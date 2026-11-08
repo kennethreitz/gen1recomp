@@ -13,6 +13,48 @@
       "category": "games",
       "versions": [
         {
+          "version": "0.4.1",
+          "date": "2026-11-06",
+          "size": 44734536,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.4.1/gen1recomp++-0.4.1-ios.ipa",
+          "localizedDescription": "squashed some shiz tyvm iykyk\n\n## Issues closed\n\n- #3099 Patch notes aren't working on switch\n- #3112 cartridge failing checksum prevening save exports???\n- #3113 Keep Update button Visible without scroll\n- #3116 bunch of emerald bugs, missing text and battle freeze\n- #3117 Poke flute gen 3 not working in battle\n- #3118 [Feature Request] Keyboard hotkeys to change game in the Launcher menu\n\n## Contributors\n\n- @bryanthaboi"
+        },
+        {
+          "version": "0.4.0",
+          "date": "2026-11-02",
+          "size": 44727368,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.4.0/gen1recomp++-0.4.0-ios.ipa",
+          "localizedDescription": "bugs and some switch stuff\n\n## Issues closed\n\n- #3083 Whitescreen on Trendy Phrase/Gabbys Interview screen\n- #3088 Scrolling issues on iOS\n- #3089 Missing phone jingle\n- #3090 Gen2 Bug-Catching Contest ignores the encounters registry\n- #3091 Gold: script.command's ctx.mapId is never the map label\n- #3092 Gen 2: mods can't add Fly destinations\n- #3094 Pokeball catching animation is skipping CRYSTAL\n- #3096 Asking to press button while trainer send pokemon\n- #3097 Shaders cant be downloaded on switch\n- #3098 No dynamic option UI on crystal\n\n## Contributors\n\n- @booshankles\n- @bryanthaboi"
+        },
+        {
+          "version": "0.3.99",
+          "date": "2026-10-31",
+          "size": 44722207,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.3.99/gen1recomp++-0.3.99-ios.ipa",
+          "localizedDescription": "JdsjziziakakLLl\n\n## Contributors\n\n- @bryanthaboi"
+        },
+        {
+          "version": "0.3.98",
+          "date": "2026-10-29",
+          "size": 44721717,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.3.98/gen1recomp++-0.3.98-ios.ipa",
+          "localizedDescription": "squash deez\n\n## Issues closed\n\n- #3066 Trainer gender bug? (Sapphire)\n- #3069 Can't move items in bag in Gen 3 (Emerald, FRLG)\n- #3071 Jessie james sprites are not colored with advanced colors (OVERWORLD)\n- #3073 some attack moves like SMOG, bug the color pallete in battle while its attacking (ADVANCE COLORS)\n- #3075 Pressing L and  ZL or zr etc speed up the game\n- #3076 Dynamic UI isnt working properly\n- #3078 Button mapping option missing\n- #3079 modkit lint MK301 rejects the assets/generated/ paths that mod.datasets view.assets:path requires\n- #3080 emerald export\n\n## Contributors\n\n- @bryanthaboi"
+        },
+        {
+          "version": "0.3.97",
+          "date": "2026-10-26",
+          "size": 44714538,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.3.97/gen1recomp++-0.3.97-ios.ipa",
+          "localizedDescription": "… CLOSES #3059, CLOSES #3061, CLOSES #3062\n\n## Issues closed\n\n- #3048 emerald data gets imported twice on portable installation\n- #3049 (Modding API v3) battleScaleBack causes error in gen2 games\n- #3055 mod.datasets:open(\"crystal\") rejects Crystal's pokemon data over its tutorMoves table\n- #3057 Mod update fails with \"string length overflow\" when baseroms/ holds a ~2 GiB import\n- #3058 mod.datasets: Gen 2's fishing art (menu_gfx emotes) can't be reached\n- #3059 Oak music in Gold starts too early\n- #3061 CD icons for Dark TMs in the TM Case are invisible.\n- #3062 Event Pokemon are missing the \"Fateful Encounter\" flag\n\n## Contributors\n\n- @bryanthaboi"
+        },
+        {
+          "version": "0.3.96",
+          "date": "2026-10-23",
+          "size": 44711034,
+          "downloadURL": "https://github.com/bryanthaboi/gen1recomp/releases/download/v0.3.96/gen1recomp++-0.3.96-ios.ipa",
+          "localizedDescription": "honestly RIP zaboomafoo we will never forget u\n\n## Issues closed\n\n- #3036 Gen2: a mod can't add a phone contact\n- #3037 Mods can't change Gen2 shops (no registry for data.gen2Marts)\n- #3038 Gen 2: new species and items get no script number (index capped at 255, never assigned)\n- #3040 FRLG: Hoenn species + Celebi play the wrong cries\n- #3042 Goldenrod game corner card game bugs\n- #3043 Emerald Isn't Available on Switch\n- #3046 (Modding API) mod.options:define doesn't work anymore\n\n## Contributors\n\n- @bryanthaboi\n- @Nexhas28\n- @poooooby"
+        },
+        {
           "version": "0.3.95",
           "date": "2026-10-21",
           "size": 44713427,
