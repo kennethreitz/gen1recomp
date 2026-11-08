@@ -24,6 +24,13 @@ local NO_SHORE_TILESETS = { SHIP_PORT = true }
 -- what counts as "outside" for the wLastMap memory (CheckIfInOutsideMap)
 local OUTSIDE_TILESETS = { "OVERWORLD", "PLATEAU" }
 
+-- pokered's fly destination gate: BuildFlyLocationsList
+-- (engine/items/town_map.asm) walks map ids 0..NUM_CITY_MAPS-1, the eleven
+-- towns PALLET_TOWN..SAFFRON_CITY, so routes never appear even though
+-- ROUTE_4/ROUTE_10 carry fly-warp landing spots (those exist for the
+-- dungeon-escape/heal tables, special_warps.asm FlyWarpDataPtr)
+local NUM_CITY_MAPS = 11
+
 -- warp pads and fall-through holes (data/tilesets/warp_pad_hole_tile_ids
 -- .asm WarpPadAndHoleData); a tileset record carrying warpPadTiles
 -- ({ [tileId] = "pad"|"hole" }) wins over these vanilla rows
@@ -136,21 +143,26 @@ end
 
 -- ------- map record properties (authored maps set them; vanilla falls back)
 
--- town/route surface: door SFX, the walk-out step, the Fly menu and the
--- town map all mean this one
 function Map.isOutdoor(def)
   if def.outdoor ~= nil then return def.outdoor end
   return def.tileset == "OVERWORLD"
 end
 
 -- CheckIfInOutsideMap, a strictly wider set: Route 23 / Indigo Plateau are
--- outside for the wLastMap memory without being outdoor for the door SFX
 function Map.isOutside(def, tilesets)
   if Map.isOutdoor(def) then return true end
   for _, ts in ipairs(tilesets or OUTSIDE_TILESETS) do
     if ts == def.tileset then return true end
   end
   return false
+end
+
+-- engine/items/town_map.asm:254 BuildFlyLocationsList
+local MOD_MAP_INDEX = 1000
+
+function Map.isFlyTown(def)
+  if def.index ~= nil and def.index < MOD_MAP_INDEX then return def.index < NUM_CITY_MAPS end
+  return Map.isOutdoor(def) or def.tileset == "PLATEAU"
 end
 
 -- region groups maps a rule applies to without naming them; the id prefix
@@ -216,6 +228,13 @@ function Map:isGrassCell(cx, cy)
   if not self:inBounds(cx, cy) then return false end
   local grass = self.tileset.grassTile
   return grass ~= nil and self:cellTile(cx, cy) == grass
+end
+
+-- engine/overworld/movement.asm:526-551
+function Map:isNpcGrassCell(cx, cy)
+  if not self:inBounds(cx, cy) then return false end
+  local grass = self.tileset.grassTile
+  return grass ~= nil and self:tileAt(cx * 2 + 1, cy * 2) == grass
 end
 
 -- Water and eastern-shore tiles, from the tileset's waterTiles/shoreTiles

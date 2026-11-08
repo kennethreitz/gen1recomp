@@ -58,12 +58,7 @@ stack:push(roll)
 -- HallOfFamePC lead-in (100 blank + 128 after music starts) + per-screen
 -- fade/hold/wipe + THE END (16 blank + 20 fade) + the script's 5x120
 -- DelayFrames before WaitForTextScrollButtonPress
-local expected = 100 + 128 + 16 + 20 + 600
-for _, s in ipairs(credits.screens) do
-  expected = expected + (s.fade and 20 or 0)
-    + (s.mon and (s.fade and 90 or 110) or (s.fade and 120 or 140))
-    + (s.mon and 27 or 0)
-end
+local expected = 100 + 128 + 5631 + 16 + 20 + 600
 while roll.phase ~= "end_wait" and frame < expected + 120 do
   frame = frame + 1
   roll:update(1 / 60)
@@ -114,16 +109,27 @@ local HallOfFame = require("src.ui.HallOfFame")
 check(getmetatable(stack2:top()) == HallOfFame, "induction showcase pushed")
 
 -- Gen1 layout (issue #102): pic rests at hlcoord (12,5); mon phase starts
--- with the LEVEL/TYPE info box (not a top "HALL OF FAME" banner alone)
+-- with the LEVEL/TYPE info box (not a top "HALL OF FAME" banner alone).
+-- HoFShowMonOrPlayer sweeps the BACK pic across the screen first (hSCX
+-- $c0 -> $a0) and only then scrolls the front pic in (#847), so the
+-- induction opens on the back pass.
 local hofUi = stack2:top()
-eq(hofUi.phase, "mons", "induction opens on the mon showcase phase")
-eq(hofUi.scrollX < 12 * 8, true, "front pic starts off-screen left of (12,5)")
--- drive past the scroll so the info box is armed
+eq(hofUi.phase, "intro", "induction opens on the fade to white")
+local introGuard = 0
+while hofUi.phase == "intro" and introGuard < 400 do
+  introGuard = introGuard + 1
+  hofUi:update(1 / 60)
+end
+eq(introGuard, 3 + 24 + 100, "Delay3 + GBFadeOutToWhite + 100 DelayFrames before the sweep")
+eq(hofUi.phase, "back", "the back pic sweep follows the fade (#847)")
+eq(hofUi.scrollX, 160, "back pic enters at the right edge (hSCX = $c0)")
+-- drive the back sweep and the front scroll so the info box is armed
 local scrollGuard = 0
-while hofUi.scrollX < 12 * 8 and scrollGuard < 200 do
+while (hofUi.phase == "back" or hofUi.scrollX < 12 * 8) and scrollGuard < 400 do
   scrollGuard = scrollGuard + 1
   hofUi:update(1 / 60)
 end
+eq(hofUi.phase, "mons", "the front pic phase follows the back sweep (#847)")
 eq(hofUi.scrollX, 12 * 8, "front pic settles at hlcoord (12,5)")
 eq(hofUi.showHofBanner, false, "bottom HALL OF FAME banner waits for the 80-frame hold")
 check(hofUi.timer == 80 or hofUi.timer < 80,
@@ -132,6 +138,14 @@ check(hofUi.timer == 80 or hofUi.timer < 80,
 -- drive induction + full credits with A held (pages are unskippable; A
 -- only advances the induction and the final THE END wait)
 pressed.a = true
+-- engine/movie/hall_of_fame.asm:58
+local monFrames = 0
+while (hofUi.phase == "mons" or hofUi.phase == "fade") and monFrames < 1000 do
+  monFrames = monFrames + 1
+  hofUi:update(1 / 60)
+end
+check(monFrames >= 80 + 180 + 20 - 1,
+      "holding A does not shorten the mon induction: " .. monFrames)
 local guard = 0
 while coroutine.status(co) ~= "dead" and stack2:top() and guard < 30000 do
   guard = guard + 1
@@ -144,9 +158,10 @@ check(guard > expected, "credits pages were not skippable by holding A")
 
 -- the autosave (SaveGameData while THE END is up)
 check(wrote, "autosave ran during THE END")
-local savedRaw = love.filesystem.read("save.lua")
-local saved = savedRaw and SaveData.decode(savedRaw) or nil
-check(saved ~= nil, "save.lua written and decodable")
+-- Read it back the way it was written: once a slot is registered, SaveData.save
+-- targets saves/<version>/<slot>.lua, not the pre-slots flat file.
+local saved = SaveData.load(game2.save.version)
+check(saved ~= nil, "the autosave is written and decodable")
 eq(saved and saved.lastHeal and saved.lastHeal.map, "PALLET_TOWN",
    "wLastBlackoutMap := PALLET_TOWN before the save")
 -- #103 parked CONTINUE in the upstairs bedroom; #253 corrected that to the

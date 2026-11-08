@@ -1,44 +1,74 @@
 local GameVersion = require("src.core.GameVersion")
+local GamepadMap = require("src.core.GamepadMap")
+local Logger = require("src.core.Logger")
 local Strings = require("src.core.Strings")
 local HostShell = require("src.core.HostShell")
+local HostPicker = require("src.core.HostPicker")
+local Platform = require("src.core.Platform")
+local SafeArea = require("src.core.SafeArea")
+local SecretGames = require("src.import.SecretGames")
 
 local RomImporter = {}
 RomImporter.__index = RomImporter
 
--- Cache generation tag; bump to force every imported version to re-extract.
-local CACHE_FORMAT = "rom-cache-v7:"
--- The completion marker is written under each version's cache prefix
--- (rom-cache.complete for Red, blue/rom-cache.complete for Blue).
-local MARKER_PATH = "rom-cache.complete"
+local PICK_COMPLETE_FILENAME = "pick_complete.flag"
+local finishDirectRequiredImport
 
--- The marker a finished import writes for a version: the generation tag plus
--- that version's ROM hash, so both a format bump and a swapped ROM invalidate.
-local function markerFor(version)
-  return CACHE_FORMAT .. GameVersion.info(version).sha1
+-- love.system.pickFile is a NATIVE BRIDGE, not part of LÖVE: it exists only on
+-- builds that compiled one (Android, and iOS builds patched by
+-- mobile/ios/patch_love_src.py). A build without it must fall back to the
+-- copy-it-into-the-save-folder flow that every caller below already has --
+-- calling the nil field instead took the whole app down the moment the player
+-- pressed Import ROM:
+--
+--   src/import/RomImporter.lua: attempt to call field 'pickFile' (a nil value)
+--
+-- love.system.createFile was already guarded this way at its one call site;
+-- these three were not. Every caller here treats `false` as "no picker
+-- available" and shows its own notice, so a missing bridge now degrades to
+-- exactly the path a picker-less Android device has always taken.
+local function pickFile(...)
+  local fn = love.system.pickFile
+  if not fn then return false end
+  return fn(...) and true or false
 end
-local COMMUNITY_URL = "https://bois.icu"
-local TRUST_WARNING = "if you did not get this from bryanthaboi's github " ..
-  "or a link from the discord that bryanthaboi himself posted, just know " ..
-  "it might have been tampered with. go to the discord to verify " ..
-  COMMUNITY_URL .. " (or click the logo above)"
-local REQUIRED_FILES = {
-  "data/generated/constants.lua",
-  "data/generated/maps.lua",
-  "data/generated/text.lua",
-  "data/generated/field.lua",
-  "data/generated/battle_anims.lua",
-  "assets/generated/title/pokemon_logo.png",
-  "assets/generated/fonts/font.png",
-  "assets/generated/battle/front/pikachu.png",
-  "assets/generated/battle/anims/move_anim_0.png",
-  "assets/generated/battle/anims/move_anim_1.png",
-  "assets/generated/audio/programs.bin",
-}
 
--- "Split-screen ROM selector" first-run palette (matches FirstRun.dc.html from
--- the Claude Design project): a dark neon arcade panel, one column per game.
--- Red is live; Blue and Yellow are lit placeholders until those games are
--- supported.  Values are 0-255 RGB; alpha is applied per draw.
+
+
+function RomImporter:_importerPickPending()
+  return self.android and self.pickerPendingKind == "importer"
+end
+
+local CART_SCOPE = "cart_"
+
+local function cartOfScope(scope)
+  if type(scope) ~= "string" then return nil end
+  return scope:match("^cart_(.+)$")
+end
+
+local CacheContract = require("src.import.CacheContract")
+local Transition = require("src.ui.kit.Transition")
+
+local TAB_ORDER, TAB_AT = {}, {}
+local function tabOrder()
+  if #TAB_ORDER == 0 then
+    for _, version in ipairs(GameVersion.ORDER) do
+      TAB_ORDER[#TAB_ORDER + 1] = version
+    end
+    local okView, View = pcall(require, "src.import.LauncherView")
+    if okView then
+      for _, t in ipairs(View.HEADER_TABS or {}) do
+        TAB_ORDER[#TAB_ORDER + 1] = t.id
+      end
+    end
+    for i, id in ipairs(TAB_ORDER) do TAB_AT[id] = i end
+  end
+  return TAB_AT
+end
+-- "Split-screen ROM selector" first-run palette (matches the FirstRun mockup):
+-- a dark neon arcade panel, one column per game.
+-- Red, Blue, and Yellow share the same importer flow once listed in
+-- GameVersion.VERSIONS.  Values are 0-255 RGB; alpha is applied per draw.
 local PAL = {
   -- radial background gradient (bright navy at top-centre -> near black)
   bgTop       = { 22, 34, 74 },   -- #16224a
@@ -87,33 +117,6 @@ local PAL = {
   chipInkGold = { 58, 44, 0 },     -- #3a2c00  dark "Y" on the gold chip
 }
 
--- CacheFs.exists checks the game folder directly for a portable install,
--- otherwise the save directory through love.filesystem.  It honors
--- CacheFs.prefix, so we point it at the version's cache subtree (Red at the
--- root, Blue under blue/).
-local function allRequiredFilesExist(version)
-  local CacheFs = require("src.import.CacheFs")
-  local saved = CacheFs.prefix
-  CacheFs.prefix = GameVersion.cachePrefix(version)
-  local ok = true
-  for _, path in ipairs(REQUIRED_FILES) do
-    if not CacheFs.exists(path) then ok = false; break end
-  end
-  CacheFs.prefix = saved
-  return ok
-end
-
--- A developer checkout / Python build leaves Red's generated data in the
--- physfs SOURCE at the un-prefixed root; that is always current.  Only Red
--- ships this way (Blue is import-only), so this stays a Red-root check.
-local function sourceTreeHasData()
-  if not allRequiredFilesExist("red") or not love.filesystem.getRealDirectory then
-    return false
-  end
-  local real = love.filesystem.getRealDirectory(REQUIRED_FILES[1])
-  return real == love.filesystem.getSource()
-end
-
 -- ------- ROM cache location
 --
 -- The extracted cache (data/generated, assets/generated) plus the
@@ -126,27 +129,53 @@ end
 -- os.execute (issue #74: that flashed a console window per file on Windows
 -- and froze the app).
 
--- Remove a cache subtree from the OS save directory.  The realDirectory
--- guard keeps this from ever deleting the game folder (portable installs
+-- Remove a cache subtree from the OS save directory.  Files are deleted by
+-- their real save-directory path and directories through the write
+-- directory only, so this never deletes the game folder (portable installs
 -- read the cache from there) or a developer's checked-out source tree.
+local chmodFn = nil
+
+local function makeWritable(real, mode)
+  if chmodFn == nil then
+    chmodFn = false
+    local okFfi, ffi = pcall(require, "ffi")
+    if okFfi and ffi.os ~= "Windows" then
+      pcall(ffi.cdef, "int chmod(const char *path, unsigned int mode);")
+      if pcall(function() return ffi.C.chmod end) then
+        chmodFn = function(p, m) pcall(ffi.C.chmod, p, m) end
+      end
+    end
+  end
+  if chmodFn then chmodFn(real, mode) end
+end
+
 local function removeTree(path)
   local info = love.filesystem.getInfo(path)
   if not info then return end
   if info.type == "directory" then
+    makeWritable(love.filesystem.getSaveDirectory() .. "/" .. path, 493)
     for _, child in ipairs(love.filesystem.getDirectoryItems(path)) do
       removeTree(path .. "/" .. child)
     end
-  end
-  if love.filesystem.getRealDirectory
-      and love.filesystem.getRealDirectory(path)
-        ~= love.filesystem.getSaveDirectory() then
+    love.filesystem.remove(path)
     return
   end
-  local ok, err = love.filesystem.remove(path)
-  if ok == false then
-    error("could not remove stale cache: " .. tostring(err))
+  local SaveData = require("src.core.SaveData")
+  local real = love.filesystem.getSaveDirectory() .. "/" .. path
+  local f = SaveData.openNative(real, "rb")
+  if not f then return end
+  f:close()
+  local ok, err = SaveData.removeNative(real)
+  if not ok then
+    makeWritable(real, 420)
+    ok, err = SaveData.removeNative(real)
+  end
+  if not ok then
+    error("could not remove stale cache " .. real .. ": " .. tostring(err))
   end
 end
+
+RomImporter._removeSaveDirTree = removeTree
 
 -- Portable installs read the cache from the game folder.  Any copy an
 -- earlier non-portable run -- or the pre-#74 build, which always wrote the
@@ -160,19 +189,24 @@ local function purgeSaveDirCache()
   saveDirPurged = true
   local saveDir = love.filesystem.getSaveDirectory()
   local function saveDirHas(rel)
-    local f = io.open(saveDir .. "/" .. rel, "rb")
+    local f = require("src.core.SaveData").openNative(saveDir .. "/" .. rel, "rb")
     if not f then return false end
     f:close()
     return true
   end
-  -- Purge each version's stale save-directory copy (Red at the root, Blue
-  -- under blue/) so it cannot shadow the portable game-folder cache.
+  -- Purge each version's stale save-directory copy (under its red/ / blue/
+  -- / yellow/ / gold/ prefix) so it cannot shadow the portable game-folder cache.
   for _, version in ipairs(GameVersion.ORDER) do
     local prefix = GameVersion.cachePrefix(version)
-    if saveDirHas(prefix .. MARKER_PATH) or saveDirHas(prefix .. REQUIRED_FILES[1]) then
+    local required = CacheContract.presenceFilesFor(version)
+    local hasRequired = false
+    for _, path in ipairs(required) do
+      if saveDirHas(prefix .. path) then hasRequired = true; break end
+    end
+    if saveDirHas(prefix .. CacheContract.MARKER_PATH) or hasRequired then
       removeTree(prefix .. "data/generated")
       removeTree(prefix .. "assets/generated")
-      love.filesystem.remove(prefix .. MARKER_PATH)
+      love.filesystem.remove(prefix .. CacheContract.MARKER_PATH)
     end
   end
 end
@@ -187,30 +221,37 @@ function RomImporter.isReady(version)
     -- save-directory copy that would otherwise shadow it at runtime.
     purgeSaveDirCache()
   end
-  -- Red generated data in the physfs source (developer checkout / Python
-  -- build) is always current; Blue is import-only and falls through to the
-  -- version-marker gate.
-  if version == "red" and sourceTreeHasData() then return true end
-  local saved = CacheFs.prefix
-  CacheFs.prefix = GameVersion.cachePrefix(version)
-  local marker = CacheFs.read(MARKER_PATH)
-  CacheFs.prefix = saved
-  return marker == markerFor(version) and allRequiredFilesExist(version)
+  return CacheContract.isReady(version, CacheFs)
+end
+
+function RomImporter.syncAndroidShortcuts(activeVersion)
+  if not (love.system and love.system.getOS and love.system.getOS() == "Android"
+      and love.system.updateShortcuts) then
+    return false
+  end
+
+  local allVersions = SecretGames.order()
+  local ready = {}
+  local seen = {}
+
+  if activeVersion and SecretGames.visible(activeVersion)
+      and RomImporter.isReady(activeVersion) then
+    table.insert(ready, activeVersion)
+    seen[activeVersion] = true
+  end
+
+  for _, v in ipairs(allVersions) do
+    if not seen[v] and RomImporter.isReady(v) then
+      table.insert(ready, v)
+      seen[v] = true
+      if #ready >= 4 then break end
+    end
+  end
+
+  return love.system.updateShortcuts(ready)
 end
 
 -- Load the import manifest for a version and confirm it matches that ROM.
-local function decodeManifest(version)
-  local path = GameVersion.info(version).manifest
-  local raw, readError = love.filesystem.read(path)
-  if not raw then error("ROM import metadata is missing: " .. tostring(readError)) end
-  local Json = require("src.link.Json")
-  local manifest, decodeError = Json.decode(raw)
-  if not manifest then error("ROM import metadata is invalid: " .. tostring(decodeError)) end
-  assert(manifest.romSha1 == GameVersion.info(version).sha1,
-    "ROM import metadata version mismatch")
-  return manifest
-end
-
 local function sha1(data)
   local digest = love.data.hash("sha1", data)
   if type(digest) == "userdata" and digest.getString then
@@ -220,13 +261,159 @@ local function sha1(data)
 end
 
 local function readExternalPath(path)
-  local file, openError = io.open(path, "rb")
+  local file, openError = require("src.core.SaveData").openNative(path, "rb")
   if not file then return nil, openError end
   local data = file:read("*a")
   file:close()
   return data
 end
 
+local function externalFileSize(path)
+  local file = require("src.core.SaveData").openNative(path, "rb")
+  if not file then return nil end
+  local size = file:seek("end")
+  file:close()
+  return size
+end
+
+local function openImportSource(path)
+  -- Desktop picker paths live outside LÖVE's virtual filesystem. Prefer the
+  -- native file handle so a 1.46 GiB disc is never copied to a temp file or
+  -- read into one Lua string before validation.
+  local native = require("src.core.SaveData").openNative(path, "rb")
+  if native then
+    local size, sizeErr = native:seek("end")
+    if size == nil or size == false then
+      native:close()
+      return nil, sizeErr or "could not determine source file size"
+    end
+    local reset, resetErr = native:seek("set", 0)
+    if reset == nil or reset == false then
+      native:close()
+      return nil, resetErr or "could not rewind source file"
+    end
+    return {
+      size = size,
+      read = function(_, n) return native:read(n) end,
+      close = function() native:close() end,
+    }
+  end
+  if love and love.filesystem and love.filesystem.newFile then
+    local file, makeErr = love.filesystem.newFile(path)
+    if not file then return nil, makeErr or "could not open source file" end
+    local ok, openErr = file:open("r")
+    if not ok then return nil, openErr or "could not open source file" end
+    local size = file.getSize and file:getSize() or nil
+    return {
+      size = size,
+      read = function(_, n) return file:read(n) end,
+      close = function() file:close() end,
+    }
+  end
+  return nil, "streaming source access is unavailable"
+end
+local function streamRequiredImport(manifest, importId, source)
+  local RequiredImports = require("src.mods.RequiredImports")
+  local spec = RequiredImports.spec(manifest, importId)
+  if not spec then return nil, "Import declaration was not found." end
+  if spec.format == "n64" then
+    return nil, "streaming canonicalization is unavailable for N64 imports"
+  end
+  local input, openErr = openImportSource(source)
+  if not input then return nil, openErr end
+  local sizeErr = RequiredImports.sizeError(spec, input.size, false)
+  if sizeErr then input:close(); return nil, sizeErr end
+
+  local CacheFs = require("src.import.CacheFs")
+  local destination = RequiredImports.path(manifest, spec)
+  local savedPrefix = CacheFs.prefix
+  local output
+  local inputClosed, outputClosed = false, false
+
+  local function closeInput()
+    if inputClosed then return end
+    inputClosed = true
+    pcall(function() input:close() end)
+  end
+
+  local function closeOutput()
+    if outputClosed or not output then return end
+    outputClosed = true
+    pcall(function() output:close() end)
+  end
+
+  local resultOk, resultDetail
+  CacheFs.prefix = ""
+  local ran, thrown = xpcall(function()
+    CacheFs.remove(RequiredImports.receiptPath(manifest, spec))
+    CacheFs.remove(destination)
+    local makeErr
+    output, makeErr = CacheFs.openWrite(destination)
+    if not output then
+      resultDetail = makeErr or "could not create imported file"
+      return
+    end
+
+    -- A mod-verified import is never compared against a digest, so skip the
+    -- pure-Lua MD5 (minutes over a multi-GiB image).
+    local md5 = not RequiredImports.modVerified(spec)
+      and require("src.mods.StreamMD5").new() or nil
+    local total, chunkBytes = 0, 4 * 1024 * 1024
+    while true do
+      local chunk = input:read(chunkBytes)
+      if not chunk or #chunk == 0 then break end
+      if md5 then md5:update(chunk) end
+      local wrote, writeErr = output:write(chunk)
+      if wrote == false or wrote == nil then
+        resultDetail = "could not copy import: "
+.. tostring(writeErr or "write failed")
+        return
+      end
+      total = total + #chunk
+      if #chunk < chunkBytes then break end
+    end
+
+    closeInput()
+    closeOutput()
+    if input.size and total ~= input.size then
+      resultDetail = ("source read ended early (expected %d bytes, copied %d)")
+        :format(input.size, total)
+      return
+    end
+    local storedSizeErr = RequiredImports.sizeError(spec, total, true)
+    if storedSizeErr then resultDetail = storedSizeErr; return end
+    local digest = md5 and md5:final() or nil
+
+    -- acceptStoredDigest uses the normal engine path/receipt rules, so
+    -- restore the caller's prefix before handing control to it.
+    CacheFs.prefix = savedPrefix
+    local accepted, detail = RequiredImports.acceptStoredDigest(
+      manifest, importId, digest, love.filesystem)
+    if not accepted then resultDetail = detail; return end
+    resultOk, resultDetail = true, detail
+  end, function(err)
+    if debug and debug.traceback then
+      return debug.traceback(tostring(err), 2)
+    end
+    return tostring(err)
+  end)
+
+  -- finally: resource handles and the process-global CacheFs prefix must
+  -- be restored even when a read/hash/write helper raises a Lua error.
+  closeInput()
+  closeOutput()
+  CacheFs.prefix = ""
+  if not ran or not resultOk then
+    pcall(function() CacheFs.remove(destination) end)
+  end
+  CacheFs.prefix = savedPrefix
+
+  if not ran then
+    return nil, "could not copy import: " .. tostring(thrown)
+  end
+  if not resultOk then return nil, resultDetail end
+  return true, resultDetail
+end
 local function readDroppedFile(file)
   local ok, openError = file:open("r")
   if not ok then return nil, openError end
@@ -266,32 +453,1007 @@ end
 -- keyboard-navigates (keyboard focus is a separate grab) but ignores the
 -- mouse entirely -- issue #254 on Linux.  Whether it bites is a race with how
 -- long the click was held, which is why the same build picks one ROM fine and
--- then hangs the mouse on the next.  So pump until no button is held, letting
--- SDL see the release and let go first; bounded, so a stuck button costs a
--- moment and never the launcher.  pump() only drains OS events into LOVE's
--- queue -- it dispatches nothing -- so there is no reentry into mousepressed
--- and the release is still delivered normally on the next frame.
-local function releasePointerGrab()
-  if not (love.mouse and love.mouse.isDown and love.event and love.event.pump
-      and love.timer) then
-    return
-  end
-  local deadline = love.timer.getTime() + 1
-  while love.mouse.isDown(1, 2, 3) do
-    love.event.pump()
-    if love.timer.getTime() > deadline then break end
-    love.timer.sleep(0.005)
-  end
-end
+-- then hangs the mouse on the next.
+--
+-- The release itself now lives in HostShell.releasePointerGrab, called from
+-- HostShell.popen, so every host spawn inherits it and not just the three
+-- pickers here.  It stays a single release point on purpose: this file used
+-- to run its own copy first, and each copy carries its own one-second bound,
+-- so keeping both made a stuck button cost two seconds instead of one.
 
 local function commandOutput(command)
-  releasePointerGrab()
+  if not Platform.canSpawnProcess() then return nil end
   local pipe = HostShell.popen(command)
   if not pipe then return nil end
   local result = pipe:read("*a")
-  pipe:close()
+  -- HostShell.pclose, never pipe:close(): closing a pipe outside the spawn
+  -- lock can free a FILE while a worker thread's popen is walking the stream
+  -- list, which deadlocks that thread for good (see HostShell).
+  HostShell.pclose(pipe)
+  HostShell.pumpHostEvents()
   result = trim(result)
   return result ~= "" and result or nil
+end
+
+local function pfs()
+  return require("src.core.SaveData").persistenceFs(love.filesystem)
+end
+
+local IMPORTS_DIR = "imports"
+local BASE_ROMS_DIR = "baseroms"
+local MODS_INBOX_DIR = "imports/mods"
+local SAVES_INBOX_DIR = "imports/saves"
+local CARTS_INBOX_DIR = "imports/carts"
+local PICKED_CART = "picked_cart.g1rcart"
+local ROM_BYTES_GEN1 = 1024 * 1024
+local ROM_BYTES_GEN2 = 2 * 1024 * 1024
+local ROM_BYTES_GEN3 = 16 * 1024 * 1024
+-- Historical alias: Gen 1 helpers and tests still refer to ROM_BYTES.
+local ROM_BYTES = ROM_BYTES_GEN1
+
+local function isAcceptedRomSize(n)
+  return n == ROM_BYTES_GEN1 or n == ROM_BYTES_GEN2 or n == ROM_BYTES_GEN3
+end
+
+-- .gb / .gbc / .gba (case-insensitive after lowercasing the name).
+local function isRomFilename(name)
+  return type(name) == "string" and name:lower():match("%.gb[ac]?$") ~= nil
+end
+
+local ROM_CANDIDATE_EXTS = {
+  gb = true, gbc = true, gba = true, agb = true, bin = true, zip = true, ["7z"] = true,
+}
+
+local function isRomCandidateName(name)
+  if type(name) ~= "string" or name:sub(1, 1) == "." then return false end
+  if name:lower():match("^picked_") and not isRomFilename(name) then return false end
+  local ext = name:match("%.([^.]+)$")
+  return ext ~= nil and ROM_CANDIDATE_EXTS[ext:lower()] == true
+end
+
+local function isRomCandidateSize(n)
+  local mib = 1024 * 1024
+  return n == mib or n == 2 * mib or n == 4 * mib or n == 8 * mib
+    or n == 16 * mib or n == 32 * mib
+end
+
+local GBA_GAME_CODES = {
+  BPR = "FireRed", BPG = "LeafGreen", AXV = "Ruby", AXP = "Sapphire", BPE = "Emerald",
+}
+local GBA_REGIONS = {
+  E = "USA", J = "Japan", P = "Europe", D = "Germany", F = "France", I = "Italy", S = "Spain",
+}
+local GB_TITLES = {
+  { "POKEMON RED", "Red" }, { "POKEMON BLUE", "Blue" }, { "POKEMON YELLOW", "Yellow" },
+  { "POKEMON_GLD", "Gold" }, { "POKEMON_SLV", "Silver" }, { "PM_CRYSTAL", "Crystal" },
+}
+
+local function romHeaderGuess(data)
+  if type(data) ~= "string" then return nil end
+  if #data >= 0xC0 and data:byte(0xB3) == 0x96 then
+    local code = data:sub(0xAD, 0xB0)
+    local game = GBA_GAME_CODES[code:sub(1, 3)]
+    if game then
+      local region = GBA_REGIONS[code:sub(4, 4)] or ("region " .. code:sub(4, 4))
+      return ("%s (%s) rev %d"):format(game, region, data:byte(0xBD) or 0)
+    end
+    if code:match("^[%u%d]+$") then return "game code " .. code end
+    return nil
+  end
+  if #data >= 0x150 then
+    local title = data:sub(0x135, 0x144)
+    for _, entry in ipairs(GB_TITLES) do
+      if title:sub(1, #entry[1]) == entry[1] then return entry[2] end
+    end
+  end
+  return nil
+end
+
+local function romSkipReason(self, name, data)
+  if type(data) ~= "string" then return "the file could not be read" end
+  local RomArchive = require("src.import.RomArchive")
+  local kind = RomArchive.kind(data)
+  if kind then
+    local caps = RomArchive.capabilities()
+    if (kind == "zip" and not caps.zip) or (kind == "7z" and not caps.z7) then
+      return ("a .%s archive this device cannot open; extract the raw .gb/.gbc/.gba next to it")
+        :format(kind)
+    end
+    return ("a .%s archive; pick it from the file browser or extract the raw .gb/.gbc/.gba next to it")
+      :format(kind)
+  end
+  if not isAcceptedRomSize(#data) then
+    return ("wrong size %.2f MiB (%d bytes); a clean cart is exactly 1 MiB (.gb), 2 MiB (.gbc) or 16 MiB (.gba)")
+      :format(math.floor(#data / 1024 / 1024 * 100) / 100, #data)
+  end
+  local hash = sha1(data)
+  if not self:_versionForSha1(hash) then
+    local guess = romHeaderGuess(data)
+    return ("unknown SHA-1 %s%s; only clean US dumps verify, patched or trimmed ones never do")
+      :format(hash, guess and (", header says " .. guess) or "")
+  end
+  if not isRomFilename(name) then
+    local ext = #data == ROM_BYTES_GEN3 and "gba" or (#data == ROM_BYTES_GEN2 and "gbc" or "gb")
+    return ("unrecognized extension .%s; rename it to .%s")
+      :format(name:match("%.([^.]+)$") or "", ext)
+  end
+  return nil
+end
+
+local function scanRomSkips(self)
+  local skips = {}
+  local names = love.filesystem.getDirectoryItems("")
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local info = love.filesystem.getInfo(name, "file")
+    if info and (isRomCandidateName(name)
+        or (name:sub(1, 1) ~= "." and isRomCandidateSize(info.size or -1))) then
+      local reason = romSkipReason(self, name, love.filesystem.read(name))
+      if reason then skips[#skips + 1] = { name = name, reason = reason } end
+    end
+  end
+  return skips
+end
+
+function RomImporter:_reportRomSkips(version)
+  local skips = scanRomSkips(self)
+  self._romSkipLogged = self._romSkipLogged or {}
+  for _, skip in ipairs(skips) do
+    local key = skip.name .. "\0" .. skip.reason
+    if not self._romSkipLogged[key] then
+      self._romSkipLogged[key] = true
+      Logger.warn("skipped ROM candidate %s/%s: %s",
+        love.filesystem.getSaveDirectory(), skip.name, skip.reason)
+    end
+  end
+  if version and skips[1] and self.workState ~= "working" then
+    self.notice = {
+      version = version,
+      status = ("Skipped %s:"):format(skips[1].name),
+      detail = skips[1].reason .. (#skips > 1
+        and (" (%d more skipped files are listed in log.txt)"):format(#skips - 1) or ""),
+    }
+  end
+  return skips
+end
+
+RomImporter._romSkipReason = romSkipReason
+RomImporter._romHeaderGuess = romHeaderGuess
+
+local function cartLabels(generation, imp)
+  local out = {}
+  for _, id in ipairs(SecretGames.order(imp or {})) do
+    if generation == nil or GameVersion.generation(id) == generation then
+      out[#out + 1] = GameVersion.info(id).label
+    end
+  end
+  return out
+end
+
+local function cartsSlashed(generation, imp)
+  return table.concat(cartLabels(generation, imp), "/")
+end
+
+local function cartsProse(imp)
+  local names = cartLabels(nil, imp)
+  local last = table.remove(names)
+  if #names == 0 then return last end
+  return table.concat(names, ", ") .. ", or " .. last
+end
+
+local function unsupportedRomText(imp, hash)
+  return ("Unsupported ROM (SHA-1 %s). This needs a clean US Pokemon "
+    .. "%s dump; patched, trimmed or "
+    .. "\"fixed\" dumps "
+    .. "(tagged [b] or [BF]) never verify."):format(hash, cartsProse(imp))
+end
+
+local function savesInboxDir(version)
+  return SAVES_INBOX_DIR .. "/" .. tostring(version)
+end
+
+local function savesImportedHashesPath(version)
+  return savesInboxDir(version) .. "/.imported-sha1"
+end
+
+local function exportsDir(version)
+  return "exports/" .. tostring(version)
+end
+
+-- Strip only a validated sdmc:/ prefix for OpenMTP/DBI relative paths.
+function RomImporter.mtpHintPath(saveDir)
+  if type(saveDir) ~= "string" then return "" end
+  if saveDir:sub(1, 6) == "sdmc:/" then return saveDir:sub(7) end
+  return saveDir
+end
+
+function RomImporter:ensureImportsDir()
+  local fs = pfs()
+  local info = fs.getInfo(IMPORTS_DIR)
+  if info and info.type == "directory" then return true end
+  if info then return false end
+  if fs.createDirectory then
+    return fs.createDirectory(IMPORTS_DIR)
+  end
+  return false
+end
+
+-- NX mod zip inbox (separate from ROM imports/). Parent imports/ first --
+-- love.filesystem.createDirectory does not create nested parents.
+function RomImporter:ensureCartsInboxDir()
+  self:ensureImportsDir()
+  local fs = pfs()
+  local info = fs.getInfo(CARTS_INBOX_DIR)
+  if info and info.type == "directory" then return true end
+  if info then return false end
+  if fs.createDirectory then
+    return fs.createDirectory(CARTS_INBOX_DIR)
+  end
+  return false
+end
+
+function RomImporter:ensureModsInboxDir()
+  self:ensureImportsDir()
+  local fs = pfs()
+  local info = fs.getInfo(MODS_INBOX_DIR)
+  if info and info.type == "directory" then return true end
+  if info then return false end
+  if fs.createDirectory then
+    return fs.createDirectory(MODS_INBOX_DIR)
+  end
+  return false
+end
+
+-- NX raw .sav inbox per game: imports/saves/{red,blue,yellow}/.
+-- Parent imports/ then imports/saves/ first -- createDirectory is not nested.
+-- Creates all three version folders so MTP browsing shows where each game goes.
+function RomImporter:ensureSavesInboxDir(version)
+  self:ensureImportsDir()
+  local fs = pfs()
+  local info = fs.getInfo(SAVES_INBOX_DIR)
+  if info and info.type ~= "directory" then return false end
+  if not info then
+    if not (fs.createDirectory
+        and fs.createDirectory(SAVES_INBOX_DIR)) then
+      return false
+    end
+  end
+  for _, v in ipairs(SecretGames.order(self)) do
+    local dir = savesInboxDir(v)
+    local vInfo = fs.getInfo(dir)
+    if vInfo and vInfo.type ~= "directory" then return false end
+    if not vInfo then
+      if not (fs.createDirectory
+          and fs.createDirectory(dir)) then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+function RomImporter:_setNxInboxNotice(version)
+  version = version or self.tab or "red"
+  local saveDir = love.filesystem.getSaveDirectory()
+  local rel = RomImporter.mtpHintPath(saveDir)
+  if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+  self.notice = {
+    version = version,
+    status = Strings("Copy your .gb/.gbc/.gba into:"),
+    detail = Platform.inboxTransfer() == "ftp"
+      and Strings("%s/imports/\nover FTP (GoldHEN, port 2121)", saveDir)
+      or Strings("%s/imports/\nDBI MTP → 1: SD Card/%simports/", saveDir, rel),
+  }
+end
+
+function RomImporter:_setNxCartsInboxNotice()
+  local saveDir = love.filesystem.getSaveDirectory()
+  local rel = RomImporter.mtpHintPath(saveDir)
+  if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+  self._cartNotice = Platform.inboxTransfer() == "ftp"
+    and Strings("Copy your .g1rcart into:\n%s/imports/carts/\nover FTP (GoldHEN, port 2121)", saveDir)
+    or Strings(
+    "Copy your .g1rcart into:\n%s/imports/carts/\nDBI MTP → 1: SD Card/%simports/carts/",
+    saveDir, rel)
+end
+
+function RomImporter:_setNxModsInboxNotice()
+  local saveDir = love.filesystem.getSaveDirectory()
+  local rel = RomImporter.mtpHintPath(saveDir)
+  if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+  self.modNotice = {
+    ok = true,
+    text = Platform.inboxTransfer() == "ftp"
+      and Strings("Copy your .zip into:\n%s/imports/mods/\nover FTP (GoldHEN, port 2121)", saveDir)
+      or Strings("Copy your .zip into:\n%s/imports/mods/\nDBI MTP → 1: SD Card/%simports/mods/",
+      saveDir, rel),
+  }
+end
+
+function RomImporter:_resolveSaveVersion(version)
+  version = version or self.panelVersion or self.tab
+  if GameVersion.VERSIONS[version] then return version end
+  return self:_savedropTarget()
+end
+
+function RomImporter:_setNxSavesInboxNotice(version)
+  version = self:_resolveSaveVersion(version)
+  local inbox = savesInboxDir(version)
+  local saveDir = love.filesystem.getSaveDirectory()
+  local rel = RomImporter.mtpHintPath(saveDir)
+  if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+  local game = GameVersion.info(version).displayName
+  self.saveNotice = self.saveNotice or {}
+  self.saveNotice[version] = {
+    ok = true,
+    persistent = true,
+    text = Platform.inboxTransfer() == "ftp"
+      and Strings("Copy your %s .sav into:\n%s/%s/\nover FTP (GoldHEN, port 2121)",
+        game, saveDir, inbox)
+      or Strings("Copy your %s .sav into:\n%s/%s/\nDBI MTP → 1: SD Card/%s%s/",
+      game, saveDir, inbox, rel, inbox),
+  }
+end
+
+local function listFs(dir)
+  if dir == "" or dir == "/" then return love.filesystem end
+  return pfs()
+end
+
+local function readListed(path)
+  local dir = path:match("^(.*)/[^/]+$") or ""
+  local data = listFs(dir).read(path)
+  return type(data) == "string" and data or nil
+end
+
+local function listRomPaths(dir)
+  local paths = {}
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
+    -- Skip AppleDouble / hidden junk from Mac MTP (._cart.gb ends in .gb
+    -- but is not a ROM -- rescan would try it first and block the real dump).
+    if name:sub(1, 1) ~= "." then
+      local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
+      if isRomFilename(name)
+          and fs.getInfo(path, "file") then
+        paths[#paths + 1] = path
+      end
+    end
+  end
+  return paths
+end
+
+local function baseRomScanSatisfied(self)
+  for _, version in ipairs(SecretGames.order(self)) do
+    if not self.ready[version] and not self.baseRoms[version] then
+      return false
+    end
+  end
+  return true
+end
+
+function RomImporter:_queueBaseRomScan()
+  if not self.baseRomDiscovery then return end
+  if baseRomScanSatisfied(self) then
+    self.baseRomScan = { state = "done" }
+    return
+  end
+  self.baseRomScan = { state = "queued", index = 1 }
+end
+
+function RomImporter:_stepBaseRomScan()
+  local scan = self.baseRomScan
+  if not scan or scan.state == "done" or self.workState == "working" then
+    return
+  end
+  if scan.state == "queued" then
+    local info = pfs().getInfo(BASE_ROMS_DIR)
+    if not info and pfs().createDirectory then
+      pfs().createDirectory(BASE_ROMS_DIR)
+    end
+    scan.paths = listRomPaths(BASE_ROMS_DIR)
+    table.sort(scan.paths)
+    scan.state = "running"
+  end
+
+  local path = scan.paths[scan.index]
+  if not path then
+    scan.state = "done"
+    return
+  end
+  scan.index = scan.index + 1
+
+  local info = pfs().getInfo(path, "file")
+  if info and isAcceptedRomSize(info.size) then
+    local data = pfs().read(path)
+    if type(data) == "string" and isAcceptedRomSize(#data) then
+      local version = self:_versionForSha1(sha1(data))
+      if version and not self.ready[version] and not self.baseRoms[version] then
+        self.baseRoms[version] = {
+          path = path,
+          name = path:match("[^/\\]+$") or path,
+        }
+      end
+    end
+  end
+
+  if baseRomScanSatisfied(self) or not scan.paths[scan.index] then
+    scan.state = "done"
+  end
+end
+
+local function listZipPaths(dir)
+  local paths = {}
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
+    -- Skip AppleDouble / hidden junk from Mac MTP (._foo.zip ends in .zip
+    -- but is not a PhysFS archive -- mount fails with "could not be opened").
+    if name:sub(1, 1) ~= "." then
+      local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
+      if name:lower():match("%.zip$")
+          and fs.getInfo(path, "file") then
+        paths[#paths + 1] = path
+      end
+    end
+  end
+  return paths
+end
+
+local function listSavPaths(dir)
+  local paths = {}
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
+    -- Skip AppleDouble / hidden junk from Mac MTP (._foo.sav ends in .sav
+    -- but is not a real battery save -- import would fail and invent noise).
+    if name:sub(1, 1) ~= "." then
+      local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
+      if name:lower():match("%.sav$")
+          and fs.getInfo(path, "file") then
+        paths[#paths + 1] = path
+      end
+    end
+  end
+  return paths
+end
+
+function RomImporter:scanInbox()
+  local paths = {}
+  for _, path in ipairs(listRomPaths(IMPORTS_DIR)) do
+    paths[#paths + 1] = path
+  end
+  for _, path in ipairs(listRomPaths("")) do
+  -- Root scan is second; imports/ entries were already collected above.
+    paths[#paths + 1] = path
+  end
+  return paths
+end
+
+-- NX mods inbox: only *.zip under imports/mods/ (never ROM extensions).
+function RomImporter:scanModsInbox()
+  self:ensureModsInboxDir()
+  return listZipPaths(MODS_INBOX_DIR)
+end
+
+local function listCartPaths(dir)
+  local paths = {}
+  local fs = listFs(dir)
+  for _, name in ipairs(fs.getDirectoryItems(dir) or {}) do
+    if name:sub(1, 1) ~= "." then
+      local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
+      if name:lower():match("%.g1rcart$")
+          and fs.getInfo(path, "file") then
+        paths[#paths + 1] = path
+      end
+    end
+  end
+  return paths
+end
+
+-- NX cart inbox: only *.g1rcart under imports/carts/.
+function RomImporter:scanCartsInbox()
+  self:ensureCartsInboxDir()
+  return listCartPaths(CARTS_INBOX_DIR)
+end
+
+-- NX saves inbox: only non-hidden *.sav under imports/saves/<version>/.
+function RomImporter:scanSavesInbox(version)
+  version = self:_resolveSaveVersion(version)
+  self:ensureSavesInboxDir(version)
+  return listSavPaths(savesInboxDir(version))
+end
+
+local function loadImportedSavHashes(version)
+  local set = {}
+  local raw = pfs().read(savesImportedHashesPath(version))
+  if type(raw) ~= "string" then return set end
+  for line in raw:gmatch("[^\r\n]+") do
+    local h = line:match("^(%x+)$")
+    if h then set[h] = true end
+  end
+  return set
+end
+
+local function appendImportedSavHash(version, hash)
+  if type(hash) ~= "string" or hash == "" then return end
+  local path = savesImportedHashesPath(version)
+  local prev = pfs().read(path) or ""
+  if prev:find(hash, 1, true) then return end
+  pfs().write(path, prev .. hash .. string.char(10))
+end
+
+-- Keep bytes for the player (MTP recovery) but stop matching %.sav$ on rescan.
+local function retireImportedSav(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local fs = pfs()
+  local data = fs.read(path)
+  if type(data) ~= "string" then return false end
+  local dest = path .. ".imported"
+  if fs.getInfo(dest) then
+    dest = path .. ".imported." .. tostring(os.time())
+  end
+  if not fs.write(dest, data) then return false end
+  fs.remove(path)
+  return true
+end
+
+local MODS_RECEIPTS = MODS_INBOX_DIR .. "/.installed"
+local CARTS_RECEIPTS = CARTS_INBOX_DIR .. "/.installed"
+local ROM_SCAN_RECEIPTS = IMPORTS_DIR .. "/.scanned"
+
+local function inboxStamp(path, fullPath)
+  local dir = path:match("^(.*)/[^/]+$") or ""
+  local info = listFs(dir).getInfo(path, "file")
+  if not info then return nil end
+  return table.concat({ fullPath and path or (path:match("[^/]+$") or path),
+    tostring(info.size), tostring(info.modtime) }, "\t")
+end
+
+local function loadReceipts(file)
+  local receipts = {}
+  local raw = pfs().read(file)
+  if type(raw) ~= "string" then return receipts end
+  for line in raw:gmatch("[^\r\n]+") do
+    local stamp, id = line:match("^(.*)\t([^\t]+)$")
+    if stamp then receipts[stamp] = id end
+  end
+  return receipts
+end
+
+local function saveReceipt(file, receipts, stamp, id)
+  if not (stamp and type(id) == "string" and id ~= "") then return end
+  local name = stamp:match("^([^\t]*)\t")
+  for old in pairs(receipts) do
+    if old:match("^([^\t]*)\t") == name then receipts[old] = nil end
+  end
+  receipts[stamp] = id
+  local lines = {}
+  for s, modId in pairs(receipts) do lines[#lines + 1] = s .. "\t" .. modId end
+  table.sort(lines)
+  pfs().write(file, table.concat(lines, "\n") .. "\n")
+end
+
+local function modTreeInstalled(id)
+  return love.filesystem.getInfo("mods/" .. id .. "/manifest.json", "file") ~= nil
+end
+
+local function inboxClock()
+  return (love.timer and love.timer.getTime) or os.clock
+end
+
+function RomImporter:inboxBusy()
+  return self._inboxJob ~= nil
+end
+
+function RomImporter:inboxJobText()
+  local job = self._inboxJob
+  if not job then return nil end
+  return job.text or Strings("Scanning the inbox ...")
+end
+
+function RomImporter:modScanBusy()
+  return self._inboxJob ~= nil and self._inboxJob.kind == "mods"
+end
+
+function RomImporter:_inboxTimeLeft(job)
+  return math.max(0, (job.deadline or 0) - job.clock())
+end
+
+function RomImporter:_startInboxJob(job, run)
+  job.index = job.index or 0
+  job.clock = inboxClock()
+  job.co = coroutine.create(function() return run(self, job) end)
+  self._inboxJob = job
+  self:_pumpInboxJob()
+  return job
+end
+
+function RomImporter:_cancelInboxJob()
+  local job = self._inboxJob
+  if not job then return end
+  self._inboxJob = nil
+  if job.release then job.release(self, job) end
+end
+
+function RomImporter:_pumpInboxJob(budget, clock)
+  local job = self._inboxJob
+  if not job then return end
+  job.clock = clock or inboxClock()
+  job.deadline = job.clock() + (budget or require("src.mods.LauncherMods").STEP_BUDGET)
+  repeat
+    local ok, err = coroutine.resume(job.co)
+    if self._inboxJob ~= job then return end
+    if not ok then
+      self._inboxJob = nil
+      if job.release then job.release(self, job) end
+      job.finish(self, job, tostring(err))
+      return
+    end
+    if coroutine.status(job.co) == "dead" then
+      self._inboxJob = nil
+      job.finish(self, job)
+      return
+    end
+  until job.clock() >= job.deadline
+  if job.progress then job.progress(self, job) end
+end
+
+local function runModScan(self, job)
+  local LauncherMods = require("src.mods.LauncherMods")
+  for i, item in ipairs(job.items) do
+    job.index = i
+    job.install = LauncherMods.beginInstallZip(item.path)
+    while true do
+      local state, installed, res, extra = LauncherMods.stepInstall(job.install,
+        self:_inboxTimeLeft(job), job.clock)
+      if state == "done" then
+        job.install = nil
+        self:_modScanResult(job, item, installed, res, extra)
+        break
+      end
+      coroutine.yield()
+    end
+    coroutine.yield()
+  end
+end
+
+local function releaseModScan(_, job)
+  if job.install then require("src.mods.LauncherMods").cancelInstall(job.install) end
+  job.install = nil
+end
+
+local function modScanProgress(self, job)
+  local item = job.items[job.index]
+  if not item then return end
+  local progress = job.install and job.install.progress
+  local text
+  if progress and (progress.total or 0) > 0 then
+    text = Strings("Installing %s (%d of %d): %d/%d files", item.name, job.index,
+      #job.items, progress.done, progress.total)
+  else
+    text = Strings("Installing %s (%d of %d) ...", item.name, job.index, #job.items)
+  end
+  job.text = text
+  if not (self.modNotice and self.modNotice.text == text) then
+    self.modNotice = { ok = true, text = text }
+  end
+end
+
+function RomImporter:rescanModsAction()
+  if self.workState == "working" or self._inboxJob then return end
+  self.tab = "mods"
+  self:ensureModsInboxDir()
+  local candidates = self:scanModsInbox()
+  if #candidates == 0 then
+    self:_setNxModsInboxNotice()
+    return
+  end
+  local receipts = loadReceipts(MODS_RECEIPTS)
+  local items = {}
+  local conflicts, lastConflict = 0, nil
+  for _, path in ipairs(candidates) do
+    local stamp = inboxStamp(path)
+    local id = stamp and receipts[stamp]
+    local conflict = id and id:sub(1, 1) == "!"
+    if conflict then id = id:sub(2) end
+    if not (id and modTreeInstalled(id)) then
+      items[#items + 1] = { path = path, stamp = stamp,
+        name = path:match("[^/]+$") or path }
+    elseif conflict then
+      conflicts = conflicts + 1
+      lastConflict = { ok = false, text = "a mod named '" .. id .. "' is already installed" }
+    end
+  end
+  if #items == 0 then
+    self.modNotice = lastConflict or { ok = true,
+      text = Strings("Every .zip in %s/ is already installed.", MODS_INBOX_DIR) }
+    return
+  end
+  self:_startInboxJob({ kind = "mods", tab = "mods", items = items, receipts = receipts,
+    anyOk = false, failCount = conflicts, lastFail = lastConflict,
+    release = releaseModScan, progress = modScanProgress,
+    finish = RomImporter._finishModScanJob }, runModScan)
+end
+
+function RomImporter:_modScanResult(job, item, installed, res, extra)
+  if installed then
+    job.anyOk = true
+    job.lastOk = { ok = true, text = "Installed " .. tostring(res) }
+    saveReceipt(MODS_RECEIPTS, job.receipts, item.stamp, res)
+    local LauncherMods = require("src.mods.LauncherMods")
+    local checkTarget = type(extra) == "table" and extra.id and extra
+      or (type(res) == "string" and { id = res }) or nil
+    if checkTarget and LauncherMods.checkDependencies then
+      local depCheck = LauncherMods.checkDependencies(checkTarget)
+      if depCheck and depCheck.hasIssues then self._modDepResolver = depCheck end
+    end
+  else
+    if type(extra) == "table" and extra.alreadyInstalled then
+      saveReceipt(MODS_RECEIPTS, job.receipts, item.stamp, "!" .. extra.alreadyInstalled)
+    end
+    job.failCount = job.failCount + 1
+    job.lastFail = { ok = false, text = tostring(res) }
+  end
+end
+
+function RomImporter:_finishModScanJob(job, err)
+  if err then
+    job.failCount = job.failCount + 1
+    job.lastFail = { ok = false, text = "Import failed: " .. err }
+  end
+  if job.anyOk then pcall(self._refreshMods, self) end
+  if job.anyOk and job.lastFail then
+    self.modNotice = {
+      ok = true,
+      text = Strings("%s\n(%d failed: %s)", job.lastOk.text, job.failCount,
+        job.lastFail.text),
+    }
+  else
+    self.modNotice = job.lastOk or job.lastFail or self.modNotice
+  end
+end
+
+local function runSaveScan(self, job)
+  local version = job.version
+  for i, path in ipairs(job.items) do
+    job.index = i
+    local data = readListed(path)
+    local hash = (type(data) == "string" and data ~= "") and sha1(data) or nil
+    data = nil
+    if hash and job.seenHashes[hash] then
+      job.skipCount = job.skipCount + 1
+      retireImportedSav(path)
+    else
+      self.saveNotice[version] = nil
+      self:_importSave(version, path)
+      local notice = self.saveNotice and self.saveNotice[version]
+      if notice and notice.ok then
+        job.okCount = job.okCount + 1
+        job.lastOk = notice
+        if hash then
+          job.seenHashes[hash] = true
+          appendImportedSavHash(version, hash)
+        end
+        retireImportedSav(path)
+      elseif notice then
+        job.failCount = job.failCount + 1
+        job.lastFail = notice
+      end
+    end
+    coroutine.yield()
+  end
+end
+
+local function saveScanProgress(self, job)
+  local path = job.items[job.index + 1] or job.items[job.index]
+  if not path then return end
+  job.notice = { ok = true, kind = "info",
+    text = Strings("Importing %s (%d of %d) ...", path:match("[^/]+$") or path,
+      math.min(job.index + 1, #job.items), #job.items) }
+  job.text = job.notice.text
+  self.saveNotice[job.version] = job.notice
+end
+
+local function finishSaveScan(self, job, err)
+  local version = job.version
+  if err then
+    job.failCount = job.failCount + 1
+    job.lastFail = { ok = false, text = "Import failed: " .. err }
+  end
+  local okCount, failCount, skipCount = job.okCount, job.failCount, job.skipCount
+  local lastOk, lastFail = job.lastOk, job.lastFail
+  local gameLabel = GameVersion.info(version).displayName
+  if okCount > 0 then
+    local okText
+    if okCount == 1 and lastOk then
+      okText = Strings("%s (%s tab)", lastOk.text, gameLabel)
+    else
+      okText = Strings("Imported %d saves into %s. Active: %s.",
+        okCount, gameLabel, tostring(self.activeSlot[version]))
+    end
+    if failCount > 0 then
+      local failText = (lastFail and lastFail.text) or "unknown error"
+      okText = Strings("%s\n(%d failed: %s)", okText, failCount, failText)
+    end
+    if skipCount > 0 then
+      okText = Strings("%s\n(%d already imported, skipped)", okText, skipCount)
+    end
+    self.saveNotice[version] = { ok = true, text = okText }
+  elseif failCount > 0 then
+    self.saveNotice[version] = lastFail
+  elseif skipCount > 0 then
+    self.saveNotice[version] = {
+      ok = true,
+      kind = "info",
+      text = Strings("Already imported: %d file(s) skipped. Check SAVE SLOT.",
+        skipCount),
+    }
+  elseif job.notice and self.saveNotice[version] == job.notice then
+    self.saveNotice[version] = nil
+  end
+end
+
+function RomImporter:rescanSavesAction(version)
+  if self.workState == "working" or self._inboxJob then return end
+  version = self:_resolveSaveVersion(version)
+  self:ensureSavesInboxDir(version)
+  local candidates = self:scanSavesInbox(version)
+  if #candidates == 0 then
+    self:_setNxSavesInboxNotice(version)
+    return
+  end
+  self.saveNotice = self.saveNotice or {}
+  self:_startInboxJob({ kind = "saves", tab = version, version = version,
+    items = candidates, seenHashes = loadImportedSavHashes(version),
+    okCount = 0, failCount = 0, skipCount = 0,
+    progress = saveScanProgress, finish = finishSaveScan }, runSaveScan)
+end
+
+local function readRomStepped(path, job)
+  local dir = path:match("^(.*)/[^/]+$") or ""
+  if listFs(dir) ~= love.filesystem or not love.filesystem.newFile then
+    return readListed(path)
+  end
+  job.read = {}
+  local data = require("src.mods.LauncherMods").readStepped(path, function()
+    coroutine.yield()
+  end, job.read)
+  job.read = nil
+  return type(data) == "string" and data or nil
+end
+
+local function runRomScan(self, job)
+  local version = job.version
+  for i, path in ipairs(job.items) do
+    job.index = i
+    local displayName = path:match("[^/\\]+$") or path
+    local stamp = inboxStamp(path, true)
+    local hash = stamp and job.receipts[stamp]
+    local romVersion = hash and self:_versionForSha1(hash)
+    local data
+    if not hash or (romVersion == version and not self.ready[version]) then
+      data = readRomStepped(path, job)
+      if type(data) ~= "string" then
+        job.unreadable = displayName
+        return
+      end
+      hash, romVersion = nil, nil
+      if isAcceptedRomSize(#data) then
+        hash = sha1(data)
+        romVersion = self:_versionForSha1(hash)
+        if romVersion or not require("src.import.RomArchive").kind(data) then
+          saveReceipt(ROM_SCAN_RECEIPTS, job.receipts, stamp, hash)
+        end
+      end
+    end
+    if not romVersion then
+      if not (job.junkData or job.junkHash) then
+        job.junkData, job.junkHash, job.junkName = data, data == nil and hash or nil, displayName
+      end
+    elseif romVersion ~= version then
+      job.sawOtherVersion = true
+    elseif self.ready[romVersion] then
+      job.targetReady = true
+    else
+      job.matchData, job.matchName = data, displayName
+      return
+    end
+    data = nil
+    coroutine.yield()
+  end
+end
+
+local function releaseRomScan(_, job)
+  local read = job.read
+  job.read = nil
+  if read and read.file then pcall(read.file.close, read.file) end
+end
+
+local function romScanProgress(self, job)
+  local path = job.items[job.index]
+  if not path then return end
+  local notice = { version = job.version,
+    status = Strings("Checking imports/ (%d of %d) ...", job.index, #job.items),
+    detail = path:match("[^/\\]+$") or path, scanning = true }
+  job.text = notice.status .. " " .. notice.detail
+  if not (self.notice and self.notice.scanning and self.notice.status == notice.status
+      and self.notice.detail == notice.detail) then
+    self.notice = notice
+  end
+end
+
+local function finishRomScan(self, job, err)
+  local version = job.version
+  if self.notice and self.notice.scanning then self.notice = nil end
+  if err then
+    self:setError("The imports/ scan failed: " .. err, version)
+    return
+  end
+  if job.unreadable then
+    self:setError("The file could not be read: " .. job.unreadable, version)
+    return
+  end
+  if job.matchData then
+    self:startData(job.matchData, job.matchName)
+    return
+  end
+  if job.targetReady then
+    self.notice = {
+      version = version,
+      status = Strings("No new ROM found."),
+      detail = Strings("Already-imported dumps are ignored. Add another version or "
+        .. "delete the copy when finished."),
+    }
+    return
+  end
+  if job.junkData and not job.sawOtherVersion then
+    self:startData(job.junkData, job.junkName)
+    return
+  end
+  if job.junkHash and not job.sawOtherVersion then
+    self:setError(unsupportedRomText(self, job.junkHash), version)
+    return
+  end
+  local label = GameVersion.info(version).displayName
+  self.notice = {
+    version = version,
+    status = Strings("No matching ROM found."),
+    detail = Strings(
+      "%s is matched by SHA-1 on this tab. Other dumps in imports/ stay "
+        .. "for their own tabs; open that game and Scan again.", label),
+  }
+end
+
+function RomImporter:rescanAction(version)
+  if self.workState == "working" or self._inboxJob then return end
+  version = version or self.tab or "red"
+  self.chooseVersion = version
+  self:ensureImportsDir()
+  local candidates = self:scanInbox()
+  if #candidates == 0 then
+    self:_setNxInboxNotice(version)
+    return
+  end
+  self:_startInboxJob({ kind = "roms", tab = version, version = version,
+    items = candidates, receipts = loadReceipts(ROM_SCAN_RECEIPTS),
+    release = releaseRomScan, progress = romScanProgress, finish = finishRomScan },
+    runRomScan)
+end
+
+function RomImporter:_romAction(version)
+  if self:_inboxImport() then
+    if self.ready[version] then self:reimport(version)
+    else self:rescanAction(version) end
+  elseif self.ready[version] then self:reimport(version)
+  else self:choose(version) end
+end
+
+-- Sanitize a string before it is interpolated into a picker shell command:
+--   * "%" would be eaten as a string.format directive (#665);
+--   * '"' would break the AppleScript / zenity double-quoted argument and
+--     "'" the surrounding single-quoted shell string.
+local function shellSafe(s)
+  s = tostring(s):gsub("%%", "%%%%")
+  return s:gsub('"', '\\"'):gsub("'", "''")
 end
 
 -- LOVE 11.5 on Android has no native file picker (love.window.showFileDialog
@@ -302,17 +1464,25 @@ end
 -- it directly through love.filesystem -- already mounted at the physfs
 -- root, so no io.* absolute-path handling is needed.
 --
--- Only a .gb whose SHA maps to a version that is not yet ready counts as
--- pending.  GameActivity always writes the SAF pick to picked_rom.gb, so a
--- naive "first .gb wins" scan would re-import Red when the player tries to
--- add Blue (issue #167).
-local function findPendingRom(ready)
+-- Only a .gb/.gbc/.gba whose SHA maps to a version that is not yet ready
+-- counts as pending.  GameActivity always writes the SAF pick to
+-- picked_rom.gb, so a naive "first ROM wins" scan would re-import Red when
+-- the player tries to add Blue (issue #167).  Yellow and Gold carts are
+-- typically .gbc (Gold is 2 MiB); FireRed is a 16 MiB .gba.
+-- `wanted` narrows the scan to one version.  A Choose names the cart it is
+-- for, so without it several dumps sitting in the save directory answered in
+-- listing order and the selection was dropped: picking Red imported Blue
+-- (#1274).  The callers that are not a Choose, the Android USB-drop scans,
+-- pass nothing and still take the first pending cart of any version.
+local function findPendingRom(self, wanted)
+  local ready = self.ready
   for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
-    if name:lower():match("%.gb$") and love.filesystem.getInfo(name, "file") then
+    if isRomFilename(name) and love.filesystem.getInfo(name, "file") then
       local data = love.filesystem.read(name)
-      if type(data) == "string" and #data == 1024 * 1024 then
-        local version = GameVersion.forSha1(sha1(data))
-        if version and not ready[version] then
+      if type(data) == "string" and isAcceptedRomSize(#data) then
+        local version = self:_versionForSha1(sha1(data))
+        if version and not ready[version]
+            and (wanted == nil or version == wanted) then
           return name, data
         end
       end
@@ -321,18 +1491,53 @@ local function findPendingRom(ready)
   return nil
 end
 
+local function importPendingRom(self)
+  local name, data = findPendingRom(self, self.chooseVersion)
+  if not name then return false end
+  self:startData(data, name)
+  return true
+end
+
+-- GameActivity always writes the SAF pick to picked_rom.gb, so a leftover
+-- under that exact basename is the file the player just chose and
+-- findPendingRom silently refused: wrong size, or a hacked/overdumped cart
+-- whose SHA-1 matches no known version ([b]/[BF] dumps never will).  Route it
+-- through startData so the launcher says which of the two it was instead of
+-- staying on "No ROM imported" with no message at all (issue #442), and drop
+-- the file so the next tap starts from a clean slate.  A cart that is simply
+-- already imported is not an error -- #167 skips it on purpose -- so leave
+-- that one alone.
+local function consumePickedRomError(self)
+  local preferred = "picked_rom.gb"
+  if not love.filesystem.getInfo(preferred, "file") then return false end
+  local data = love.filesystem.read(preferred)
+  if type(data) == "string" and isAcceptedRomSize(#data) then
+    local version = self:_versionForSha1(sha1(data))
+    if version and self.ready[version] then return false end
+  end
+  love.filesystem.remove(preferred)
+  if type(data) ~= "string" then
+    self:setError("The picked file could not be read. Reopen the picker and "
+      .. "choose the ROM with the Files (Documents) app.")
+    return true
+  end
+  self:startData(data, preferred)
+  return true
+end
+
 -- Android SAF writes mod picks to picked_mod.zip; USB copies may use any
 -- .zip basename at the save-dir root.  preferAny=true also accepts those USB
 -- copies (Choose / Import); focus only consumes the SAF basename so a random
 -- leftover archive is never auto-installed on every refocus.
-local function findPendingMod(preferAny)
+local function findPendingMod(preferAny, skip)
   local preferred = "picked_mod.zip"
   if love.filesystem.getInfo(preferred, "file") then
     return preferred
   end
   if not preferAny then return nil end
   for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
-    if name:lower():match("%.zip$") and love.filesystem.getInfo(name, "file") then
+    if name:lower():match("%.zip$") and not (skip and skip[name])
+        and love.filesystem.getInfo(name, "file") then
       return name
     end
   end
@@ -340,75 +1545,159 @@ local function findPendingMod(preferAny)
 end
 
 -- Same pattern as findPendingMod for battery saves (picked_save.sav / *.sav).
-local function findPendingSav(preferAny)
-  local preferred = "picked_save.sav"
-  if love.filesystem.getInfo(preferred, "file") then
-    return preferred
+-- Android/iOS SAF writes a cart pick to picked_cart.g1rcart. USB copies may
+-- use any .g1rcart basename at the save-dir root. preferAny=true also accepts
+-- those copies (Import). Focus only consumes the SAF basename so a leftover
+-- cart file is never auto-installed on every refocus.
+local function findPendingCart(preferAny, skip)
+  if love.filesystem.getInfo(PICKED_CART, "file") then
+    return PICKED_CART
   end
   if not preferAny then return nil end
   for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
-    if name:lower():match("%.sav$") and love.filesystem.getInfo(name, "file") then
+    if name:lower():match("%.g1rcart$") and not (skip and skip[name])
+        and love.filesystem.getInfo(name, "file") then
       return name
     end
   end
   return nil
 end
 
-local function chooseRom(promptName)
-  promptName = promptName or "Pokemon"
-  local prompt = "Choose your " .. promptName .. " ROM"
-  local platform = love.system.getOS()
-  if platform == "OS X" then
-    return commandOutput(
-      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"gb"})' 2>/dev/null]])
-        :format(prompt))
-  elseif platform == "Windows" then
-    local script = table.concat({
-      "Add-Type -AssemblyName System.Windows.Forms;",
-      "$d=New-Object System.Windows.Forms.OpenFileDialog;",
-      "$d.Title='" .. prompt .. "';",
-      "$d.Filter='Game Boy ROM (*.gb)|*.gb|All files (*.*)|*.*';",
-      -- write the pick as UTF-8: the console's OEM codepage would mangle
-      -- non-ASCII names (Pokémon -> Pok\x82mon) and crash any text draw
-      -- that shows them (#325)
-      "if($d.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write($d.FileName)}",
-    })
-    return commandOutput(
-      'powershell -NoProfile -STA -Command "' .. script .. '"')
-  elseif platform == "Linux" then
-    local path = commandOutput(
-      ([[zenity --file-selection --title="%s" --file-filter="Game Boy ROM | *.gb" 2>/dev/null]])
-        :format(prompt))
-    if path then return path end
-    return commandOutput(
-      [[kdialog --getopenfilename "$HOME" "*.gb|Game Boy ROM" 2>/dev/null]])
+local function findPendingSav(preferAny, skip)
+  local preferred = "picked_save.sav"
+  if love.filesystem.getInfo(preferred, "file") then
+    return preferred
+  end
+  if not preferAny then return nil end
+  for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
+    if name:lower():match("%.sav$") and name:lower() ~= "pending_export.sav"
+        and not (skip and skip[name])
+        and love.filesystem.getInfo(name, "file") then
+      return name
+    end
   end
   return nil
 end
 
--- Open a native picker for a mod .zip (mirrors chooseRom's per-OS dialogs).
--- Returns the chosen absolute path or nil.  Android uses love.system.pickFile
--- ("mod") instead -- see RomImporter:chooseMod.
-local function chooseZip()
-  local prompt = Strings("Choose a mod .zip")
+local function pickerHasKind(kind)
+  local fn = love.system.pickFileKinds
+  if type(fn) ~= "function" then return false end
+  local ok, kinds = pcall(fn)
+  if not ok or type(kinds) ~= "string" then return false end
+  for token in kinds:gmatch("[^,%s]+") do
+    if token == kind then return true end
+  end
+  return false
+end
+
+local function findPendingRequiredImport(self)
+  local names = { "picked_required_import.bin", "picked_stadium.z64" }
+  -- Builds released before required_import was added to the Android JNI bridge
+  -- only understand the long-standing "rom" picker kind.  While a required
+  -- import request is in flight, it is safe to treat its staging name as a
+  -- dependency file: the pending IDs below select the same validation/copy
+  -- path as a current bridge.  Never scan picked_rom.gb otherwise, since that
+  -- remains reserved for an ordinary game-ROM import.
+  if self and self.requiredImportLegacyRomPick
+      and self.pickerPendingKind == "required_import" then
+    names[#names + 1] = "picked_rom.gb"
+  end
+  for _, name in ipairs(names) do
+    if love.filesystem.getInfo(name, "file") then return name end
+  end
+  return nil
+end
+
+local function importerPickName(importerId)
+  return "picked_importer_" .. tostring(importerId) .. ".bin"
+end
+
+local function findPendingImporter(self)
+  if self and self.pickerPendingImporterId then
+    local name = importerPickName(self.pickerPendingImporterId)
+    if love.filesystem.getInfo(name, "file") then
+      return name, self.pickerPendingImporterId
+    end
+    return nil
+  end
+
+  local Importers = require("src.import.Importers")
+  for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
+    local importerId = name:lower():match(
+      "^picked_importer_([%l%d_%-]+)%.bin$")
+    if importerId and Importers.get(importerId)
+        and love.filesystem.getInfo(name, "file") then
+      return name, importerId
+    end
+  end
+  return nil
+end
+
+-- Retire an Android pick once it has been through the installer / importer,
+-- whether or not it worked: a pick left on disk wins the scans above forever,
+-- so the next tap re-runs the same failing file and the picker never reopens
+-- (#420).  The SAF basename is GameActivity's own copy of the pick and is
+-- always deleted; a USB copy is the player's file, so a failed one is only
+-- skipped for the rest of the session.
+local function consumePick(self, name, safName, ok)
+  if ok or name == safName then
+    love.filesystem.remove(name)
+    return
+  end
+  self.pickSkip = self.pickSkip or {}
+  self.pickSkip[name] = true
+end
+
+function RomImporter._pickerGlobs(exts)
+  local globs = {}
+  for _, ext in ipairs(exts) do
+    globs[#globs + 1] = "*." .. ext:lower()
+    if ext:upper() ~= ext:lower() then
+      globs[#globs + 1] = "*." .. ext:upper()
+    end
+  end
+  return globs
+end
+
+local function romPickerExts()
+  local exts = { "gb", "gbc", "gba" }
+  local ok, RomArchive = pcall(require, "src.import.RomArchive")
+  if ok then
+    local caps = RomArchive.capabilities()
+    if caps.zip then exts[#exts + 1] = "zip" end
+    if caps.z7 then exts[#exts + 1] = "7z" end
+  end
+  return exts
+end
+
+local function chooseRom(promptName)
+  promptName = promptName or "Pokemon"
+  local prompt = shellSafe("Choose your " .. promptName .. " ROM")
   local platform = love.system.getOS()
+  local quoted, globs, semis = {}, {}, {}
+  local exts = romPickerExts()
+  for _, ext in ipairs(exts) do
+    quoted[#quoted + 1] = ('"%s"'):format(ext)
+    semis[#semis + 1] = "*." .. ext
+  end
+  globs = RomImporter._pickerGlobs(exts)
   if platform == "OS X" then
     return commandOutput(
-      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"zip"})' 2>/dev/null]])
-        :format(prompt))
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {%s})' 2>/dev/null]])
+        :format(prompt, table.concat(quoted, ", ")))
   elseif platform == "Windows" then
     local script = table.concat({
-      "Add-Type -AssemblyName System.Windows.Forms;",
-      "$d=New-Object System.Windows.Forms.OpenFileDialog;",
+      HostPicker.WIN_OPEN_DIALOG,
       "$d.Title='" .. prompt .. "';",
-      "$d.Filter='Mod archive (*.zip)|*.zip|All files (*.*)|*.*';",
+      "$d.Filter='Game Boy / GBA ROM (" .. table.concat(semis, ";") .. ")|"
+        .. table.concat(semis, ";") .. "|All files (*.*)|*.*';",
       -- copy the pick to a plain-ASCII temp name and answer with that:
       -- the console's OEM codepage would mangle a non-ASCII path
       -- (Pokémon -> Pok\x82mon) and io.open on Windows needs ANSI bytes,
       -- so returning the original name both crashed the notice draw and
-      -- could never have opened the file (#325)
-      "if($d.ShowDialog() -eq 'OK'){",
-      "$t=Join-Path $env:TEMP 'pokeport_mod_pick.zip';",
+      -- could never have opened the file (#325, #665)
+      HostPicker.WIN_SHOW,
+      "$t=Join-Path $env:TEMP 'pokeport_rom_pick.gb';",
       "Copy-Item -LiteralPath $d.FileName -Destination $t -Force;",
       "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
       "[Console]::Write($t)}",
@@ -417,11 +1706,127 @@ local function chooseZip()
       'powershell -NoProfile -STA -Command "' .. script .. '"')
   elseif platform == "Linux" then
     local path = commandOutput(
+      ([[zenity --file-selection --title="%s" --file-filter="Game Boy / GBA ROM | %s" 2>/dev/null]])
+        :format(prompt, table.concat(globs, " ")))
+    if path then return path end
+    return commandOutput(
+      ([[kdialog --getopenfilename "$HOME" "%s|Game Boy / GBA ROM" 2>/dev/null]])
+        :format(table.concat(globs, " ")))
+  end
+  return nil
+end
+
+-- chooseRom for an importer's own dump: same per-OS dialogs, but the file
+-- types come from the importer descriptor rather than being Game Boy ROMs.
+local function chooseImporterFile(promptName, exts)
+  local prompt = shellSafe("Choose your " .. (promptName or "game") .. " dump")
+  local platform = love.system.getOS()
+  local quoted, globs, semis = {}, {}, {}
+  for _, ext in ipairs(exts) do
+    quoted[#quoted + 1] = ('"%s"'):format(ext)
+    globs[#globs + 1] = "*." .. ext
+    semis[#semis + 1] = "*." .. ext
+  end
+  if platform == "OS X" then
+    return commandOutput(
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {%s})' 2>/dev/null]])
+        :format(prompt, table.concat(quoted, ", ")))
+  elseif platform == "Windows" then
+    local script = table.concat({
+      HostPicker.WIN_OPEN_DIALOG,
+      "$d.Title='" .. prompt .. "';",
+      "$d.Filter='Cartridge dump (" .. table.concat(semis, ";") .. ")|"
+        .. table.concat(semis, ";") .. "|All files (*.*)|*.*';",
+      HostPicker.WIN_SHOW,
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($d.FileName)}",
+    })
+    return commandOutput(
+      'powershell -NoProfile -STA -Command "' .. script .. '"')
+  elseif platform == "Linux" then
+    local path = commandOutput(
+      ([[zenity --file-selection --title="%s" --file-filter="Cartridge dump | %s" 2>/dev/null]])
+        :format(prompt, table.concat(globs, " ")))
+    if path then return path end
+    return commandOutput(
+      ([[kdialog --getopenfilename "$HOME" "%s|Cartridge dump" 2>/dev/null]])
+        :format(table.concat(globs, " ")))
+  end
+  return nil
+end
+
+local function zipPickCommands()
+  local prompt = shellSafe(Strings("Choose a mod .zip"))
+  local platform = love.system.getOS()
+  if platform == "OS X" then
+    return {
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"zip"})' 2>/dev/null]])
+        :format(prompt) }
+  elseif platform == "Windows" then
+    local script = table.concat({
+      HostPicker.WIN_OPEN_DIALOG,
+      "$d.Title='" .. prompt .. "';",
+      "$d.Filter='Mod archive (*.zip)|*.zip|All files (*.*)|*.*';",
+      -- copy the pick to a plain-ASCII temp name and answer with that:
+      -- the console's OEM codepage would mangle a non-ASCII path
+      -- (Pokémon -> Pok\x82mon) and io.open on Windows needs ANSI bytes,
+      -- so returning the original name both crashed the notice draw and
+      -- could never have opened the file (#325)
+      HostPicker.WIN_SHOW,
+      "$t=Join-Path $env:TEMP 'pokeport_mod_pick.zip';",
+      "Copy-Item -LiteralPath $d.FileName -Destination $t -Force;",
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($t)}",
+    })
+    return { 'powershell -NoProfile -STA -Command "' .. script .. '"' }
+  elseif platform == "Linux" then
+    return {
       ([[zenity --file-selection --title="%s" --file-filter="Mod archive | *.zip" 2>/dev/null]])
+        :format(prompt),
+      [[kdialog --getopenfilename "$HOME" "*.zip|Mod archive" 2>/dev/null]],
+    }
+  end
+  return nil
+end
+
+local function chooseZip()
+  for _, command in ipairs(zipPickCommands() or {}) do
+    local path = commandOutput(command)
+    if path then return path end
+  end
+  return nil
+end
+
+RomImporter._zipPickCommands = zipPickCommands
+
+local function chooseSkinZip()
+  local prompt = shellSafe(Strings("Choose a skin .zip or .deltaskin"))
+  local platform = love.system.getOS()
+  if platform == "OS X" then
+    return commandOutput(
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"zip", "deltaskin"})' 2>/dev/null]])
+        :format(prompt))
+  elseif platform == "Windows" then
+    local script = table.concat({
+      HostPicker.WIN_OPEN_DIALOG,
+      "$d.Title='" .. prompt .. "';",
+      "$d.Filter='Skin archive (*.zip;*.deltaskin)|*.zip;*.deltaskin|All files (*.*)|*.*';",
+      HostPicker.WIN_SHOW,
+      "$n=[IO.Path]::GetFileName($d.FileName) -replace '[^\\x20-\\x7E]','_';",
+      "$t=Join-Path $env:TEMP $n;",
+      "Copy-Item -LiteralPath $d.FileName -Destination $t -Force;",
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($t)}",
+    })
+    return commandOutput(
+      'powershell -NoProfile -STA -Command "' .. script .. '"')
+  elseif platform == "Linux" then
+    local path = commandOutput(
+      ([[zenity --file-selection --title="%s" --file-filter="Skin archive | *.zip *.deltaskin" 2>/dev/null]])
         :format(prompt))
     if path then return path end
     return commandOutput(
-      [[kdialog --getopenfilename "$HOME" "*.zip|Mod archive" 2>/dev/null]])
+      [[kdialog --getopenfilename "$HOME" "*.zip *.deltaskin|Skin archive" 2>/dev/null]])
   end
   return nil
 end
@@ -430,30 +1835,80 @@ end
 -- dialogs).  Returns the chosen absolute path or nil.  Android uses
 -- love.system.pickFile("sav") instead -- see RomImporter:chooseSaveImport.
 local function chooseSav()
-  local prompt = Strings("Choose a .sav save file")
+  local prompt = shellSafe(Strings("Choose a .sav save file"))
   local platform = love.system.getOS()
   if platform == "OS X" then
     return commandOutput(
-      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"sav"})' 2>/dev/null]])
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s" of type {"sav", "srm", "lua"})' 2>/dev/null]])
         :format(prompt))
   elseif platform == "Windows" then
     local script = table.concat({
-      "Add-Type -AssemblyName System.Windows.Forms;",
-      "$d=New-Object System.Windows.Forms.OpenFileDialog;",
+      HostPicker.WIN_OPEN_DIALOG,
       "$d.Title='" .. prompt .. "';",
-      "$d.Filter='Game Boy save (*.sav)|*.sav|All files (*.*)|*.*';",
-      -- UTF-8, like the ROM and mod pickers (#325)
-      "if($d.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Write($d.FileName)}",
+      "$d.Filter='Save file (*.sav;*.lua)|*.sav;*.lua|All files (*.*)|*.*';",
+      -- copy the pick to a plain-ASCII temp name: io.open on Windows
+      -- needs ANSI bytes, so a non-ASCII path (Pokémon -> Pok\x82mon)
+      -- could never have been opened (#325, #665)
+      HostPicker.WIN_SHOW,
+      "$t=Join-Path $env:TEMP 'pokeport_sav_pick.sav';",
+      "Copy-Item -LiteralPath $d.FileName -Destination $t -Force;",
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($t)}",
     })
     return commandOutput(
       'powershell -NoProfile -STA -Command "' .. script .. '"')
   elseif platform == "Linux" then
     local path = commandOutput(
-      ([[zenity --file-selection --title="%s" --file-filter="Game Boy save | *.sav" 2>/dev/null]])
+      ([[zenity --file-selection --title="%s" --file-filter="Save file | *.sav *.srm *.lua" 2>/dev/null]])
         :format(prompt))
     if path then return path end
     return commandOutput(
-      [[kdialog --getopenfilename "$HOME" "*.sav|Game Boy save" 2>/dev/null]])
+      [[kdialog --getopenfilename "$HOME" "*.sav *.srm *.lua|Save file" 2>/dev/null]])
+  end
+  return nil
+end
+
+-- Generic user-supplied dependency picker. Keep the native prompt entirely
+-- engine-owned: manifest labels are untrusted and must never enter shell
+-- command templates. The LÖVE modal already shows the specific import name.
+-- Declared extensions are validated by Manifest as "." plus alphanumerics, so
+-- they are safe inside the dialog filter.
+local function windowsFilter(spec)
+  local exts = spec and spec.extensions
+  if not exts then return "All files (*.*)|*.*" end
+  local globs = {}
+  for i, ext in ipairs(exts) do globs[i] = "*" .. ext end
+  local list = table.concat(globs, ";")
+  return list .. "|" .. list .. "|All files (*.*)|*.*"
+end
+
+local function chooseRequiredFile(spec)
+  local prompt = shellSafe(Strings("Choose required mod file"))
+  local platform = love.system.getOS()
+  if platform == "OS X" then
+    return commandOutput(
+      ([[osascript -e 'POSIX path of (choose file with prompt "%s")' 2>/dev/null]])
+        :format(prompt))
+  elseif platform == "Windows" then
+    local script = table.concat({
+      HostPicker.WIN_OPEN_DIALOG,
+      "$d.Title='" .. prompt .. "';",
+      "$d.Filter='" .. windowsFilter(spec) .. "';",
+      -- Required imports can be multi-gigabyte optical-disc images. Do NOT
+      -- stage them through %TEMP%: that doubles free-space requirements and a
+      -- failed Copy-Item can leave a plausible-looking truncated temp file.
+      -- Stream the selected source directly into the mod-owned destination.
+      HostPicker.WIN_SHOW,
+      "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+      "[Console]::Write($d.FileName)}",
+    })
+    return commandOutput(
+      'powershell -NoProfile -STA -Command "' .. script .. '"')
+  elseif platform == "Linux" then
+    local path = commandOutput(
+      ([[zenity --file-selection --title="%s" 2>/dev/null]]):format(prompt))
+    if path then return path end
+    return commandOutput([[kdialog --getopenfilename "$HOME" 2>/dev/null]])
   end
   return nil
 end
@@ -464,32 +1919,115 @@ end
 -- import-only run all skip the release check so headless and CI runs never spin
 -- up the background worker or reach out to the network.
 local function updaterAllowed()
-  if not (love.filesystem.isFused and love.filesystem.isFused()) then return false end
+  if not Platform.networkValidated() then return false end
+  local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+  local okb, Boot = pcall(require, "src.update.Boot")
+  local canUpdate = (okb and type(Boot) == "table" and type(Boot.canUpdateInPlace) == "function"
+      and Boot.canUpdateInPlace())
+    or (love and love.filesystem and love.filesystem.isFused and love.filesystem.isFused())
+    or isHandheld
+  if not canUpdate then
+    return false
+  end
   if os.getenv("POKEPORT_AUTOPILOT") or os.getenv("POKEPORT_DRIVER") then return false end
   if os.getenv("POKEPORT_IMPORT_ONLY") == "1" then return false end
   return true
 end
 
--- The launcher runs Red and Blue as two independent columns.  Each dropped or
+RomImporter._updaterAllowed = updaterAllowed
+
+-- #835: which column the launcher opens on.  `tab` starts at the --game
+-- shortcut's version (LaunchOptions.pendingTab) or Red; this then prefers the
+-- game play() last handed off, so relaunching lands on the game that was last
+-- played instead of always Red.  An explicit --game still wins, and a
+-- remembered version whose cache is gone or stale is ignored, since opening a
+-- column with no Play button would read as the launcher losing the import.
+-- Called from new() once self.ready is filled, which is what that check needs.
+function RomImporter:_applyLastVersionTab()
+  local okOpt, opts = pcall(function()
+    return require("src.core.SaveData").loadOptions()
+  end)
+  self:_restoreActiveCarts(okOpt and opts or nil)
+  local okLO, LO = pcall(require, "src.core.LaunchOptions")
+  if okLO and LO.pendingTab then return end
+  if os.getenv("POKEPORT_LAUNCHER_TAB") then return end
+  local last = okOpt and opts and opts.lastVersion
+  if last and GameVersion.VERSIONS[last] and self.ready[last]
+      and SecretGames.shown(self, last) then
+    self.tab = last
+  end
+end
+
+-- The launcher runs each GameVersion as an independent tab.  Each dropped or
 -- chosen ROM is routed to its version by SHA-1, extracted into that version's
--- own cache (Red at the root, Blue under blue/), so both can be imported and
--- played side by side.  onComplete(version) hands the chosen game off to boot.
+-- own cache (Red at the root, Blue under blue/, Yellow under yellow/), so all
+-- can be imported and played side by side.  onComplete(version, cartId) hands
+-- the chosen game -- and the custom cart its page is showing, if any -- off to
+-- boot.
 -- opts: launcher (a fresh import stays on the launcher instead of auto-booting),
 -- forceImport (treat every version as not-yet-imported, so re-import is forced),
 -- onEditSave(version, slotId) (host handler for the Edit affordance on a save
 -- row -- main.lua opens the bundled save editor on that slot; when it is not
--- supplied the Edit label is not drawn at all).
+-- supplied the Edit label is not drawn at all),
+-- onEditTouchControls() (host handler for the Touch Controls button -- main.lua
+-- opens the layout editor; when it is not supplied the button is not drawn).
 function RomImporter.new(onComplete, opts)
   opts = opts or {}
-  local android = love.system.getOS() == "Android"
+  -- iOS rides the same mobile import flows as Android: the save-dir
+  -- pending-file scan plus love.system.pickFile / createFile, provided
+  -- natively by the Swift GRPickerBridge (mobile/ios/native/).  The flag
+  -- keeps its historical name so every Android call site stays untouched.
+  -- NX uses a separate save-directory inbox (isNX / romImportMode) and must
+  -- never set android or take the mobile delete-after-import path.
+  local mobileOS = love.system.getOS()
+  local isNX = Platform.isNX()
+  local romImportMode = Platform.romImportMode()
+  local mobileFileBridge = mobileOS == "Android" or mobileOS == "iOS"
+  local android = mobileFileBridge
   local CacheFs = require("src.import.CacheFs")
   local self = setmetatable({
     onComplete = onComplete,
     launcher = opts.launcher or false,
+    cartShape = os.getenv("POKEPORT_CART_SHAPE") == "gba" and "gba" or nil,
     forceImport = opts.forceImport or false,
     onEditSave = opts.onEditSave,
+    onEditTouchControls = opts.onEditTouchControls,
+    onOpenSkinStudio = opts.onOpenSkinStudio,
+    isNX = isNX,
+    -- Save-directory inbox import (Switch, PS4): see _inboxImport().
+    inboxImport = romImportMode == "save-directory",
+    romImportMode = romImportMode,
+    mobileFileBridge = mobileFileBridge,
     android = android,
-    tab = "red",          -- active launcher tab: "red"/"blue"/"yellow"/"mods"
+    ios = mobileOS == "iOS",
+    nativePicker = romImportMode == "native-picker",
+    baseRomDiscovery = opts.launcher and Platform.isUWP(),
+    baseRoms = {},
+    baseRomScan = nil,
+    -- One startup poll pass on both mobiles.  iOS: files dropped through the
+    -- Files app are swept into the save dir before Lua boots (GRBootstrap) with
+    -- no love.focus event necessarily following.  Android: the SAF picker is a
+    -- separate activity, and Android is free to destroy GameActivity while it
+    -- is up (memory pressure, or "Don't keep activities"), so the app RESTARTS
+    -- instead of resuming and the love.focus(true) that would have consumed the
+    -- pick never arrives.  The file is sitting in the save dir either way, so
+    -- boot armed and let the first poll tick consume it, rather than making the
+    -- player tap Import a second time to trigger the scan by hand (#553).
+    pickPending = mobileFileBridge or nil,
+    -- Mobile drag-scroll goes through FlexLove.touch* (main.lua forwards the
+    -- full touch stream while the launcher is up). love.touch remains pollable
+    -- for click hit-testing inside EventHandler.
+    touchPollable = mobileFileBridge and love.touch ~= nil
+      and love.touch.getTouches ~= nil and love.touch.getPosition ~= nil,
+    -- Active launcher tab: "red"/"blue"/"yellow"/"mods"/"find".  A --game
+    -- shortcut for a version that is not importable yet lands here, so the
+    -- player at least arrives on the tab they asked for (src/core/LaunchOptions).
+    tab = (function()
+      local okLO, LO = pcall(require, "src.core.LaunchOptions")
+      return (okLO and LO.pendingTab) or os.getenv("POKEPORT_LAUNCHER_TAB") or "red"
+    end)(),
     logo = love.graphics.newImage("assets/logo/logo.png"),
     bcg = love.graphics.newImage("assets/logo/bcg.png"),
     ready = {}, returning = {}, romName = {},
@@ -504,6 +2042,7 @@ function RomImporter.new(onComplete, opts)
     -- any slot mutation); activeSlot drives the LOADED pill; slotScroll is the
     -- per-version list scroll offset (px), clamped against content in draw.
     slots = {}, activeSlot = {}, slotScroll = {},
+    carts = {}, activeCart = {},
     -- SAVE FILES card state: the last import/export result per version, shown as
     -- a green/red notice line under the Import save / Export save buttons.  A
     -- successful export carries { dir } so the notice can offer an open-folder
@@ -511,15 +2050,42 @@ function RomImporter.new(onComplete, opts)
     saveNotice = {},
     -- MODS panel state (pass 3): mods is the cached LauncherMods.list() array
     -- (refreshed lazily on first draw and after any toggle/install/delete);
-    -- modScroll is the list scroll offset (px, clamped in draw); modNotice is
-    -- the last install/delete result { ok, text } shown as a line above the list.
-    mods = nil, modScroll = 0, modNotice = nil,
+    -- modNotice is the last install/delete result { ok, text }.
+    -- requiredImportNotice stays inside the imported-files modal so validation
+    -- failures are visible beside the file picker that caused them.
+    mods = nil, modNotice = nil, issueNotice = nil,
+    requiredImportNotice = nil,
+    -- Which game the MODS panel is answering for (a GameVersion id, nil =
+    -- every game).  Rows resolve their enable-state and their "runs here"
+    -- verdict against it (src/mods/ModTargets.lua).
+    modScope = nil,
+    -- FIND MODS panel state (src/mods/ModIndex.lua).  findLoaded gates the
+    -- first fetch the way `mods = nil` gates the mods list, but it is a flag
+    -- rather than a nil listing because "no index added" is a legitimate
+    -- loaded state and must not re-fetch every frame.  findSources is the
+    -- player's index list from options; findIndex is the merged listing;
+    -- _findThumbs caches one image per mod id (false = fetched and failed).
+    findLoaded = false, findSources = nil, findIndex = nil,
+    findInstalled = nil, findScroll = 0, findNotice = nil, findQuery = "",
+    findCategory = nil, _findSearchFocus = false, _findThumbs = nil,
+    _findVisibleEntries = nil,
+    -- Which half of the feed the panel is browsing.  Mods by default: carts
+    -- are the newer, much shorter list, and a feed may carry none at all.
+    findKind = "mods", findBase = nil,
+    findGame = nil,
+    skinUrl = "", _skinUrlFocus = false,
+    -- Page scroll offset (px) for the column under the tab bar -- panel, updater
+    -- banner and footer -- used only while that column is taller than the window
+    -- (see draw()).  Clamped against content in draw, reset on a tab change.
+    pageScroll = 0,
     -- Android SAF: which game tab should receive the next picked_save.sav when
     -- focus consumes it (set by chooseSaveImport before opening the picker).
     androidPendingVersion = nil,
     -- Android SAF create-document: which game's SAVE FILES card should show
     -- "Save exported." when export_done.flag appears on focus.
     androidPendingExportVersion = nil,
+    pickerPendingKind = nil,
+    pickerPendingVersion = nil,
     -- Virtual pointer for handhelds / gamepads (Anbernic stock OS has no
     -- mouse).  D-pad + left stick move it; A clicks; shoulders cycle tabs;
     -- right stick scrolls the save-slot / mods lists.
@@ -527,8 +2093,14 @@ function RomImporter.new(onComplete, opts)
     _padCursorActive = false,
     _padAxis = { leftx = 0, lefty = 0, righty = 0 },
     _padDir = {},
+    _rawHatDirs = {},
     _padInited = false,
   }, RomImporter)
+
+  -- Pre-#899 installs keep Red's extracted cache at the save-dir root; move
+  -- it under red/ before the readiness loop looks for red/ paths, or every
+  -- such install would read as "never imported" and demand the ROM again.
+  CacheFs.migrateLegacyRedCache()
 
   for _, version in ipairs(GameVersion.ORDER) do
     local info = GameVersion.info(version)
@@ -536,21 +2108,77 @@ function RomImporter.new(onComplete, opts)
     self.ready[version] = ready
     -- a marker present but for an older cache generation / different ROM means
     -- "update required" (re-import) rather than a clean first-run choose
-    local saved = CacheFs.prefix
-    CacheFs.prefix = info.cachePrefix
-    local marker = CacheFs.read(MARKER_PATH)
-    CacheFs.prefix = saved
+    local marker = CacheContract.readMarker(version, CacheFs)
     self.returning[version] =
-      (not ready) and marker ~= nil and marker ~= markerFor(version)
-    self.romName[version] = "pokemon_" .. info.id .. ".gb"
+      (not ready) and marker ~= nil and not CacheContract.markerMatches(version, marker)
+    local gen = GameVersion.generation(version)
+    local ext = ".gb"
+    if gen == 3 then
+      ext = ".gba"
+    elseif info.id == "yellow" or gen == 2 then
+      ext = ".gbc"
+    end
+    self.romName[version] = "pokemon_" .. info.id .. ext
   end
+  if GameVersion.VERSIONS[self.tab] and not SecretGames.shown(self, self.tab) then
+    self.tab = "red"
+  end
+  local portableErr = CacheFs.portableError()
+  if portableErr then
+    self.notice = {
+      version = self.tab or "red",
+      status = Strings("Portable folder unavailable"),
+      detail = portableErr,
+    }
+  end
+  RomImporter.syncAndroidShortcuts()
+  Transition.reset()
+  Transition.armed = false
+  local okMotion, motionOpts = pcall(function()
+    return require("src.core.SaveData").loadOptions()
+  end)
+  Transition.reduceMotion = os.getenv("POKEPORT_REDUCE_MOTION") == "1"
+    or opts.reduceMotion == true
+    or (okMotion and type(motionOpts) == "table"
+      and motionOpts.reduceMotion == true) or false
+  self:_applyLastVersionTab()
+  if type(opts.initialTab) == "string" and opts.initialTab ~= "" then
+    self:_switchTab(opts.initialTab)
+  end
+  if type(opts.invite) == "string" and opts.invite ~= "" then
+    self:_switchTab("online")
+    local okOnline, OnlinePanel = pcall(require, "src.import.OnlinePanel")
+    if okOnline then
+      pcall(OnlinePanel.deepLink, self, { invite = opts.invite }, "player")
+    end
+  end
+  self:_queueBaseRomScan()
+  self:_queueLaunchReimports()
 
-  -- Android: import a save-dir .gb that is not yet ready (USB drop or a
+  -- Android: import a save-dir .gb/.gbc/.gba that is not yet ready (USB drop or a
   -- leftover SAF pick), routed by SHA-1.  Already-imported carts are skipped
-  -- so a stale picked_rom.gb cannot block the opposite version.
-  if android and not (self.ready.red and self.ready.blue) then
-    local name, data = findPendingRom(self.ready)
-    if name then self:startData(data, name) end
+  -- so a stale picked_rom.gb cannot block another version.
+  local needRom = false
+  for _, version in ipairs(GameVersion.ORDER) do
+    if not self.ready[version] then needRom = true; break end
+  end
+  if mobileFileBridge and needRom then
+    local name, data = findPendingRom(self)
+    if name then
+      self:startData(data, name)
+    else
+      -- The picker runs as its own activity and Android may kill us while it
+      -- is up, so a rejected pick can outlive the focus handler (#442).
+      consumePickedRomError(self)
+    end
+  elseif self:_inboxImport() and self.launcher then
+    self:ensureImportsDir()
+    self:_setNxInboxNotice()
+  elseif needRom and self.launcher and (os.getenv("HANDHELD") == "1"
+      or os.getenv("PORTMASTER") == "1" or os.getenv("POKEPORT_HANDHELD") == "1"
+      or os.getenv("TRIMUI") == "1" or os.getenv("MUOS") == "1"
+      or os.getenv("KNULLI") == "1") then
+    self:_reportRomSkips(nil)
   end
 
   -- Mouse-wheel scroll for the save-slot / mods lists.  main.lua (off limits)
@@ -569,9 +2197,9 @@ function RomImporter.new(onComplete, opts)
   end
 
   -- Self-updater: the interactive launcher on a real fused build kicks off one
-  -- async release check as it comes up; draw() polls Check.state() to render an
-  -- unobtrusive banner beneath the columns.  Held behind pcall so a broken or
-  -- absent updater can never take the launcher down with it.
+  -- async release check as it comes up; the top-right update control polls
+  -- Check.state() and glows when there is something to do.  Held behind pcall
+  -- so a broken or absent updater can never take the launcher down with it.
   if self.launcher and updaterAllowed() then
     local ok, Check = pcall(require, "src.update.Check")
     if ok and Check then
@@ -580,13 +2208,40 @@ function RomImporter.new(onComplete, opts)
     end
   end
 
-  -- On Linux handhelds a gamepad is usually already connected at boot; arm
-  -- the virtual cursor immediately so the player does not have to press a
-  -- button before seeing something move.
-  if self.launcher and love.system.getOS() == "Linux"
-      and love.joystick and love.joystick.getJoystickCount
+  -- PREWARM.  Start the mod-index fetch at boot rather than when the Find
+  -- Mods tab is first opened.  The work is identical either way, but doing it
+  -- now means it overlaps the time the user spends looking at the game tab,
+  -- so the tab is already populated when they reach it instead of greeting
+  -- them with a loader.  Nothing here blocks: the fetch pool is off-thread
+  -- and _pumpFindFetch collects the result whenever it lands.
+  --
+  -- Deliberately NOT behind the blocking overlay: the user did not ask for
+  -- this and must be able to use the launcher while it runs, so _busy is
+  -- cleared straight back out.  An explicit Refresh press still shows one.
+  if self.launcher then
+    pcall(function()
+      self:_refreshFindSources()
+      if #(self.findSources or {}) > 0 then
+        self:_refreshFind(false)
+        self:_clearBusy()
+      end
+    end)
+  end
+
+  -- On Linux handhelds / NX a gamepad is usually already connected at boot;
+  -- arm the virtual cursor immediately so the player does not have to press a
+  -- button before seeing something move.  Desktop keeps the cursor latent
+  -- until the first stick bump so a plugged DualSense does not steal the mouse.
+  if self.launcher and love.joystick and love.joystick.getJoystickCount
       and love.joystick.getJoystickCount() > 0 then
-    self:_activatePadCursor()
+    local osName = (love.system and love.system.getOS and love.system.getOS()) or ""
+    if osName == "Linux" or self.isNX then
+      self:_activatePadCursor()
+    end
+  end
+
+  if GameVersion.VERSIONS[self.tab] then
+    self.modScope = self.tab
   end
 
   return self
@@ -599,39 +2254,255 @@ end
 -- up without the player needing to tap the button again.  Mod and save SAF
 -- drops (picked_mod.zip / picked_save.sav) are consumed first so a leftover
 -- ROM pick cannot steal the focus path when both games are already ready.
+-- NOTE (iOS): do NOT clear pickPending here.  The picker's dismissal focus
+-- event can arrive before the Swift delegate has finished copying the pick
+-- into the save dir; if this scan runs early and finds nothing, the poll in
+-- _pollPickedFiles must stay armed so it consumes the file when it lands
+-- moments later (it clears pickPending itself once something is found).
 function RomImporter:focus(f)
+  self._modPickOpenWait = nil
+  if not f then
+    require("src.import.LauncherView").forgetConsumedTouch(self)
+    self._touchAt = nil
+    self._activeTouch = nil
+    self._pagePress = nil
+    self._slotPress = nil
+    self._modPress = nil
+    return
+  end
+  if type(self._sync) == "table" then
+    pcall(self._sync.noteResumed, self._sync)
+  end
   if not (f and self.android and self.workState ~= "working") then return end
   -- SAF create-document finished: GameActivity wrote export_done.flag.
   if love.filesystem.getInfo("export_done.flag", "file") then
     love.filesystem.remove("export_done.flag")
     love.filesystem.remove("pending_export.sav")
+    if self.androidPendingCartExport then
+      self.androidPendingCartExport = nil
+      self._cartNotice = Strings("Cart exported.")
+      return
+    end
     local version = self.androidPendingExportVersion or self:_savedropTarget()
     self.androidPendingExportVersion = nil
     self.saveNotice[version] = { ok = true, text = "Save exported." }
-    if self.tab == "mods" or self.tab == "yellow" then self.tab = version end
+    if self.tab == "mods" then self.tab = version end
     return
   end
-  local modName = findPendingMod(false)
-  if modName then
-    self:_installMod(modName)
-    if self.modNotice and self.modNotice.ok then
-      love.filesystem.remove(modName)
+  -- The SAF pick failed inside GameActivity, which wrote pick_error.flag with
+  -- the destination basename in it: some OEM shells (ColorOS) let a third-party
+  -- archive manager win the ACTION_OPEN_DOCUMENT chooser and hand back a URI
+  -- this app has no permission to read, and until #442 that returned to a
+  -- launcher that said nothing at all.
+  local pickError = love.filesystem.getInfo("pick_error.flag", "file")
+    and love.filesystem.read("pick_error.flag")
+  if pickError then love.filesystem.remove("pick_error.flag") end
+  if pickError and self:_importerPickPending() then
+    local destination = pickError:gsub("^cancelled:", "")
+    if destination ~= importerPickName(self.pickerPendingImporterId) then
+
+      pickError = nil
+    end
+  end
+  if pickError then
+    local text
+    if pickError:find("cancelled:", 1, true) == 1 then
+      text = "The file manager did not return a file. Try a different file "
+        .. "manager, or copy it into: " .. love.filesystem.getSaveDirectory()
+    else
+      text = "Could not read the picked file. Reopen the picker and choose "
+        .. "it with the Files (Documents) app, or copy it into: "
+        .. love.filesystem.getSaveDirectory()
+    end
+    local legacyRequiredPick = self.requiredImportLegacyRomPick
+      and self.pickerPendingKind == "required_import"
+    if self.pickerPendingKind == "importer"
+        or pickError:find("picked_importer_", 1, true) then
+      self._importerNotice = { ok = false, text = text }
+      self.pickPending = nil
+      self.pickerPendingKind = nil
+      self.pickerPendingImporterId = nil
+    elseif self.pickerPendingKind == "required_import"
+        or pickError:find("picked_required_import", 1, true)
+        or pickError:find("picked_stadium", 1, true)
+        or pickError:find("/baseroms/", 1, true)
+        or pickError:find("\\baseroms\\", 1, true)
+        or (legacyRequiredPick and pickError:find("picked_rom", 1, true)) then
+      self.modNotice = { ok = false, text = text }
+      self.pickerPendingKind = nil
+      self.pickerPendingModId = nil
+      self.pickerPendingImportId = nil
+      self.requiredImportLegacyRomPick = nil
+    elseif self.cartLegacyModPick and self.pickerPendingKind == "cart"
+        and pickError:find("picked_mod", 1, true) then
+      self.pickerPendingKind, self.pickerPendingVersion = nil, nil
+      self.cartLegacyModPick = nil
+      self._cartNotice = text
+    elseif pickError:find("picked_mod", 1, true) then
+      if self.pickerPendingKind == "skin" then
+        self.pickerPendingKind = nil
+        self._skinNotice = { ok = false, text = text }
+      else
+        self.pickerPendingKind = nil
+        self.modNotice = { ok = false, text = text }
+      end
+    elseif self.pickerPendingKind == "box" then
+      self.pickerPendingKind, self.pickPending = nil, nil
+      require("src.import.BoxPanel").importGCI(self, nil, text)
+    elseif pickError:find("picked_save", 1, true) then
+      local version = self.androidPendingVersion or self:_savedropTarget()
+      self.androidPendingVersion = nil
+      self.saveNotice[version] = { ok = false, text = text }
+    elseif pickError:find("picked_cart", 1, true)
+        or self.pickerPendingKind == "cart" then
+      self.pickerPendingKind = nil
+      self.pickerPendingVersion = nil
+      self.cartLegacyModPick = nil
+      self._cartNotice = text
+    else
+      self:setError(text)
     end
     return
   end
-  local savName = findPendingSav(false)
+
+
+
+  if self:_importerPickPending() and not findPendingImporter(self) then return end
+
+  -- Current mobile bridge: the native picker has already streamed a raw
+  -- dependency into mods/<id>/baseroms and published its digest/size marker.
+  local completedRequired = not self:_importerPickPending()
+    and love.filesystem.getInfo(PICK_COMPLETE_FILENAME, "file")
+    and love.filesystem.read(PICK_COMPLETE_FILENAME)
+  if completedRequired then
+    love.filesystem.remove(PICK_COMPLETE_FILENAME)
+    self.pickPending = nil
+    finishDirectRequiredImport(self, completedRequired)
+    self.pickerPendingKind = nil
+    self.pickerPendingModId = nil
+    self.pickerPendingImportId = nil
+    self.requiredImportLegacyRomPick = nil
+    return
+  end
+
+  local importerName, importerId = findPendingImporter(self)
+  if importerName then
+    local data = love.filesystem.read(importerName)
+    love.filesystem.remove(importerName)
+    self.pickPending = nil
+    self.pickerPendingKind = nil
+    self.pickerPendingImporterId = nil
+    if type(data) ~= "string" then
+      self._importerNotice = {
+        ok = false,
+        text = "Could not read the picked importer file.",
+      }
+    else
+      self:_runImporterData(importerId, data)
+    end
+    return
+  end
+
+  local requiredName = findPendingRequiredImport(self)
+  if requiredName then
+    local modId, importId = self.pickerPendingModId, self.pickerPendingImportId
+    self.pickerPendingKind = nil
+    self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+    self.requiredImportLegacyRomPick = nil
+    local imported = modId and importId
+      and self:_importRequiredSource(modId, importId, requiredName)
+    consumePick(self, requiredName, requiredName, imported)
+    if not modId or not importId then
+      self.modNotice = { ok = false,
+        text = "A picked dependency file had no pending mod request and was discarded." }
+    end
+    return
+  end
+  local modName = findPendingMod(false, self.pickSkip)
+  if modName then
+    if self.pickerPendingKind == "cart" and self.cartLegacyModPick then
+      local version = self.pickerPendingVersion or self._cartPopup or self.tab
+      self.pickerPendingKind, self.pickerPendingVersion = nil, nil
+      self.cartLegacyModPick = nil
+      consumePick(self, modName, "picked_mod.zip",
+        self:_installCartFile(modName, version))
+      return
+    end
+    if self.pickerPendingKind == "skin" then
+      self.pickerPendingKind = nil
+      self:_installSkinZip(modName)
+      consumePick(self, modName, "picked_mod.zip",
+        self._skinNotice and self._skinNotice.ok)
+      return
+    end
+    self.pickerPendingKind = nil
+    self:_installMod(modName)
+    consumePick(self, modName, "picked_mod.zip",
+      self.modNotice and self.modNotice.ok)
+    return
+  end
+  local cartName = findPendingCart(false, self.pickSkip)
+  if cartName then
+    local version = self.pickerPendingVersion or self._cartPopup or self.tab
+    self.pickerPendingKind = nil
+    self.pickerPendingVersion = nil
+    local installed = self:_installCartFile(cartName, version)
+    consumePick(self, cartName, PICKED_CART, installed)
+    return
+  end
+  local savName = findPendingSav(false, self.pickSkip)
   if savName then
+    if self.pickerPendingKind == "box" then
+      self.pickerPendingKind = nil
+      consumePick(self, savName, "picked_save.sav", self:_importBoxFile(savName))
+      return
+    end
     local version = self.androidPendingVersion or self:_savedropTarget()
     self.androidPendingVersion = nil
     self:_importSave(version, savName)
-    if self.saveNotice[version] and self.saveNotice[version].ok then
-      love.filesystem.remove(savName)
-    end
+    consumePick(self, savName, "picked_save.sav",
+      self.saveNotice[version] and self.saveNotice[version].ok)
     return
   end
-  if self.ready.red and self.ready.blue then return end
-  local name, data = findPendingRom(self.ready)
-  if name then self:startData(data, name) end
+  for _, v in ipairs(GameVersion.ORDER) do
+    if not self.ready[v] then
+      local name, data = findPendingRom(self)
+      if name then
+        self:startData(data, name)
+      else
+        consumePickedRomError(self)
+      end
+      return
+    end
+  end
+end
+
+function RomImporter:_versionForSha1(hash)
+  local version = GameVersion.forSha1(hash)
+  if version and not SecretGames.shown(self, version) then return nil end
+  return version
+end
+
+function RomImporter:_logoTap()
+  if SecretGames.update() then
+    self._secretPopup = nil
+    self._logoTaps = nil
+    return
+  end
+  if self._secretPopup or not SecretGames.anyLocked() then return end
+  self._logoTaps = (self._logoTaps or 0) + 1
+  if self._logoTaps >= SecretGames.TAPS then
+    self._secretPopup = true
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    if okKit then Kit.setFocus("secret-ok") end
+  end
+end
+
+function RomImporter:_confirmSecret()
+  if not self._secretPopup then return end
+  self._secretPopup = nil
+  SecretGames.unlock()
+  self._headerChrome = nil
 end
 
 function RomImporter:setError(message, version)
@@ -644,7 +2515,19 @@ function RomImporter:setError(message, version)
   self.detail = tostring(message)
   self.progress = 0
   self.worker = nil
+  -- Dropping the job stops collection; the next import clears the channels.
+  self._extract = nil
   self.romData = nil
+  -- A headless import has no launcher to read this off: POKEPORT_IMPORT_ONLY
+  -- only ever quits from onComplete, so an import that fails here would sit in
+  -- the error state forever and look to a build script (or a person) exactly
+  -- like a hang.  Log what broke and exit non-zero instead.  Logger, not a
+  -- literal write: this is a diagnostic for whoever ran the import, never text
+  -- a player sees, so it is deliberately not a translated string.
+  if os.getenv("POKEPORT_IMPORT_ONLY") == "1" then
+    Logger.error("import failed: %s", tostring(message))
+    love.event.quit(1)
+  end
 end
 
 -- draw() may leave the system hand cursor set while hovering a Play /
@@ -655,35 +2538,67 @@ local function resetPointerCursor(self)
   if not (love.mouse.isCursorSupported and love.mouse.isCursorSupported()) then
     return
   end
-  self.arrowCursor = self.arrowCursor or love.mouse.getSystemCursor("arrow")
+  if not self.arrowCursor then
+    local ok, cursor = pcall(love.mouse.getSystemCursor, "arrow")
+    if not ok then return end
+    self.arrowCursor = cursor
+  end
   love.mouse.setCursor(self.arrowCursor)
 end
 
 -- Verify + extract a ROM.  The version is decided by the ROM's own SHA-1, so
--- dropping a Red or Blue cart into either column always lands in the right one.
-function RomImporter:startData(data, displayName)
+-- dropping a Red, Blue, or Yellow cart into any column always lands in the
+-- right one.
+function RomImporter:startData(data, displayName, sourcePath)
   if self.workState == "working" then return end
+  self._importSource = sourcePath
   if type(data) ~= "string" then
     self:setError("The selected file could not be read.")
     return
   end
-  if #data ~= 1024 * 1024 then
-    self:setError(("Expected a 1 MiB Game Boy ROM; this file is %.2f MiB.")
-      :format(#data / 1024 / 1024))
+  local RomArchive = require("src.import.RomArchive")
+  local kind = RomArchive.kind(data)
+  if kind then
+    if #data > RomArchive.MAX_ARCHIVE_BYTES then
+      self:setError(("That .%s is %.1f MiB; a ROM archive only has to hold "
+        .. "one small cart. Drop the raw .gb/.gbc/.gba instead.")
+        :format(kind, #data / 1024 / 1024))
+      return
+    end
+    local bytes, entry = RomArchive.unwrap(data, displayName, {
+      isRomName = isRomFilename,
+      acceptedSize = isAcceptedRomSize,
+      prefer = function(candidate)
+        return self:_versionForSha1(sha1(candidate)) ~= nil
+      end,
+    })
+    if not bytes then
+      self:setError(entry)
+      return
+    end
+    data = bytes
+    displayName = displayName and (displayName .. " / " .. entry) or entry
+  end
+  if not isAcceptedRomSize(#data) then
+    self:setError(("Expected a 1 MiB Game Boy ROM (%s), a "
+      .. "2 MiB Game Boy Color ROM (%s), or a 16 MiB Game Boy Advance ROM (%s); "
+      .. "this file is %.2f MiB.")
+      :format(cartsSlashed(1, self), cartsSlashed(2, self), cartsSlashed(3, self),
+        #data / 1024 / 1024))
     return
   end
   local actualHash = sha1(data)
-  local version = GameVersion.forSha1(actualHash)
+  local version = self:_versionForSha1(actualHash)
   if not version then
-    self:setError(("Unsupported ROM (SHA-1 %s). Use an unmodified US Pokemon "
-      .. "Red or Blue ROM."):format(actualHash))
+    self:setError(unsupportedRomText(self, actualHash))
     return
   end
+  self.romSha1 = actualHash
   local info = GameVersion.info(version)
 
   -- Bring the launcher to this version's tab so its progress bar is on screen
   -- (a dropped cart is routed by SHA-1 regardless of which tab was showing).
-  if self.tab == "red" or self.tab == "blue" or self.tab == "yellow" then
+  if GameVersion.VERSIONS[self.tab] then
     self.tab = version
   end
   self.importing = version
@@ -693,24 +2608,71 @@ function RomImporter:startData(data, displayName)
   self.detail = displayName or info.displayName
   self.progress = 0
   self.romData = data
-  self.worker = coroutine.create(function()
-    self.status = "Preparing private game data"
-    coroutine.yield()
-    -- Redirect every cache write to this version's subtree, then clear only
-    -- that version's previous cache from both homes (save directory and, for
-    -- a portable install, the game folder).  The other version is untouched.
-    local CacheFs = require("src.import.CacheFs")
-    local prefix = info.cachePrefix
-    CacheFs.prefix = prefix
+  self.status = "Preparing private game data"
+
+  -- Clear this version's previous cache from both homes before anything
+  -- writes.  Stays on the main thread so delete-then-fill-then-mark keeps one
+  -- owner; the prefix is restored at once because the worker sets its own.
+  local CacheFs = require("src.import.CacheFs")
+  local prefix = info.cachePrefix
+  local savedPrefix = CacheFs.prefix
+  CacheFs.prefix = prefix
+  local cleared, clearError = pcall(function()
     removeTree(prefix .. "data/generated")
     removeTree(prefix .. "assets/generated")
-    love.filesystem.remove(prefix .. MARKER_PATH)
+    love.filesystem.remove(prefix .. CacheContract.MARKER_PATH)
     CacheFs.removeTree("data/generated")
     CacheFs.removeTree("assets/generated")
-    CacheFs.remove(MARKER_PATH)
+    CacheFs.remove(CacheContract.MARKER_PATH)
+  end)
+  CacheFs.prefix = savedPrefix
+  if not cleared then
+    self:setError(tostring(clearError), version)
+    return
+  end
 
-    local manifest = decodeManifest(version)
-    local RomExtractor = require("src.import.RomExtractor")
+  if self:_startExtractThread(version, prefix, data, displayName) then return end
+  self:_startExtractCoroutine(version, info, prefix, displayName)
+end
+
+-- False when threads are unavailable, so the coroutine path still covers
+-- that host.  POKEPORT_NO_THREAD=1 forces it, which is the only way to
+-- exercise the fallback on a desktop.
+function RomImporter:_startExtractThread(version, prefix, data, displayName)
+  if os.getenv("POKEPORT_NO_THREAD") == "1" then return false end
+  if not (love.thread and love.thread.newThread) then return false end
+  local ok, thread = pcall(love.thread.newThread, "src/import/ExtractThread.lua")
+  if not ok or not thread then return false end
+  local progressName = "rom_import_progress"
+  local resultName = "rom_import_result"
+  love.thread.getChannel(progressName):clear()
+  love.thread.getChannel(resultName):clear()
+  local started, startResult = pcall(thread.start, thread, version, prefix, data,
+    progressName, resultName, self.romSha1)
+  if not started or startResult == false then return false end
+  self._extract = {
+    thread = thread, version = version, prefix = prefix,
+    displayName = displayName,
+    progress = love.thread.getChannel(progressName),
+    result = love.thread.getChannel(resultName),
+  }
+  -- The worker owns the bytes now; drop ours so the 1-16 MiB string can go.
+  self.romData = nil
+  return true
+end
+
+function RomImporter:_startExtractCoroutine(version, info, prefix, displayName)
+  self.worker = coroutine.create(function()
+    coroutine.yield()
+    local CacheFs = require("src.import.CacheFs")
+    CacheFs.prefix = prefix
+    local manifest = require("src.import.RomManifest").decode(version)
+    local gen = GameVersion.generation(version)
+    local RomExtractor = gen == 3
+      and require("src.import.RomExtractorGen3")
+      or gen == 2
+      and require("src.import.RomExtractorGen2")
+      or require("src.import.RomExtractor")
     local extractor = RomExtractor.new(self.romData, manifest,
       function(progress, total, stage, current, stageTotal)
         self.status = stage
@@ -718,39 +2680,341 @@ function RomImporter:startData(data, displayName)
         self.stageCurrent = current
         self.stageTotal = stageTotal
         coroutine.yield()
-      end)
+      end, self.romSha1)
     extractor:run()
+    CacheFs.prefix = ""   -- restore the default so later writes stay at the root
     self.romData = nil
     collectgarbage("collect")
-    -- Written last: the marker is what isReady() checks, so it must only
-    -- appear once every required file is in place.
-    local ok, writeError = CacheFs.write(MARKER_PATH, markerFor(version))
-    CacheFs.prefix = ""   -- restore the default so later writes stay at the root
-    if not ok then error("could not finish the private cache: " .. tostring(writeError)) end
-    self.ready[version] = true
-    self.returning[version] = false
-    self.romName[version] = (displayName
-      and (displayName:match("[^/\\]+$") or displayName)) or self.romName[version]
-    -- Android: drop the consumed save-dir .gb (picked_rom.gb or a USB copy)
-    -- so the next Choose / focus cannot treat it as a fresh pending ROM.
-    if self.android and type(displayName) == "string"
-        and not displayName:find("[/\\]") then
-      love.filesystem.remove(displayName)
-    end
-    self.importing = nil
-    self.workState = "complete"
-    self.completeVersion = version
-    self.status = "Ready"
+    self:_completeImport(version, prefix, displayName)
+  end)
+end
+
+-- Everything after the tree is filled, shared by both worker paths.  Raises
+-- on a failed marker write; the thread path calls it inside a pcall.
+function RomImporter:_completeImport(version, prefix, displayName)
+  local info = GameVersion.info(version)
+  local CacheFs = require("src.import.CacheFs")
+  -- Written last: the marker is what isReady() checks, so it must only
+  -- appear once every required file is in place.
+  local savedPrefix = CacheFs.prefix
+  CacheFs.prefix = prefix
+  local ok, writeError = CacheContract.publish(version, CacheFs, self.romSha1)
+  CacheFs.prefix = savedPrefix
+  if not ok then
+    error("could not finish the private cache: " .. tostring(writeError))
+  end
+  local SaveConvert = package.loaded["src.save_convert.SaveConvert"]
+  if GameVersion.generation(version) == 2 and SaveConvert then
+    SaveConvert.invalidateGen2Data(version)
+  end
+  self.ready[version] = true
+  self.returning[version] = false
+  self.romName[version] = (displayName
+    and (displayName:match("[^/\\]+$") or displayName)) or self.romName[version]
+  pcall(self._rememberRomSource, self, version, displayName)
+  -- Android: drop the consumed save-dir .gb/.gbc/.gba (picked_rom.gb or a USB copy)
+  -- so the next Choose / focus cannot treat it as a fresh pending ROM.
+  if self.mobileFileBridge and type(displayName) == "string"
+      and not displayName:find("[/\\]") then
+    love.filesystem.remove(displayName)
+  end
+  self.importing = nil
+  self.workState = "complete"
+  self.completeVersion = version
+  self.status = "Ready"
+  RomImporter.syncAndroidShortcuts(version)
+  -- NX launcher stays put: keep the imports/ cleanup hint instead of
+  -- overwriting it with a "Starting…" line that never boots from here.
+  if self.launcher and self:_inboxImport() and type(displayName) == "string" then
+    self.detail = Strings("%s imported. You may delete the copy from "
+      .. "imports/ when finished.", displayName)
+  else
     self.detail = "Starting " .. info.displayName .. "..."
-    self.progress = 1
-    if self.launcher then
-      -- Stay on the launcher; the player presses Play to boot the new game.
+  end
+  self.progress = 1
+  if self.launcher then
+    -- Stay on the launcher; the player presses Play to boot the new game.
+    return
+  end
+  self._handedOff = true
+  resetPointerCursor(self)
+  if self._flex then require("src.import.LauncherView").detach(self) end
+  if self.onComplete then self.onComplete(version) end
+end
+
+-- Drain the worker's progress and finish when it reports done.  One
+-- non-blocking poll per frame, like the other _pump* collectors above.
+function RomImporter:_pumpExtract()
+  local job = self._extract
+  if not job then return end
+  local msg = job.progress:pop()
+  while msg do
+    self.status = msg.stage
+    self.progress = msg.progress / msg.total
+    self.stageCurrent = msg.current
+    self.stageTotal = msg.stageTotal
+    msg = job.progress:pop()
+  end
+  local res = job.result:pop()
+  if not res then
+    -- A thread that died before pushing a result would strand the loader.
+    local threadError = job.thread.getError and job.thread:getError()
+    if threadError then
+      self._extract = nil
+      self:setError(tostring(threadError), job.version)
+    end
+    return
+  end
+  self._extract = nil
+  if not res.ok then
+    self:setError(tostring(res.error), job.version)
+    return
+  end
+  local ok, err = pcall(self._completeImport, self, job.version, job.prefix,
+    job.displayName)
+  if not ok then self:setError(tostring(err), job.version) end
+end
+
+function RomImporter:_rememberRomSource(version, displayName)
+  local RomSources = require("src.import.RomSources")
+  local source = self._importSource
+  self._importSource = nil
+  local rec = { sha1 = self.romSha1, at = os.time() }
+  local kept = RomSources.keptPath(version)
+  local prior = RomSources.get(version)
+  if source == kept then
+    rec.path, rec.kept = kept, true
+  elseif RomSources.isAbsolute(source) and not self.mobileFileBridge then
+    rec.path = source
+  elseif self.mobileFileBridge then
+    if prior and prior.kept and prior.sha1 == rec.sha1
+        and RomSources.keptExists(kept) then
+      rec.path, rec.kept = kept, true
+    elseif self.launcher and RomSources.promptsAllowed()
+        and type(displayName) == "string" and not displayName:find("[/\\]") then
+      local data = love.filesystem.read(displayName)
+      if type(data) == "string" then
+        self:_offerKeepRom(version, data, rec)
+      end
+    end
+  end
+  if prior and prior.kept and not rec.kept and prior.sha1 ~= rec.sha1
+      and type(prior.path) == "string" then
+    RomSources.removeKept(prior.path)
+  end
+  RomSources.remember(version, rec)
+end
+
+function RomImporter:_offerKeepRom(version, data, rec)
+  local RomSources = require("src.import.RomSources")
+  local info = GameVersion.info(version)
+  self._modConfirm = {
+    kind = "keepRom",
+    title = Strings("Keep a copy of this ROM?"),
+    lines = {
+      Strings("Store a private copy of %s in app storage so game data can be re-imported after updates.",
+        info.displayName),
+      Strings("You can delete it later in Settings."),
+    },
+    yesLabel = Strings("Keep copy"),
+    noLabel = Strings("No"),
+    onYes = function()
+      local path = RomSources.keep(version, data)
+      if path then
+        RomSources.remember(version, {
+          sha1 = rec.sha1, at = rec.at, path = path, kept = true,
+        })
+      end
+    end,
+  }
+end
+
+function RomImporter:_reimportCandidate(version)
+  if not GameVersion.VERSIONS[version] or self.ready[version] then return nil end
+  if self.forceImport or not self.launcher then return nil end
+  local RomSources = require("src.import.RomSources")
+  if not RomSources.promptsAllowed() then return nil end
+  local ok, cand = pcall(RomSources.candidate, version, self.mobileFileBridge)
+  return ok and cand or nil
+end
+
+function RomImporter:_queueReimport(version)
+  if not GameVersion.VERSIONS[version] or self.ready[version]
+      or not SecretGames.shown(self, version) then
+    return
+  end
+  self._reimportQueue = self._reimportQueue or {}
+  for _, v in ipairs(self._reimportQueue) do
+    if v == version then return end
+  end
+  self._reimportQueue[#self._reimportQueue + 1] = version
+end
+
+function RomImporter:_queueLaunchReimports()
+  if not self.launcher or self.forceImport then return end
+  local RomSources = require("src.import.RomSources")
+  if not RomSources.promptsAllowed() then return end
+  pcall(RomSources.migrateKept)
+  local okOpt, opts = pcall(require("src.core.SaveData").loadOptions)
+  if not okOpt then return end
+  if RomSources.autoReimport(opts) then
+    for _, version in ipairs(GameVersion.ORDER) do
+      if RomSources.get(version, opts) then self:_queueReimport(version) end
+    end
+    return
+  end
+  local order = {}
+  order[#order + 1] = opts.lastVersion
+  order[#order + 1] = self.tab
+  for _, version in ipairs(GameVersion.ORDER) do order[#order + 1] = version end
+  for _, version in ipairs(order) do
+    if GameVersion.VERSIONS[version] and not self.ready[version]
+        and RomSources.get(version, opts) then
+      self:_queueReimport(version)
       return
     end
-    self._handedOff = true
-    resetPointerCursor(self)
-    if self.onComplete then self.onComplete(version) end
-  end)
+  end
+end
+
+function RomImporter:_beginReimport(version, cand)
+  local RomSources = require("src.import.RomSources")
+  self._reimportRunning = version
+  if GameVersion.VERSIONS[self.tab] and self.tab ~= version then
+    self.tab = version
+    self:_setModScope(version)
+  end
+  if cand.pick then
+    self:choose(version)
+  elseif cand.kept then
+    self:startData(RomSources.readKept(cand.path),
+      cand.path:match("[^/\\]+$") or cand.path, cand.path)
+  else
+    self:startPath(cand.path)
+  end
+end
+
+function RomImporter:_offerReimport(version, cand)
+  local RomSources = require("src.import.RomSources")
+  self._reimportDeclined = self._reimportDeclined or {}
+  self._reimportDeclined[version] = true
+  if cand.broken then
+    Logger.warn("kept ROM copy for %s is unreadable or does not match; dropping it",
+      tostring(version))
+    pcall(RomSources.drop, version)
+  end
+  if not cand.pick and RomSources.autoReimport() then
+    self:_beginReimport(version, cand)
+    return
+  end
+  if GameVersion.VERSIONS[self.tab] and self.tab ~= version then
+    self.tab = version
+    self:_setModScope(version)
+  end
+  local name = GameVersion.info(version).displayName
+  local lines
+  if cand.missing then
+    local why = cand.missing ~= "changed"
+      and Strings("The saved ROM at %s could not be found or opened.",
+        RomSources.shortPath(cand.path))
+      or Strings("The saved ROM at %s no longer matches this game.",
+        RomSources.shortPath(cand.path))
+    lines = {
+      Strings("%s needs its ROM imported again.", name),
+      why,
+      Strings("Choose the ROM file to re-import it?"),
+    }
+  elseif cand.pick then
+    lines = {
+      Strings("%s needs its ROM imported again.", name),
+      Strings("Choose the ROM file to re-import it?"),
+    }
+  else
+    lines = {
+      Strings("Re-import %s from %s?", name, RomSources.shortPath(cand.path)),
+    }
+  end
+  self._modConfirm = {
+    kind = "reimport",
+    title = Strings("Game data needs updating"),
+    lines = lines,
+    yesLabel = Strings("Yes"),
+    noLabel = Strings("No"),
+    toggle = not cand.pick and {
+      label = Strings("Always re-import automatically"),
+      on = RomSources.autoReimport(),
+      set = function(on) RomSources.setAutoReimport(on) end,
+    } or nil,
+    onYes = function() self:_beginReimport(version, cand) end,
+  }
+end
+
+local function reimportFailReason(detail)
+  detail = tostring(detail or "")
+  local lower = detail:lower()
+  if lower:find("could not write", 1, true) or lower:find("could not create", 1, true)
+      or lower:find("no space", 1, true) or lower:find("read%-only") then
+    return Strings("The game data could not be saved. Check that the device has free storage space.")
+  end
+  if lower:find("out of memory", 1, true) or lower:find("not enough memory", 1, true) then
+    return Strings("The device ran out of memory while importing.")
+  end
+  local stripped = detail
+  repeat
+    local before = stripped
+    stripped = stripped:gsub("^%s*[^%s:]+%.lua:%d+:%s*", "")
+  until stripped == before
+  if stripped == "" or stripped:find("%.lua:%d+") or stripped:find("stack traceback", 1, true) then
+    return Strings("Something went wrong while importing. Details were written to the log.")
+  end
+  return stripped
+end
+
+function RomImporter:_offerReimportFailed(version)
+  local name = GameVersion.info(version).displayName
+  Logger.error("re-import of %s failed: %s", tostring(version), tostring(self.detail))
+  self._modConfirm = {
+    kind = "reimportFailed",
+    title = Strings("Re-import failed"),
+    lines = {
+      Strings("%s could not be re-imported.", name),
+      reimportFailReason(self.detail),
+    },
+    yesLabel = Strings("Continue"),
+    noLabel = Strings("Stop"),
+    onYes = function() end,
+    onNo = function() self._reimportQueue = nil end,
+  }
+end
+
+function RomImporter:_pumpReimport()
+  local queue = self._reimportQueue
+  local pending = queue and #queue > 0
+  if not pending and not self._reimportRunning then return end
+  if self.workState == "working" or self._extract or self.worker
+      or self._hostPick or self._launchFade or self._handedOff then
+    return
+  end
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and ((Kit.FileBrowser and Kit.FileBrowser.active)
+      or (Kit.VirtualKeyboard and Kit.VirtualKeyboard.active)) then
+    return
+  end
+  local okView, View = pcall(require, "src.import.LauncherView")
+  for _, key in ipairs(okView and View.MODAL_KEYS or {}) do
+    if self[key] then return end
+  end
+  local running = self._reimportRunning
+  self._reimportRunning = nil
+  if running and pending and self.workState == "error"
+      and self.errorVersion == running then
+    self:_offerReimportFailed(running)
+    return
+  end
+  if not pending then return end
+  local version = table.remove(queue, 1)
+  if self._reimportDeclined and self._reimportDeclined[version] then return end
+  local cand = self:_reimportCandidate(version)
+  if cand then self:_offerReimport(version, cand) end
 end
 
 function RomImporter:startPath(path)
@@ -760,25 +3024,74 @@ function RomImporter:startPath(path)
     self:setError("Could not read the selected file: " .. tostring(readError))
     return
   end
-  self:startData(data, path:match("[^/\\]+$") or path)
+  self:startData(data, path:match("[^/\\]+$") or path,
+    require("src.import.RomSources").absolute(path))
+end
+
+function RomImporter:_zipHoldsRom(data)
+  local ok, RomArchive = pcall(require, "src.import.RomArchive")
+  if not ok then return false end
+  if RomArchive.kind(data) ~= "zip" then return false end
+  if not RomArchive.capabilities().zip then return false end
+  local bytes = RomArchive.unwrap(data, nil, {
+    isRomName = isRomFilename,
+    acceptedSize = isAcceptedRomSize,
+    prefer = function(candidate)
+      return self:_versionForSha1(sha1(candidate)) ~= nil
+    end,
+  })
+  return bytes ~= nil
 end
 
 function RomImporter:filedropped(file)
   if self.workState == "working" then return end
   -- A dropped .zip is a mod archive: hand it straight to the mods installer
-  -- (which mounts + validates it).  Everything else is treated as a ROM.  The
-  -- dropped file itself is passed through -- installZip opens it the same way
-  -- readDroppedFile does here.
+  -- (which mounts + validates it).  A .deltaskin is only ever a skin, and
+  -- everything else is treated as a ROM.  The dropped file itself is passed
+  -- through -- installZip opens it the same way readDroppedFile does here.
   local name = file:getFilename() or ""
+  if name:lower():match("%.gci$")
+      or (self.tab == "box" and name:lower():match("%.sav$")
+        and file.getSize and file:getSize() == 0x76000) then
+    self:_switchTab("box")
+    self:_importBoxFile(file)
+    return
+  end
+  if name:lower():match("%.deltaskin$") then
+    self:_installSkinZip(file)
+    return
+  end
   if name:lower():match("%.zip$") then
-    self:_installMod(file)
+    -- On the SKINS tab a zip is a skin; elsewhere a cart inside wins, else
+    -- it stays a mod archive.
+    if self.tab == "skins" then
+      self:_installSkinZip(file)
+    elseif GameVersion.VERSIONS[self.tab] then
+      local data, readError = readDroppedFile(file)
+      if not data then
+        self:setError("Could not read the dropped file: " .. tostring(readError))
+        return
+      end
+      if self:_zipHoldsRom(data) then
+        self:startData(data, name, name)
+        return
+      end
+      self:_installMod(file)
+    else
+      self:_installMod(file)
+    end
     return
   end
   -- A dropped .sav is a battery save: import it to a new slot for the active
   -- game tab (see _savedropTarget for the tab-selection rule).  It never steals
   -- .gb/.zip routing above.
-  if name:lower():match("%.sav$") then
+  if name:lower():match("%.sav$")
+      or (name:lower():match("%.lua$") and GameVersion.VERSIONS[self.tab]) then
     self:_importSave(self:_savedropTarget(), file)
+    return
+  end
+  if name:lower():match("%.g1rcart$") then
+    self:_installCartFile(file, self._cartPopup or self.tab)
     return
   end
   local data, readError = readDroppedFile(file)
@@ -786,7 +3099,68 @@ function RomImporter:filedropped(file)
     self:setError("Could not read the dropped file: " .. tostring(readError))
     return
   end
-  self:startData(data, file:getFilename())
+  if self._importerDropFor then
+    local importerId = self._importerDropFor
+    self._importerDropFor = nil
+    self:_runImporterData(importerId, data)
+    return
+  end
+  self:startData(data, file:getFilename(), file:getFilename())
+end
+
+function RomImporter:_importBoxFile(source)
+  local data, why, size
+  if type(source) == "string" then
+    local info = love.filesystem.getInfo(source, "file")
+    size = info and info.size or externalFileSize(source)
+    if size == 0x76040 or size == 0x76000 then
+      if info then data, why = love.filesystem.read(source)
+      else data, why = readExternalPath(source) end
+    end
+  else
+    local opened
+    opened, why = source:open("r")
+    if opened then
+      size = source:getSize()
+      if size == 0x76040 or size == 0x76000 then data, why = source:read(size) end
+      source:close()
+    end
+  end
+  if not data then
+    why = why or "Choose a native Box GCI (0x76040 bytes) or raw save (0x76000 bytes)."
+  end
+  return require("src.import.BoxPanel").importGCI(self, data, why)
+end
+
+function RomImporter:chooseBoxImport()
+  if self.workState == "working" then return end
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "box"
+    if not pickFile("sav") then
+      self.pickerPendingKind = nil
+      require("src.import.BoxPanel").importGCI(self, nil, "Could not open the file picker.")
+    end
+    return
+  end
+  if self.android then
+    self.pickerPendingKind = "box"
+    if pickFile("sav") then self.pickPending, self.pickTimer = true, 0
+    else
+      self.pickerPendingKind = nil
+      require("src.import.BoxPanel").importGCI(self, nil, "Could not open the file picker.")
+    end
+    return
+  end
+  local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+  if self:_inboxImport() or self.ios or isHandheld then
+    require("src.ui.kit.Kit").FileBrowser.open({ title = "Select Pokémon Box save (.gci / .sav)",
+      mode = "box", onSelect = function(path) self:_importBoxFile(path) end })
+    return
+  end
+  local path = chooseImporterFile("Pokémon Box save", { "gci", "sav" })
+  if path and path ~= "" then self:_importBoxFile(path) end
 end
 
 -- Install a mod .zip from a picker path or a dropped file, then surface the
@@ -794,25 +3168,50 @@ end
 -- source is whatever LauncherMods.installZip accepts: an absolute path string
 -- or a love DroppedFile.
 function RomImporter:_installMod(source)
-  if self.workState == "working" then return end
-  local LauncherMods = require("src.mods.LauncherMods")
-  local ok, res = LauncherMods.installZip(source)
-  if ok then
-    self:_refreshMods()
+  if self.workState == "working" or self._inboxJob then return end
+  self.tab = "mods"
+  local ok, installed, res, manifest = pcall(function()
+    local LauncherMods = require("src.mods.LauncherMods")
+    return LauncherMods.installZip(source)
+  end)
+  if not ok then
+    self.modNotice = { ok = false,
+      text = "Import failed: " .. tostring(installed) }
+    return
+  end
+  if installed then
+    pcall(self._refreshMods, self)
     self.modNotice = { ok = true, text = "Installed " .. tostring(res) }
+    local LauncherMods = require("src.mods.LauncherMods")
+    local checkTarget = manifest
+    if not checkTarget and type(res) == "string" then
+      checkTarget = { id = res }
+    end
+    if checkTarget and LauncherMods.checkDependencies then
+      local depCheck = LauncherMods.checkDependencies(checkTarget)
+      if depCheck and depCheck.hasIssues then
+        self._modDepResolver = depCheck
+      end
+    end
   else
     self.modNotice = { ok = false, text = tostring(res) }
   end
-  self.tab = "mods"
 end
 
 -- Remove an installed mod from the save-dir mods/ tree and refresh the panel.
 function RomImporter:_deleteMod(id)
   if self.workState == "working" then return end
-  local LauncherMods = require("src.mods.LauncherMods")
-  local ok, res = LauncherMods.uninstall(id)
-  if ok then
-    self:_refreshMods()
+  local ok, deleted, res = pcall(function()
+    local LauncherMods = require("src.mods.LauncherMods")
+    return LauncherMods.uninstall(id)
+  end)
+  if not ok then
+    self.modNotice = { ok = false,
+      text = "Delete failed: " .. tostring(deleted) }
+    return
+  end
+  if deleted then
+    pcall(self._refreshMods, self)
     self.modNotice = { ok = true, text = "Deleted " .. tostring(id) }
   else
     self.modNotice = { ok = false, text = tostring(res) }
@@ -820,37 +3219,503 @@ function RomImporter:_deleteMod(id)
 end
 
 -- "Import mod .zip" button: open a native picker and install the pick.
--- Android mirrors ROM import: scan for a pending .zip in the save dir (USB
--- or a fresh SAF drop), else love.system.pickFile("mod") -> picked_mod.zip
+-- Android: consume a fresh SAF drop, else love.system.pickFile("mod") -> picked_mod.zip
 -- which focus/Choose consumes on return.
+-- NX: no HostShell/desktop picker -- rescan imports/mods/ inbox instead.
 function RomImporter:chooseMod()
+  if self:_importerPickPending() then return end
   if self.workState == "working" then return end
-  if self.android then
-    local name = findPendingMod(true)
-    if name then
-      self:_installMod(name)
-      if self.modNotice and self.modNotice.ok then
-        love.filesystem.remove(name)
-      end
-      return
-    end
-    if not love.system.pickFile("mod") then
-      self.modNotice = { ok = false,
-        text = "Could not open the file picker. Copy a mod .zip via USB." }
+  if self._hostPick or self._modInboxInstall or self._inboxJob then return end
+  if self:_inboxImport() then
+    self:ensureModsInboxDir()
+    self:rescanModsAction()
+    return
+  end
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "mod"
+    if not pickFile("mod") then
+      self.pickerPendingKind = nil
+      self.modNotice = { ok = false, text = "Could not open the file picker." }
     end
     return
   end
+  if self.android then
+    local name = findPendingMod(false, self.pickSkip)
+    if name then
+      self:_installMod(name)
+      consumePick(self, name, "picked_mod.zip",
+        self.modNotice and self.modNotice.ok)
+      return
+    end
+    if self._modPickStalled and #self:scanModsInbox() > 0 then
+      self._modPickStalled = nil
+      self._modInboxInstall = "armed"
+      self.tab = "mods"
+      self.modNotice = { ok = true,
+        text = Strings("Installing mods from %s/ ...", MODS_INBOX_DIR) }
+      return
+    end
+    self._modPickOpenWait = nil
+    self.pickerPendingKind = "mod"
+    self.pickerPendingVersion = nil
+    self.cartLegacyModPick = nil
+    if not pickFile("mod") then
+      self.pickerPendingKind = nil
+      self._modPickStalled = true
+      self.modNotice = { ok = false,
+        text = self:_modInboxHint(Strings("Could not open the file picker.")) }
+    else
+      self.pickPending = true
+      self.pickTimer = 0
+      if love.system.getOS() == "Android" then self._modPickOpenWait = 0 end
+    end
+    return
+  end
+  local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+
+  if isHandheld then
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    if okKit and Kit.FileBrowser then
+      self._padCursorActive = false
+      Kit.FileBrowser.open({
+        title = "Select Mod (.zip)",
+        mode = "mod",
+        onSelect = function(pickedPath)
+          self:_installMod(pickedPath)
+        end,
+      })
+      return
+    end
+  end
+
+  if love.system.getOS() == "Windows" and Platform.canSpawnProcess() then
+    local id = HostPicker.start(zipPickCommands())
+    if id then
+      local notice = { ok = true, text = Strings(
+        "Choose a .zip in the file dialog. The launcher waits until it closes.") }
+      self._hostPick = { id = id, kind = "mod", notice = notice }
+      self.tab = "mods"
+      self.modNotice = notice
+      return
+    end
+  end
+
   local path = chooseZip()
-  if path then self:_installMod(path) end
+  if path then
+    self:_installMod(path)
+    return
+  end
+  self:_openModBrowser()
+end
+
+function RomImporter:_openModBrowser()
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and Kit.FileBrowser then
+    self._padCursorActive = false
+    Kit.FileBrowser.open({
+      title = "Select Mod (.zip)",
+      mode = "mod",
+      onSelect = function(pickedPath)
+        self:_installMod(pickedPath)
+      end,
+    })
+    return true
+  end
+  return false
+end
+
+function RomImporter:_modInboxHint(lead)
+  return Strings("%s Copy the .zip into this folder, then tap %s again:\n%s/%s/",
+    lead, self:_modsImportButtonLabel(), love.filesystem.getSaveDirectory(),
+    MODS_INBOX_DIR)
+end
+
+function RomImporter:_pumpHostPick()
+  local job = self._hostPick
+  if not job then return end
+  local state, output, err = HostPicker.poll(job.id)
+  if state == "pending" then return end
+  self._hostPick = nil
+  if job.kind == "cart" then
+    if self._cartNotice == job.notice then self._cartNotice = nil end
+  elseif self.modNotice == job.notice then
+    self.modNotice = nil
+  end
+  output = trim(output)
+  if output ~= "" then
+    if job.kind == "cart" then self:_installCartFile(output, job.version)
+    else self:_installMod(output) end
+  elseif err then
+    if job.kind == "cart" then self:_openCartBrowser(job.version)
+    else self:_openModBrowser() end
+  end
+end
+
+function RomImporter:_pumpModInboxInstall()
+  local step = self._modInboxInstall
+  if not step then return end
+  if step == "armed" then
+    self._modInboxInstall = "shown"
+    return
+  end
+  self._modInboxInstall = nil
+  self:rescanModsAction()
+end
+
+function RomImporter:_pumpModPickOpen(dt)
+  if not self._modPickOpenWait then return end
+  self._modPickOpenWait = self._modPickOpenWait + math.min(dt or 0, 0.1)
+  if self._modPickOpenWait < 4 then return end
+  self._modPickOpenWait = nil
+  self._modPickStalled = true
+  self.modNotice = { ok = false,
+    text = self:_modInboxHint(Strings("The file picker did not open.")) }
+end
+
+local function requiredManifest(self, modId)
+  for _, row in ipairs(self.mods or {}) do
+    if row.id == modId then return row.manifest, row end
+  end
+  return nil
+end
+
+local function requiredSpec(manifest, importId)
+  for _, candidate in ipairs(require("src.mods.RequiredImports").specs(manifest)) do
+    if candidate.id == importId then return candidate end
+  end
+  return nil
+end
+
+local function requiredImportNotice(self, modId, importId, text)
+  self.requiredImportNotice = {
+    modId = modId,
+    importId = importId,
+    text = tostring(text),
+  }
+end
+
+-- Current Android/iOS bridges can stream a raw required import directly from
+-- the system document provider into its engine-owned baseroms destination.
+-- The bridge hashes/counts the same bytes and then publishes this tiny marker:
+--   v1\n<relative destination>\n<md5>\n<byte count>\n
+-- Older mobile builds still stage picked_required_import.bin, so this is an
+-- additive completion path rather than a replacement for the legacy one.
+local function directRequiredImportTarget(self, marker)
+  local fields = {}
+  for line in tostring(marker or ""):gmatch("[^\r\n]+") do
+    fields[#fields + 1] = line
+    if #fields > 4 then break end
+  end
+  local version, path, digest, count = fields[1], fields[2], fields[3], fields[4]
+  if version ~= "v1" or not path or not digest or not count or #digest ~= 32
+      or not digest:match("^%x+$") or not count:match("^%d+$") then
+    return nil, "The completed dependency marker was malformed."
+  end
+  digest = digest:lower()
+  count = tonumber(count)
+  if not count then return nil, "The completed dependency size was invalid." end
+
+  if not self.mods and self._refreshMods then pcall(self._refreshMods, self) end
+  local RequiredImports = require("src.mods.RequiredImports")
+
+  local function matchRow(row, wantedImportId)
+    local manifest = row and row.manifest
+    if not manifest then return nil end
+    for _, spec in ipairs(RequiredImports.specs(manifest)) do
+      if (not wantedImportId or spec.id == wantedImportId)
+          and RequiredImports.path(manifest, spec) == path then
+        return manifest, spec, row.id or manifest.id
+      end
+    end
+    return nil
+  end
+
+  -- Normal resume: bind the marker to exactly the request that opened picker.
+  if self.pickerPendingModId and self.pickerPendingImportId then
+    for _, row in ipairs(self.mods or {}) do
+      if row.id == self.pickerPendingModId then
+        local manifest, spec, modId = matchRow(row, self.pickerPendingImportId)
+        if manifest then return path, digest, count, manifest, spec, modId end
+      end
+    end
+    return nil, "The completed dependency did not match the pending import request."
+  end
+
+  -- Android may recreate GameActivity while DocumentsUI is open. If Lua was
+  -- restarted too, recover by the exact engine-owned destination. The path
+  -- includes the mod id and only a manifest-declared import can match it.
+  for _, row in ipairs(self.mods or {}) do
+    local manifest, spec, modId = matchRow(row)
+    if manifest then return path, digest, count, manifest, spec, modId end
+  end
+  return nil, "The completed dependency did not match an installed mod request."
+end
+
+finishDirectRequiredImport = function(self, marker)
+  local path, digestOrErr, nativeSize, manifest, spec, modId =
+    directRequiredImportTarget(self, marker)
+  if not path then
+    self.modNotice = { ok = false, text = tostring(digestOrErr) }
+    return nil
+  end
+  local digest = digestOrErr
+  local RequiredImports = require("src.mods.RequiredImports")
+  local info = love.filesystem.getInfo(path, "file")
+  if not info or type(info.size) ~= "number" then
+    requiredImportNotice(self, modId, spec.id,
+      "The completed dependency file was not found.")
+    self.modNotice = nil
+    return nil
+  end
+  if info.size ~= nativeSize then
+    love.filesystem.remove(path)
+    if RequiredImports.receiptPath then
+      love.filesystem.remove(RequiredImports.receiptPath(manifest, spec))
+    end
+    requiredImportNotice(self, modId, spec.id,
+      ("Dependency copy size changed after completion (expected %d bytes, found %d).")
+        :format(nativeSize, info.size))
+    self.modNotice = nil
+    return nil
+  end
+  local sizeErr = RequiredImports.sizeError(spec, info.size, true)
+  if sizeErr then
+    love.filesystem.remove(path)
+    if RequiredImports.receiptPath then
+      love.filesystem.remove(RequiredImports.receiptPath(manifest, spec))
+    end
+    requiredImportNotice(self, modId, spec.id, sizeErr)
+    self.modNotice = nil
+    return nil
+  end
+
+  -- No second 665 MiB / 1.46 GiB read: native calculated this digest while
+  -- streaming the selected document into the one final copy.
+  local ok, detail = RequiredImports.acceptStoredDigest(
+    manifest, spec.id, digest, love.filesystem)
+  if not ok then
+    love.filesystem.remove(path)
+    if RequiredImports.receiptPath then
+      love.filesystem.remove(RequiredImports.receiptPath(manifest, spec))
+    end
+    requiredImportNotice(self, modId, spec.id, detail)
+    self.modNotice = nil
+    return nil
+  end
+
+  self.requiredImportNotice = nil
+  self.modNotice = { ok = true, text = "Imported " .. tostring(spec.id)
+    .. " for " .. tostring(manifest.name or manifest.id) .. "." }
+  self:_refreshMods()
+  return true
+end
+
+function RomImporter:_importRequiredData(modId, importId, data)
+  local manifest = requiredManifest(self, modId)
+  if not manifest then
+    self.modNotice = { ok = false, text = "Required import failed: mod not found." }
+    return nil
+  end
+  local ok, result = require("src.mods.RequiredImports")
+    .importData(manifest, importId, data)
+  if ok then
+    self.requiredImportNotice = nil
+    self.modNotice = { ok = true, text = "Imported " .. tostring(importId)
+      .. " for " .. tostring(manifest.name or manifest.id) .. "." }
+    self:_refreshMods()
+    return true
+  end
+  -- Keep validation feedback on the imported-files page.  A general Mods-page
+  -- notice is hidden by this modal and made MD5 failures especially easy to miss.
+  requiredImportNotice(self, modId, importId, result)
+  self.modNotice = nil
+  return nil
+end
+
+function RomImporter:_importRequiredSource(modId, importId, source, confirmed)
+  local manifest = requiredManifest(self, modId)
+  local spec = manifest and requiredSpec(manifest, importId)
+  if not spec then
+    requiredImportNotice(self, modId, importId, "Import declaration was not found.")
+    self.modNotice = nil
+    return nil
+  end
+  local RequiredImports = require("src.mods.RequiredImports")
+  -- A desktop picker returns a host path. Ask the host file handle first;
+  -- love.filesystem.getInfo is only authoritative for virtual/save paths.
+  local size = externalFileSize(source)
+  if not size then
+    local info = love.filesystem.getInfo(source, "file")
+    size = info and info.size or nil
+  end
+  local sizeErr = RequiredImports.sizeError(spec, size, false)
+  if sizeErr then
+    requiredImportNotice(self, modId, importId, sizeErr)
+    self.modNotice = nil
+    return nil
+  end
+  if not confirmed and type(size) == "number"
+      and size > RequiredImports.LARGE_WARN_BYTES then
+    self._modConfirm = {
+      kind = "largeImport",
+      modId = modId, importId = importId, source = source,
+      title = Strings("Large import"),
+      lines = {
+        Strings("This is a large import (%s).",
+          RequiredImports.sizeLabel(size)),
+        Strings("Please ensure you have enough space on your"),
+        Strings("device before doing this."),
+      },
+      yesLabel = Strings("I understand"),
+    }
+    return nil
+  end
+  if spec.format ~= "n64" and (size == nil
+      or size > RequiredImports.LARGE_WARN_BYTES) then
+    local ok, result = streamRequiredImport(manifest, importId, source)
+    if ok then
+      self.requiredImportNotice = nil
+      self.modNotice = { ok = true, text = "Imported " .. tostring(importId)
+        .. " for " .. tostring(manifest.name or manifest.id) .. "." }
+      self:_refreshMods()
+      return true
+    end
+    requiredImportNotice(self, modId, importId, result)
+    self.modNotice = nil
+    return nil
+  end
+  local data = love.filesystem.read(source)
+  if not data then data = readExternalPath(source) end
+  if not data then
+    requiredImportNotice(self, modId, importId, "Could not read the selected file.")
+    self.modNotice = nil
+    return nil
+  end
+  return self:_importRequiredData(modId, importId, data)
+end
+
+function RomImporter:_removeRequiredImport(modId, importId)
+  local manifest = requiredManifest(self, modId)
+  if not manifest then return end
+  local ok, err = require("src.mods.RequiredImports").remove(manifest, importId)
+  if ok then
+    self.requiredImportNotice = nil
+    self.modNotice = { ok = true, text = "Deleted " .. tostring(importId) .. "." }
+    self:_refreshMods()
+  else
+    requiredImportNotice(self, modId, importId, err)
+    self.modNotice = nil
+  end
+end
+
+-- Select and validate one manifest-declared file.  NX has no host picker, so
+-- its equivalent is an engine-owned imports/baseroms inbox that can be filled
+-- over MTP; every other native/mobile picker lands on the same validation path.
+function RomImporter:chooseRequiredImport(modId, importId)
+  if self:_importerPickPending() then return end
+  if self.workState == "working" then return end
+  local manifest = requiredManifest(self, modId)
+  if not manifest then return end
+  local spec = requiredSpec(manifest, importId)
+  if not spec then return end
+
+  if self:_inboxImport() then
+    local inbox = "imports/baseroms"
+    local fs = pfs()
+    fs.createDirectory(inbox)
+    local lastError
+    for _, name in ipairs(fs.getDirectoryItems(inbox) or {}) do
+      if name:sub(1, 1) ~= "." then
+        local path = inbox .. "/" .. name
+        local info = fs.getInfo(path, "file")
+        local RequiredImports = require("src.mods.RequiredImports")
+        local sizeErr = info
+          and (RequiredImports.extensionError(spec, name)
+            or RequiredImports.sizeError(spec, info.size, false))
+        if info and not sizeErr
+            and info.size > RequiredImports.LARGE_WARN_BYTES then
+          return self:_importRequiredSource(modId, importId, path)
+        end
+        local data = not sizeErr and fs.read(path) or nil
+        if data and self:_importRequiredData(modId, importId, data) then return end
+        if sizeErr then lastError = sizeErr
+        elseif self.requiredImportNotice
+            and self.requiredImportNotice.modId == modId
+            and self.requiredImportNotice.importId == importId then
+          lastError = self.requiredImportNotice.text
+        end
+      end
+    end
+    requiredImportNotice(self, modId, importId, lastError
+      or (Platform.inboxTransfer() == "ftp"
+        and "No matching file in imports/baseroms/. Copy it there over FTP, then try again."
+        or "No matching file in imports/baseroms/. Copy it there over MTP, then try again."))
+    self.modNotice = nil
+    return
+  end
+  if self.nativePicker then
+    -- Android 13+ uses the Storage Access Framework for both paths.  Some
+    -- Android 15 installs carry the newer Lua launcher with an older native
+    -- bridge, however, so they do not advertise required_import yet.  Fall
+    -- back to that bridge's known "rom" picker and quarantine its result by
+    -- the pending required-import IDs. iOS has a different asynchronous
+    -- bridge and deliberately keeps the explicit capability requirement.
+    local legacyAndroidPicker = self.mobileFileBridge
+      and love.system.getOS() == "Android"
+      and not pickerHasKind("required_import")
+    if self.mobileFileBridge and not pickerHasKind("required_import")
+        and not legacyAndroidPicker then
+      requiredImportNotice(self, modId, importId,
+        "This app build cannot pick required mod files yet. Update the app and try again.")
+      self.modNotice = nil
+      return
+    end
+    self.pickerPendingKind = "required_import"
+    self.pickerPendingModId = modId
+    self.pickerPendingImportId = importId
+    self.requiredImportLegacyRomPick = legacyAndroidPicker or nil
+    -- Raw imports can go straight to their final private destination on current
+    -- Android/iOS bridges. N64 stays on staging because the launcher still has
+    -- to canonicalize byte order/copier headers before storing it.
+    local directDestination = (self.mobileFileBridge and not legacyAndroidPicker
+        and spec.format ~= "n64"
+        and type(manifest.path) == "string" and manifest.path ~= "")
+      and require("src.mods.RequiredImports").path(manifest, spec) or nil
+    if not pickFile(legacyAndroidPicker and "rom" or "required_import",
+        directDestination) then
+      self.pickerPendingKind = nil
+      self.pickerPendingModId = nil
+      self.pickerPendingImportId = nil
+      self.requiredImportLegacyRomPick = nil
+      requiredImportNotice(self, modId, importId, "Could not open the file picker.")
+      self.modNotice = nil
+    elseif self.android then
+      self.pickPending = true
+      self.pickTimer = 0
+    end
+    return
+  end
+
+  local path = chooseRequiredFile(spec)
+  if not path then return end
+  local extErr = require("src.mods.RequiredImports").extensionError(spec, path)
+  if extErr then
+    requiredImportNotice(self, modId, importId, extErr)
+    self.modNotice = nil
+    return
+  end
+  self:_importRequiredSource(modId, importId, path)
 end
 
 -- Which game a dropped .sav imports into: a .sav has no version signature of
--- its own, so it lands on the active game tab.  When a non-game tab (mods, or
--- the locked yellow placeholder) is showing, default to red -- the always-
--- present first game -- rather than guess.
+-- its own, so it lands on the active game tab.  When a non-game tab (mods) is
+-- showing, default to red -- the always-present first game -- rather than
+-- guess.
 function RomImporter:_savedropTarget()
   local v = self.tab
-  if v == "red" or v == "blue" then return v end
+  if GameVersion.VERSIONS[v] then return v end
   return "red"
 end
 
@@ -859,10 +3724,9 @@ end
 -- the target tab forward so the notice (and, on success, the new active slot)
 -- is visible.  Requires the ROM to be imported first, since a save is only
 -- playable with its game's data present.
-function RomImporter:_importSave(version, source)
+function RomImporter:_importSave(version, source, force)
   if self.workState == "working" then return end
-  if self.tab == "red" or self.tab == "blue" or self.tab == "mods"
-      or self.tab == "yellow" then
+  if GameVersion.VERSIONS[self.tab] or self.tab == "mods" then
     self.tab = version
   end
   if not self.ready[version] then
@@ -870,41 +3734,124 @@ function RomImporter:_importSave(version, source)
       .. GameVersion.info(version).displayName .. " ROM before importing a save." }
     return
   end
-  local ok, res = require("src.import.SaveFileIO").importToSlot(source, version)
+  local ok, res, info = require("src.import.SaveFileIO").importToSlot(source, version, force)
   if ok then
+    if force and type(source) == "string"
+        and source:sub(1, #savesInboxDir(version) + 1) == savesInboxDir(version) .. "/" then
+      local data = readListed(source)
+      if type(data) == "string" and data ~= "" then appendImportedSavHash(version, sha1(data)) end
+      retireImportedSav(source)
+    end
     self:_refreshSlots(version)
     self.activeSlot[version] = res
     self.slotScroll[version] = math.huge   -- pin the new row on screen (clamped in draw)
-    self.saveNotice[version] = { ok = true, text = "Imported save into " .. tostring(res) .. "." }
-  else
-    self.saveNotice[version] = { ok = false, text = tostring(res) }
+    self.saveNotice[version] = { ok = true, text = "Imported save into " .. tostring(res) .. "."
+      .. (info and info.note and (" " .. info.note) or "") }
+    return
   end
+  if res == nil and info and info.needsConfirm then
+    -- A .sav larger than 32 KB whose first 32768 bytes checksum: the surplus
+    -- is almost certainly an emulator RTC footer, so ask before truncating.
+    -- The yes arm re-enters with force=true; cancel leaves the file untouched.
+    self._modConfirm = {
+      kind = "importOversize",
+      version = version,
+      source = source,
+      title = "Oversized save file",
+      lines = {
+        ("This save is %d bytes; a cartridge save is exactly %d bytes (32 KB).")
+          :format(info.size, 32768),
+        "It may come from a ROM that saved the battery image with an emulator.",
+        "The extra bytes would be discarded.",
+        "Import it anyway?",
+      },
+      yesLabel = "Import anyway",
+    }
+    return
+  end
+  self.saveNotice[version] = { ok = false, text = tostring(res) }
 end
 
 -- "Import save" button: open a native .sav picker and import the pick.
 -- Android mirrors ROM / mod import via love.system.pickFile("sav").
+-- NX: no HostShell/desktop picker -- rescan imports/saves/ inbox instead.
 function RomImporter:chooseSaveImport(version)
+  if self:_importerPickPending() then return end
   if self.workState == "working" then return end
-  if self.android then
-    local name = findPendingSav(true)
-    if name then
-      self.androidPendingVersion = version
-      self:_importSave(version, name)
-      if self.saveNotice[version] and self.saveNotice[version].ok then
-        love.filesystem.remove(name)
-      end
-      return
-    end
-    self.androidPendingVersion = version
-    if not love.system.pickFile("sav") then
-      self.androidPendingVersion = nil
-      self.saveNotice[version] = { ok = false,
-        text = "Could not open the file picker. Copy a .sav via USB." }
+  version = self:_resolveSaveVersion(version)
+  if self:_inboxImport() then
+    self:ensureSavesInboxDir(version)
+    self:rescanSavesAction(version)
+    return
+  end
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "sav"
+    self.pickerPendingVersion = version
+    if not pickFile("sav") then
+      self.pickerPendingKind = nil
+      self.pickerPendingVersion = nil
+      self.saveNotice[version] = { ok = false, text = "Could not open the file picker." }
     end
     return
   end
+  if self.android then
+    local name = findPendingSav(true, self.pickSkip)
+    if name then
+      self.androidPendingVersion = version
+      self:_importSave(version, name)
+      consumePick(self, name, "picked_save.sav",
+        self.saveNotice[version] and self.saveNotice[version].ok)
+      return
+    end
+    self.androidPendingVersion = version
+    self.pickerPendingKind, self.pickerPendingVersion = nil, nil
+    self.cartLegacyModPick = nil
+    if not pickFile("sav") then
+      self.androidPendingVersion = nil
+      self.saveNotice[version] = { ok = false,
+        text = "Could not open the file picker. Copy a .sav via USB." }
+    else
+      self.pickPending = true
+      self.pickTimer = 0
+    end
+    return
+  end
+  local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+
+  if isHandheld then
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    if okKit and Kit.FileBrowser then
+      self._padCursorActive = false
+      Kit.FileBrowser.open({
+        title = "Select Save (.sav / .srm / .lua)",
+        mode = "save",
+        onSelect = function(pickedPath)
+          self:_importSave(version, pickedPath)
+        end,
+      })
+      return
+    end
+  end
+
   local path = chooseSav()
-  if path then self:_importSave(version, path) end
+  if path then
+    self:_importSave(version, path)
+    return
+  end
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and Kit.FileBrowser then
+    self._padCursorActive = false
+    Kit.FileBrowser.open({
+      title = "Select Save (.sav / .srm / .lua)",
+      mode = "save",
+      onSelect = function(pickedPath)
+        self:_importSave(version, pickedPath)
+      end,
+    })
+    return
+  end
 end
 
 -- "Export save" button: write the active slot back out to a raw .sav in the save
@@ -912,54 +3859,95 @@ end
 -- affordance.  On Android, stage pending_export.sav and open the system
 -- create-document picker (love.system.createFile) so the player can save to
 -- Downloads / Drive / etc. -- the app-private exports/ path is not useful there.
-function RomImporter:exportSave(version)
+-- NX: surface exports path + MTP hint; do not rely on openURL / open-folder.
+function RomImporter:exportSave(version, format, scope, slotId)
   if self.workState == "working" then return end
-  local ok, res = require("src.import.SaveFileIO").exportActiveSlot(version)
+  version = self:_resolveSaveVersion(version)
+  local noticeScope = scope or version
+  local IO = require("src.import.SaveFileIO")
+  local ok, res, exportNote
+  if format == "lua" then
+    ok, res = IO.exportLuaSlot(version, slotId, cartOfScope(scope))
+  else
+    ok, res, exportNote = IO.exportActiveSlot(version)
+  end
   if not ok then
-    self.saveNotice[version] = { ok = false, text = tostring(res) }
+    self.saveNotice[noticeScope] = { ok = false, text = tostring(res) }
+    return
+  end
+  if self:_inboxImport() then
+    local saveDir = love.filesystem.getSaveDirectory()
+    local rel = RomImporter.mtpHintPath(saveDir)
+    if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+    local outDir = exportsDir(version)
+    self.saveNotice[noticeScope] = {
+      ok = true,
+      persistent = true,
+      text = Platform.inboxTransfer() == "ftp"
+        and Strings("Exported to %s\nget it over FTP (GoldHEN, port 2121)", res)
+        or Strings("Exported to %s\nDBI MTP → 1: SD Card/%s%s/", res, rel, outDir),
+    }
     return
   end
   if self.android then
-    local rel = res:match("exports[/\\][^/\\]+$")
+    local rel = res:match("(exports[/\\].+%.[Ss][Aa][Vv])$")
+      or res:match("(exports[/\\].+)$")
     local data = rel and love.filesystem.read(rel)
     if not data then
-      self.saveNotice[version] = { ok = false,
+      self.saveNotice[noticeScope] = { ok = false,
         text = "Exported, but could not stage the file for the picker." }
       return
     end
     local suggested = rel:match("[^/\\]+$") or "export.sav"
     local wrote, writeErr = love.filesystem.write("pending_export.sav", data)
     if not wrote then
-      self.saveNotice[version] = { ok = false,
+      self.saveNotice[noticeScope] = { ok = false,
         text = "Could not stage the export: " .. tostring(writeErr) }
       return
     end
-    self.androidPendingExportVersion = version
-    if love.system.createFile and love.system.createFile(suggested) then
-      self.saveNotice[version] = { ok = true,
+    self.androidPendingExportVersion = noticeScope
+    if love.system.createFile and love.system.createFile(suggested, love.filesystem.getSaveDirectory()) then
+      self.pickPending = true
+      self.pickTimer = 0
+      self.saveNotice[noticeScope] = { ok = true, kind = "info",
         text = "Pick where to save " .. suggested .. "..." }
     else
       self.androidPendingExportVersion = nil
-      self.saveNotice[version] = { ok = true,
+      self.saveNotice[noticeScope] = { ok = true,
         text = "Exported inside the app folder (picker unavailable)." }
     end
     return
   end
   local dir = res:match("^(.*)[/\\][^/\\]+$")
-  self.saveNotice[version] = { ok = true, text = "Exported to " .. res, dir = dir }
+  local text = "Exported to " .. res
+  if exportNote then text = text .. "\n" .. exportNote end
+  self.saveNotice[noticeScope] = { ok = true, text = text, dir = dir }
 end
 
 -- Delete a save slot from the registry and disk, then refresh the panel.  If the
 -- deleted slot was active, SaveData.deleteSlot points active at another slot.
-function RomImporter:_deleteSlot(version, id)
+function RomImporter:_deleteSlot(scope, id)
   if self.workState == "working" then return end
   local SaveData = require("src.core.SaveData")
-  local ok, err = SaveData.deleteSlot(version, id)
-  if ok then
-    self:_refreshSlots(version)
-    self.saveNotice[version] = { ok = true, text = "Deleted " .. tostring(id) .. "." }
+  local cart = cartOfScope(scope)
+  local eng = self:_syncEngine()
+  local syncKey
+  if eng and eng.saves and type(eng.saves.keyForSlot) == "function" then
+    local okKey, key = pcall(eng.saves.keyForSlot, scope, id)
+    syncKey = okKey and key or nil
+  end
+  local ok, err
+  if cart then
+    ok, err = SaveData.deleteCartSlot(cart, id)
   else
-    self.saveNotice[version] = { ok = false, text = tostring(err) }
+    ok, err = SaveData.deleteSlot(scope, id)
+  end
+  if ok then
+    if eng and syncKey then pcall(eng.noteSaveDeleted, eng, syncKey) end
+    self:_refreshSlots(scope)
+    self.saveNotice[scope] = { ok = true, text = "Deleted " .. tostring(id) .. "." }
+  else
+    self.saveNotice[scope] = { ok = false, text = tostring(err) }
   end
 end
 
@@ -968,16 +3956,53 @@ end
 -- picked ROM is still routed by its SHA-1, so choosing a Blue cart in the Red
 -- column imports Blue.
 function RomImporter:choose(version)
+  if self:_importerPickPending() then return end
   if self.workState == "working" then return end
   self.chooseVersion = version or "red"
+  if self:_inboxImport() then
+    -- Same path as the Scan again button: rescan imports/ (or show MTP hint).
+    self:rescanAction(self.chooseVersion)
+    return
+  end
+  local baseRom = self.baseRomDiscovery and self.baseRoms[self.chooseVersion]
+  if baseRom then
+    self.baseRoms[self.chooseVersion] = nil
+    local data = love.filesystem.read(baseRom.path)
+    if not data then
+      self.notice = {
+        version = self.chooseVersion,
+        status = "The detected ROM is no longer available.",
+        detail = "Choose Import ROM to select it another way.",
+      }
+      return
+    end
+    self:startData(data, baseRom.name)
+    return
+  end
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "rom"
+    if not pickFile("rom") then
+      self.pickerPendingKind = nil
+      self:setError("Could not open the file picker.")
+    end
+    return
+  end
   if self.android then
-    -- Prefer a not-yet-imported .gb already in the save dir (USB copy, or a
-    -- fresh SAF pick).  Never reuse an already-imported cart's file -- that
-    -- was the #167 failure mode (second Choose just re-extracted Red).
-    local name, data = findPendingRom(self.ready)
+    -- Prefer a not-yet-imported .gb/.gbc/.gba already in the save dir (USB copy, or
+    -- a fresh SAF pick).  Never reuse an already-imported cart's file -- that
+    -- was the #167 failure mode (second Choose just re-extracted Red).  This
+    -- is a Choose, so it takes the cart that was asked for and nothing else.
+    local name, data = findPendingRom(self, self.chooseVersion)
     if name then
       self:startData(data, name)
-    elseif not love.system.pickFile() then
+      return
+    end
+    if consumePickedRomError(self) then
+      return   -- a rejected pick explains itself instead of silently reopening
+    end
+    self.pickerPendingKind, self.pickerPendingVersion = nil, nil
+    self.cartLegacyModPick = nil
+    if not pickFile() then
       -- Picker unavailable (API < 19, or no document-picker app installed):
       -- fall back to the USB folder-drop path as a friendly notice, not an
       -- error (which would read as a rejected file).
@@ -986,21 +4011,52 @@ function RomImporter:choose(version)
         status = "No picker available, copy your ROM into:",
         detail = love.filesystem.getSaveDirectory(),
       }
+    else
+      self.pickPending = true
+      self.pickTimer = 0
     end
     return
   end
+  local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+
+  if isHandheld then
+    if importPendingRom(self) then return end
+    local skips = self:_reportRomSkips(self.chooseVersion)
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    if okKit and Kit.FileBrowser then
+      self._padCursorActive = false
+      Kit.FileBrowser.open({
+        title = "Select " .. (GameVersion.info(self.chooseVersion).displayName or "ROM"),
+        mode = "rom",
+        hint = skips[1] and ("Skipped " .. skips[1].name .. ": " .. skips[1].reason) or nil,
+        onSelect = function(pickedPath)
+          self:startPath(pickedPath)
+        end,
+      })
+      return
+    end
+  end
+
   local path = chooseRom(GameVersion.info(self.chooseVersion).displayName)
   if path then
     self:startPath(path)
     return
   end
-  -- Handheld Linux (Anbernic stock OS / PortMaster) rarely has zenity or
-  -- kdialog.  Fall back to the same "drop a .gb next to the game" scan used
-  -- on Android, which works when the game is launched as an unpacked
-  -- directory (see build-rg34xxsp.sh).
-  local name, data = findPendingRom(self.ready)
-  if name then
-    self:startData(data, name)
+  if importPendingRom(self) then return end
+  local skips = self:_reportRomSkips(self.chooseVersion)
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and Kit.FileBrowser then
+    self._padCursorActive = false
+    Kit.FileBrowser.open({
+      title = "Select " .. (GameVersion.info(self.chooseVersion).displayName or "ROM"),
+      mode = "rom",
+      hint = skips[1] and ("Skipped " .. skips[1].name .. ": " .. skips[1].reason) or nil,
+      onSelect = function(pickedPath)
+        self:startPath(pickedPath)
+      end,
+    })
     return
   end
   if love.system.getOS() == "Linux" then
@@ -1010,19 +4066,361 @@ function RomImporter:choose(version)
       or "the game folder"
     self.notice = {
       version = self.chooseVersion,
-      status = "No file picker. Copy your .gb into:",
+      status = "No file picker. Copy your .gb/.gbc/.gba into:",
       detail = where,
     }
     return
   end
   if love.system.getOS() ~= "OS X" and love.system.getOS() ~= "Windows" then
-    self:setError("File selection is unavailable here. Drop the .gb file onto the window.")
+    self:setError("File selection is unavailable here. Drop the .gb/.gbc/.gba file onto the window.")
+  end
+end
+
+-- Poll the save dir for a delivered pick (picked_rom.gb / picked_mod.zip /
+-- picked_save.sav / export_done.flag) and run the same import path a refocus
+-- runs.  Both mobiles need this, for different reasons:
+--
+--   iOS     the document picker is an in-process modal sheet, so there is no
+--           love.focus(true) when it dismisses -- nothing else would consume it.
+--   Android the SAF picker IS a separate activity and normally does refocus,
+--           but Android may destroy GameActivity while it is up, in which case
+--           the app restarts and that focus event never comes.  Polling makes
+--           the outcome the same either way instead of leaving the pick on disk
+--           for the next tap to find, which is what made users import twice and
+--           what made it look random: it depends on memory pressure (#553).
+--
+-- Deliberately NO timeout.  A version of this disarmed the poll after 120s so a
+-- cancelled picker would stop scanning, which was wrong on iOS: the picker there
+-- is an in-process modal sheet, so update() keeps running while it is open and
+-- the window burned down while the player was still browsing Files.  The pick
+-- then landed with nothing armed to consume it, and because every path here is
+-- silent on success the import just did not happen, with no error shown.  A
+-- half-second directory listing on a menu screen is far cheaper than an import
+-- that vanishes, so the poll stays armed until something is actually consumed.
+
+function RomImporter:_pollPickedFiles(dt)
+  if not self.pickPending then return end
+  if self.workState == "working" then return end
+  self.pickTimer = (self.pickTimer or 0) + dt
+  if self.pickTimer < 0.5 then return end
+  self.pickTimer = 0
+  -- The Swift bridge reports a failed pick copy through pick_error.txt;
+  -- surface it on whichever tab the player is looking at rather than
+  -- letting the pick silently do nothing.
+  local pickError = love.filesystem.read("pick_error.txt")
+  if pickError then
+    love.filesystem.remove("pick_error.txt")
+    self.pickPending = nil
+    if self.pickerPendingKind == "box" then
+      self.pickerPendingKind = nil
+      require("src.import.BoxPanel").importGCI(self, nil, pickError)
+    elseif self.pickerPendingKind == "cart" then
+      self.pickerPendingKind = nil
+      self.pickerPendingVersion = nil
+      self._cartNotice = pickError
+    else
+      self.modNotice = { ok = false, text = pickError }
+      self.notice = { version = self.chooseVersion or "red",
+                      status = "File import failed:", detail = pickError }
+    end
+    return
+  end
+  local importerPending = self:_importerPickPending()
+  local found = love.filesystem.getInfo("pick_error.flag", "file") ~= nil
+    or (not importerPending and (
+      love.filesystem.getInfo("export_done.flag", "file") ~= nil
+      or love.filesystem.getInfo(PICK_COMPLETE_FILENAME, "file") ~= nil))
+  if not found and self:_importerPickPending() then
+    found = findPendingImporter(self) ~= nil
+  elseif not found then
+    for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
+      local n = name:lower()
+      if isRomFilename(n) or n == "picked_mod.zip" or n == "picked_save.sav"
+          or n == PICKED_CART
+          or n == "picked_required_import.bin" or n == "picked_stadium.z64"
+          or n:match("^picked_importer_[%l%d_%-]+%.bin$") then
+        found = true
+        break
+      end
+    end
+  end
+  if found then
+
+
+    if not importerPending then self.pickPending = nil end
+    self:focus(true)
   end
 end
 
 function RomImporter:update(dt)
+  local released, changed = SecretGames.update()
+  if released then
+    self._secretPopup = nil
+    self._logoTaps = nil
+    if changed then self._headerChrome = nil end
+  end
   self.pulse = self.pulse + dt
-  self:_updatePadCursor(dt)
+  if self._importerJob then self:_stepImporter() end
+  if not Transition.armed then
+    self._motionFrames = (self._motionFrames or 0) + 1
+    if self._motionFrames > 1 then Transition.armed = true end
+  end
+  if self._launchFade then
+    self._launchFade.elapsed = self._launchFade.elapsed + dt
+    if self._launchFade.elapsed >= self._launchFade.duration then
+      local version = self._launchFade.version
+      self._launchFade = nil
+      self:play(version)
+      return
+    end
+  end
+  if not self._inputBlocked then self:_updatePadCursor(dt) end
+  self:_stepBaseRomScan()
+  -- Pump the FlexLove view (input polling + the queued click actions).  The
+  -- flag is only set once draw() has built a tree, so headless runs and the
+  -- test tier never touch the toolkit.
+  if self._flex and not self._inputBlocked then
+    require("src.import.LauncherView").update(self, dt)
+  end
+  if self.tab == "box" then require("src.import.BoxPanel").update(self, dt) end
+  -- Drive every in-flight async fetch.  These are the operations that used to
+  -- run synchronously inside draw and freeze the window; each pump is a
+  -- non-blocking channel poll, so a frame with nothing in flight costs
+  -- nothing.  They run whether or not the view is up, so a refresh started
+  -- before a tab switch still completes.
+  self:_pumpFindFetch()
+  self:_pumpFindDetails()
+  self:_pumpModInfoFetch()
+  self:_queueFindEnrichment()
+  self:_pumpFindStats()
+  self:_pumpFindThumbs()
+  self:_pumpSkinFetch()
+  self:_pumpSync(dt)
+  self:_pumpOnline(dt)
+  self:_pumpModCheck()
+  self:_pumpModInstall()
+  self:_pumpCartInstall()
+  self:_pumpCartFill()
+  self:_pumpIdSync()
+  self:_pumpUpdateAll()
+  if self:_fireAutoUpdateAll() then return end
+  self:_pumpExtract()
+  self:_pumpReimport()
+  self:_pumpHostPick()
+  self:_pumpModPickOpen(dt)
+  self:_pumpInboxJob()
+  self:_pumpModInboxInstall()
+  -- Dev harness: POKEPORT_LAUNCHER_SHOT=/path.png resizes the window from
+  -- POKEPORT_WIN=WxH, lets the view settle, then captures one frame and
+  -- quits, so a scripted run can see the real launcher at any window shape
+  -- (the frame drivers all bypass the interactive launcher).
+  local shot = os.getenv("POKEPORT_LAUNCHER_SHOT")
+  if shot and not self._shotDone then
+    if not self._shotSized then
+      self._shotSized = true
+      if os.getenv("POKEPORT_REDUCE_MOTION") ~= "0" then
+        Transition.reduceMotion = true
+      end
+      local w, h = (os.getenv("POKEPORT_WIN") or ""):match("^(%d+)x(%d+)$")
+      if w and love.window and love.window.setMode then
+        pcall(love.window.setMode, tonumber(w), tonumber(h),
+          require("src.render.WindowsDpi").modeFlags({ resizable = true }))
+      end
+      local tab = os.getenv("POKEPORT_LAUNCHER_TAB")
+      if tab and tab ~= "" then self:_switchTab(tab) end
+      -- POKEPORT_LAUNCHER_CONFIRM=1 arms a representative install confirm so
+      -- a capture can see the modal (it is otherwise only reachable by click)
+      if os.getenv("POKEPORT_LAUNCHER_CONFIRM") == "1" then
+        self._modConfirm = {
+          kind = "update",
+          title = "Install mod",
+          yesLabel = "Install",
+          lines = { "JP GREEN - Poketto Monsuta Midori v0.4.4",
+                    "by bryanthaboi",
+                    "Mods are not reviewed - trust the author." },
+        }
+      end
+      -- POKEPORT_LAUNCHER_SETTINGS=1 opens the gear panel, the other layout
+      -- a capture cannot otherwise reach without a click.  Pair it with
+      -- POKEPORT_LAUNCHER_SETTINGS_PAGE to land on a page past the first.
+      if os.getenv("POKEPORT_LAUNCHER_SETTINGS") == "1" then
+        self:_openSettings()
+      end
+      if os.getenv("POKEPORT_LAUNCHER_BUG") == "1" then
+        self:_openBugPanel()
+      end
+      if os.getenv("POKEPORT_LAUNCHER_GAME_POPUP") == "1" then
+        self._gamePopup = true
+      end
+      for _ = 1, tonumber(os.getenv("POKEPORT_LAUNCHER_LOGO_TAPS") or "") or 0 do
+        self:_logoTap()
+      end
+      -- POKEPORT_LAUNCHER_FIND_KIND=mods|carts picks which half of the feed
+      -- the FIND tab is browsing; the switch is otherwise only a click.
+      local findKind = os.getenv("POKEPORT_LAUNCHER_FIND_KIND")
+      if findKind and findKind ~= "" then self:_setFindKind(findKind) end
+      local query = os.getenv("POKEPORT_LAUNCHER_QUERY")
+      if query and query ~= "" then
+        self.findQuery = query
+        self._findSearchFocus = true
+      end
+      -- POKEPORT_LAUNCHER_TYPE feeds one character per frame through the
+      -- real textinput path, reproducing typed (per-frame growing) text
+      -- rather than text set once before the first frame.
+      self._shotType = os.getenv("POKEPORT_LAUNCHER_TYPE")
+      if self._shotType and self._shotType ~= "" then
+        self._findSearchFocus = true
+        self._shotTypeAt = 0
+      end
+    end
+    if self._shotType and self._shotTypeAt then
+      self._shotTypeAt = self._shotTypeAt + 1
+      if self._shotTypeAt % 3 == 0 then
+        local n = math.floor(self._shotTypeAt / 3)
+        if n <= #self._shotType then
+          self:textinput(self._shotType:sub(n, n))
+        end
+      end
+      if os.getenv("POKEPORT_LAUNCHER_SETTINGS") == "1" then
+        self:_openSettings()
+      end
+    end
+    self._shotTimer = (self._shotTimer or 0) + dt
+    -- POKEPORT_WIN2=WxH resizes mid-run, with UI state already settled, so
+    -- the capture exercises the live-resize path and not just first boot.
+    if not self._shotResized and self._shotTimer > 0.6 then
+      self._shotResized = true
+      local w2, h2 = (os.getenv("POKEPORT_WIN2") or ""):match("^(%d+)x(%d+)$")
+      if w2 and love.window and love.window.setMode then
+        pcall(love.window.setMode, tonumber(w2), tonumber(h2),
+          require("src.render.WindowsDpi").modeFlags({ resizable = true }))
+      end
+    end
+    local motion = os.getenv("POKEPORT_LAUNCHER_MOTION")
+    if motion and motion ~= "" and not self._shotMotionAt
+        and self._shotTimer > 0.9 then
+      self._shotMotionAt = 0
+      local ms = tonumber(os.getenv("POKEPORT_MOTION_MS") or "")
+      if ms and ms > 0 then
+        for kind in pairs(Transition.DURATIONS) do
+          Transition.DURATIONS[kind] = ms / 1000
+        end
+      end
+      if motion:match("^go:") then
+        local okOP, OP = pcall(require, "src.import.OnlinePanel")
+        if okOP then OP.go(self, motion:sub(4)) end
+      elseif motion == "modal-close" then
+        self._modConfirm = nil
+      elseif motion == "modal" then
+        self._modConfirm = {
+          kind = "update", title = "Install mod", yesLabel = "Install",
+          lines = { "JP GREEN - Poketto Monsuta Midori v0.4.4",
+                    "by bryanthaboi",
+                    "Mods are not reviewed - trust the author." },
+        }
+      else
+        self:_switchTab(motion)
+      end
+    end
+    if self._shotMotionAt then
+      self._shotMotionAt = self._shotMotionAt + 1
+      local want = tonumber(os.getenv("POKEPORT_LAUNCHER_SHOT_SEQ") or "4") or 4
+      if self._shotMotionAt <= want then
+        local path = (shot:gsub("%.png$", ""))
+          .. "-" .. self._shotMotionAt .. ".png"
+        love.graphics.captureScreenshot(function(imagedata)
+          local fd = imagedata:encode("png")
+          local f = io.open(path, "wb")
+          if f then f:write(fd:getString()) f:close() end
+        end)
+      else
+        self._shotDone = true
+        love.event.quit()
+      end
+    elseif self._shotTimer > 1.2 then
+      self._shotDone = true
+      love.graphics.captureScreenshot(function(imagedata)
+        local fd = imagedata:encode("png")
+        local f = io.open(shot, "wb")
+        if f then f:write(fd:getString()) f:close() end
+        love.event.quit()
+      end)
+    end
+  end
+  if self.nativePicker and love.system.getPickedFile and self.workState ~= "working" then
+    local path = love.system.getPickedFile()
+    if path then
+      local kind = self.pickerPendingKind or "rom"
+      local version = self.pickerPendingVersion
+      self.pickerPendingKind = nil
+      self.pickerPendingVersion = nil
+      if kind == "required_import" then
+        local modId, importId = self.pickerPendingModId, self.pickerPendingImportId
+        self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+        if modId and importId then self:_importRequiredSource(modId, importId, path) end
+        if Platform.isUWP() then os.remove(path) end
+      elseif kind == "mod" then
+        self:_installMod(path)
+        if Platform.isUWP() and self.modNotice and self.modNotice.ok then
+          os.remove(path)
+        end
+      elseif kind == "importer" then
+        local importerId = self.pickerPendingImporterId
+        self.pickerPendingImporterId = nil
+        if importerId then self:_runImporter(importerId, path) end
+        if Platform.isUWP() then os.remove(path) end
+      elseif kind == "skin" then
+        self:_installSkinZip(path)
+        if Platform.isUWP() and self._skinNotice and self._skinNotice.ok then
+          os.remove(path)
+        end
+      elseif kind == "box" then
+        local imported = self:_importBoxFile(path)
+        if Platform.isUWP() and imported then os.remove(path) end
+      elseif kind == "sav" then
+        local target = version or self:_savedropTarget()
+        self:_importSave(target, path)
+        if Platform.isUWP() and self.saveNotice[target] and self.saveNotice[target].ok then
+          os.remove(path)
+        end
+      elseif kind == "cart" then
+        if Platform.isUWP() then
+          local installed = self:_installCartFile(path, version)
+          if installed then os.remove(path) end
+        else
+          self:_installCartFile(path, version)
+        end
+      else
+        self:startPath(path)
+        if Platform.isUWP() then os.remove(path) end
+      end
+    elseif love.system.getPickError then
+      local errorText = love.system.getPickError()
+      if errorText then
+        local kind = self.pickerPendingKind or "rom"
+        local version = self.pickerPendingVersion or self:_savedropTarget()
+        self.pickerPendingKind = nil
+        self.pickerPendingVersion = nil
+        if kind == "required_import" then
+          self.modNotice = { ok = false, text = errorText }
+          self.pickerPendingModId, self.pickerPendingImportId = nil, nil
+        elseif kind == "mod" then
+          self.modNotice = { ok = false, text = errorText }
+        elseif kind == "skin" then
+          self._skinNotice = { ok = false, text = errorText }
+        elseif kind == "box" then
+          require("src.import.BoxPanel").importGCI(self, nil, errorText)
+        elseif kind == "sav" then
+          self.saveNotice[version] = { ok = false, text = errorText }
+        elseif kind == "cart" then
+          self._cartNotice = errorText
+        else
+          self:setError(errorText)
+        end
+      end
+    end
+  end
+  self:_pollPickedFiles(dt)
   if self.workState ~= "working" or not self.worker then return end
   local started = love.timer.getTime()
   repeat
@@ -1044,39 +4442,257 @@ local PAD_DEAD = 0.28
 local PAD_SPEED = 560   -- px/s at full stick deflection
 local PAD_DPAD_SPEED = 420
 
+function RomImporter:_consolePointerHost()
+  return (self.isNX or Platform.padNavigation() ~= nil) and true or false
+end
+
+-- True when ROMs, mods and saves arrive through the save-directory inbox
+-- (imports/) instead of a file picker: "Scan again", transfer hints.  Asked
+-- here rather than through isNX, which means the Switch itself.  isNX still
+-- counts so hand-built importers (tests) that only set it keep the NX flow.
+function RomImporter:_inboxImport()
+  return (self.inboxImport or self.isNX) and true or false
+end
+
 function RomImporter:_activatePadCursor()
   if self._padCursorActive then return end
-  local w, h = love.graphics.getDimensions()
+  local ox, oy, w, h = SafeArea.rect()
   if not self._padInited then
-    self._padCursor.x = w * 0.5
-    self._padCursor.y = h * 0.45
+    self._padCursor.x = ox + w * 0.5
+    self._padCursor.y = oy + h * 0.45
     self._padInited = true
   end
   self._padCursorActive = true
 end
 
-function RomImporter:_cycleTab(delta)
-  local order = { "red", "blue", "yellow", "mods" }
-  local idx = 1
-  for i, id in ipairs(order) do
-    if id == self.tab then idx = i; break end
+-- NX: FlexLove hover/hit-test polls love.mouse.getPosition every interactive
+-- element. Warping via setPosition every stick frame is expensive on love-nx
+-- and makes the virtual cursor lag. Expose the pad pointer through a getPosition
+-- shim instead; desktop keeps the setPosition path unchanged.
+function RomImporter:_ensureNxPointerBridge()
+  if not self:_consolePointerHost() or self._nxPointerBridge then return end
+  if not (love and love.mouse and love.mouse.getPosition) then return end
+  self._nxRealGetPosition = love.mouse.getPosition
+  local importer = self
+  love.mouse.getPosition = function()
+    if importer._padCursorActive then
+      return importer._padCursor.x, importer._padCursor.y
+    end
+    return importer._nxRealGetPosition()
   end
-  idx = ((idx - 1 + delta) % #order) + 1
-  self.tab = order[idx]
-  self._slotPress = nil
-  self._modPress = nil
+  self._nxPointerBridge = true
+end
+
+function RomImporter:_restoreNxPointerBridge()
+  if not self._nxPointerBridge then return end
+  if love and love.mouse and self._nxRealGetPosition then
+    love.mouse.getPosition = self._nxRealGetPosition
+  end
+  self._nxPointerBridge = false
+  self._nxRealGetPosition = nil
+end
+
+-- NX only: drop the getPosition shim + hide the virtual cursor before a host
+-- takes over input (embedded save editor). Desktop is a no-op.
+function RomImporter:parkNxPointerForHost()
+  if not self:_consolePointerHost() then return end
+  self._padCursorActive = false
+  self:_restoreNxPointerBridge()
+end
+
+-- Temporary overlay handoff (Edit Save / Touch Controls): restore the system
+-- arrow cursor, hide the virtual pad pointer, tear down FlexLove when the
+-- view is already loaded, and drop the NX getPosition shim.  Play uses
+-- resetPointerCursor + detach directly because it never returns here.
+function RomImporter:prepareOverlayHandoff()
+  resetPointerCursor(self)
+  self._padCursorActive = false
+  self:_forgetActiveSkin()
+  -- Avoid requiring LauncherView from headless unit tests (no luautf8).  In
+  -- a real session draw() has already loaded it, so detach runs normally.
+  if self._flex and package.loaded["src.import.LauncherView"] then
+    require("src.import.LauncherView").detach(self)
+  else
+    self._flex = nil
+    self:parkNxPointerForHost()
+  end
+end
+
+-- EXIT GAME / Close editor leave the confirming finger still down, often
+-- sitting where Import Save is drawn.  The launcher must not treat that
+-- leftover hold as a new press once a short suppress window expires
+-- (#2079): update() would then arm on the still-down pointer and the
+-- later lift would open the system file picker.  Swallow this gesture
+-- (held mouse, already-down touches) and debounce clicks briefly.
+local RETURN_POINTER_HOLD = 0.5
+
+function RomImporter:ignoreReturningPointer()
+  local now = 0
+  if love.timer and love.timer.getTime then
+    now = love.timer.getTime()
+  end
+  self._suppressClickUntil = now + RETURN_POINTER_HOLD
+  self._suppressMouseUntil = now + RETURN_POINTER_HOLD
+  self._clickPt = nil
+  self._mouseAt = nil
+  self._touchAt = nil
+  -- Already-down is not a rising edge.  Always mark the poll as held so
+  -- the first frame after remount cannot mint a press from a leftover.
+  self._prevMouseDown = true
+  local ignore = {}
+  if love.touch and love.touch.getTouches then
+    local ok, ids = pcall(love.touch.getTouches)
+    if ok and type(ids) == "table" then
+      for i = 1, #ids do
+        ignore[tostring(ids[i])] = true
+      end
+    end
+  end
+  self._ignoreTouch = ignore
+  if package.loaded["src.ui.kit.Kit"] then
+    local Kit = require("src.ui.kit.Kit")
+    if Kit.dragEnd then pcall(Kit.dragEnd) end
+  end
+end
+
+-- After an overlay closes: re-arm the pad cursor when a stick is already
+-- connected so NX / handhelds are not stranded without a pointer until the
+-- next stick bump (same class of bug as opening Touch Controls).
+function RomImporter:resumeAfterOverlay()
+  self:ignoreReturningPointer()
+  if not self.launcher then return end
+  if not (love.joystick and love.joystick.getJoystickCount) then return end
+  if love.joystick.getJoystickCount() <= 0 then return end
+  local osName = (love.system and love.system.getOS and love.system.getOS()) or ""
+  if osName == "Linux" or self.isNX then
+    self:_activatePadCursor()
+  end
+end
+
+function RomImporter:_cycleTab(delta)
+  local order = {}
+  for _, tab in ipairs(require("src.import.LauncherView").HEADER_TABS) do
+    order[#order + 1] = tab.id
+  end
+  local games = SecretGames.order(self)
+  for i = #games, 1, -1 do
+    table.insert(order, 1, games[i])
+  end
+  local idx
+  local current = self.tab == "find" and "mods" or self.tab
+  for i, id in ipairs(order) do
+    if id == current then idx = i; break end
+  end
+  local target
+  if idx then
+    target = order[((idx - 1 + delta) % #order) + 1]
+  else
+    target = delta > 0 and order[1] or order[#order]
+  end
+  self:_switchTab(target == "mods" and (self._modsInnerTab or "mods") or target)
+end
+
+function RomImporter:_cycleGame(delta)
+  local LauncherView = require("src.import.LauncherView")
+  local games = LauncherView.gameTabs(self)
+  if #games == 0 then return end
+  local cur = LauncherView.currentGame(self)
+  local idx
+  for i, g in ipairs(games) do
+    if cur and g.id == cur.id then idx = i; break end
+  end
+  local target
+  if idx then
+    target = games[((idx - 1 + delta) % #games) + 1]
+  else
+    target = delta > 0 and games[1] or games[#games]
+  end
+  self._gamePopup = nil
+  self:_switchTab(target.id)
+end
+
+local STICK_NAV_ON = 0.5
+local STICK_NAV_OFF = 0.3
+local STICK_NAV_DELAY = 0.28
+local STICK_NAV_REPEAT = 0.12
+
+function RomImporter:_stickNavDir()
+  local nav = self._stickNav
+  local on = (nav and nav.dir) and STICK_NAV_OFF or STICK_NAV_ON
+  local ax = self._padAxis.leftx or 0
+  local ay = self._padAxis.lefty or 0
+  if math.abs(ax) >= math.abs(ay) then
+    if math.abs(ax) > on then return ax > 0 and "right" or "left" end
+  else
+    if math.abs(ay) > on then return ay > 0 and "down" or "up" end
+  end
+  if self._padDir.dpleft then return "left" end
+  if self._padDir.dpright then return "right" end
+  if self._padDir.dpup then return "up" end
+  if self._padDir.dpdown then return "down" end
+  return nil
+end
+
+function RomImporter:_navigateWithStick(dt, Kit)
+  local nav = self._stickNav
+  if not nav then nav = {}; self._stickNav = nav end
+  local dir = self:_stickNavDir()
+  if not dir then
+    nav.dir, nav.t, nav.fired = nil, 0, false
+    return
+  end
+  if nav.dir ~= dir then
+    nav.dir, nav.t, nav.fired = dir, 0, false
+    if Kit then Kit.navigate(dir) end
+    return
+  end
+  nav.t = (nav.t or 0) + dt
+  if nav.t >= (nav.fired and STICK_NAV_REPEAT or STICK_NAV_DELAY) then
+    nav.t, nav.fired = 0, true
+    if Kit then Kit.navigate(dir) end
+  end
 end
 
 function RomImporter:_updatePadCursor(dt)
-  -- Real mouse motion yields the pad cursor so desktop users keep a normal
-  -- pointer after bumping a stick once.
-  local mx, my = love.mouse.getPosition()
-  if self._lastMouseX and self._padCursorActive then
-    if math.abs(mx - self._lastMouseX) > 3 or math.abs(my - self._lastMouseY) > 3 then
-      self._padCursorActive = false
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit then
+    if (Kit.FileBrowser and Kit.FileBrowser.active)
+        or (Kit.VirtualKeyboard and Kit.VirtualKeyboard.active) then
+      return
     end
   end
-  self._lastMouseX, self._lastMouseY = mx, my
+
+  if self:_consolePointerHost() then
+    self:_ensureNxPointerBridge()
+    -- Cap dt so a hitch in the FlexLove immediate-mode frame does not fling
+    -- the cursor; desktop keeps raw dt (setPosition path already smooth there).
+    if dt > 1 / 30 then dt = 1 / 30 end
+  end
+
+  -- Real mouse motion yields the pad cursor so desktop users keep a normal
+  -- pointer after bumping a stick once. On NX this must stay off: love-nx /
+  -- SDL often drifts the system mouse with the stick (or touch), and axis
+  -- events are not every frame, so yield+reactivate flickers the overlay.
+  if not self:_consolePointerHost() then
+    local mx, my = love.mouse.getPosition()
+    if self._lastMouseX and self._padCursorActive then
+      if math.abs(mx - self._lastMouseX) > 3 or math.abs(my - self._lastMouseY) > 3 then
+        self._padCursorActive = false
+      end
+    end
+    self._lastMouseX, self._lastMouseY = mx, my
+  end
+
+  if not self._padCursorActive and not self.isNX
+      and (Platform.padNavigation() == "focus" or self._padNavChosen) then
+    self:_navigateWithStick(dt, okKit and Kit or nil)
+    local scrollY = self._padAxis.righty or 0
+    if math.abs(scrollY) > PAD_DEAD and self._flex then
+      require("src.import.LauncherView").wheelmoved(self, 0, -scrollY * 8 * dt)
+    end
+    return
+  end
+  self._stickNav = nil
 
   local ax = self._padAxis.leftx or 0
   local ay = self._padAxis.lefty or 0
@@ -1094,52 +4710,258 @@ function RomImporter:_updatePadCursor(dt)
     if mag > 1 then dx, dy = dx / mag, dy / mag end
     local speed = (math.abs(ax) > PAD_DEAD or math.abs(ay) > PAD_DEAD)
       and PAD_SPEED or PAD_DPAD_SPEED
-    local w, h = love.graphics.getDimensions()
+    local ox, oy, w, h = SafeArea.rect()
     local nx = self._padCursor.x + dx * speed * dt
     local ny = self._padCursor.y + dy * speed * dt
-    self._padCursor.x = math.max(0, math.min(w, nx))
-    self._padCursor.y = math.max(0, math.min(h, ny))
+    self._padCursor.x = math.max(ox, math.min(ox + w, nx))
+    self._padCursor.y = math.max(oy, math.min(oy + h, ny))
+    local overY = 0
+    if ny > oy + h then overY = ny - (oy + h)
+    elseif ny < oy then overY = ny - oy end
+    if math.abs(ay) > PAD_DEAD and not self._padStickCentered then overY = 0 end
+    if overY ~= 0 and self._flex then
+      require("src.import.LauncherView").wheelmoved(self, 0, -overY / 48)
+    end
+    if not self:_consolePointerHost() and love.mouse.setPosition then
+      pcall(love.mouse.setPosition, self._padCursor.x, self._padCursor.y)
+      self._lastMouseX, self._lastMouseY = self._padCursor.x, self._padCursor.y
+    end
   end
 
-  -- Right stick scrolls the active list (save slots or mods).
   local ry = self._padAxis.righty or 0
-  if math.abs(ry) > PAD_DEAD then
+  if math.abs(ry) > PAD_DEAD and self._flex then
     self:_activatePadCursor()
-    local step = -ry * 480 * dt
-    if self.tab == "mods" then
-      local maxS = self._modMax or 0
-      if maxS > 0 then
-        local next = (self.modScroll or 0) + step
-        self.modScroll = math.max(0, math.min(maxS, next))
-      end
-    elseif self.tab == "red" or self.tab == "blue" then
-      local maxS = (self._slotMax and self._slotMax[self.tab]) or 0
-      if maxS > 0 then
-        local next = (self.slotScroll[self.tab] or 0) + step
-        self.slotScroll[self.tab] = math.max(0, math.min(maxS, next))
-      end
-    end
+    require("src.import.LauncherView").wheelmoved(self, 0, -ry * 8 * dt)
   end
 end
 
 function RomImporter:gamepadpressed(_, button)
-  self:_activatePadCursor()
-  if button == "a" then
-    -- Instant click at the virtual pointer (same path as a mouse/touch tap).
-    self:mousepressed(self._padCursor.x, self._padCursor.y, 1)
-  elseif button == "leftshoulder" then
+  if Transition.active() then return end
+  if self._hostPick then return end
+  local action =(GamepadMap.mapLauncherButton and GamepadMap.mapLauncherButton(button)) or button
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit then
+    if Kit.VirtualKeyboard and Kit.VirtualKeyboard.active then
+      if Kit.VirtualKeyboard.gamepadpressed(action) then return end
+    end
+    if Kit.FileBrowser and Kit.FileBrowser.active then
+      if Kit.FileBrowser.gamepadpressed(action) then return end
+    end
+  end
+  if self._secretPopup then
+    if action == "a" or action == "start" then self:_confirmSecret() end
+    return
+  end
+  if self._boxPopup and action == "b" then
+    require("src.import.BoxUI").close(self)
+    return
+  end
+  if okKit and Kit.focus and action == "b" then Kit.blur(); return end
+
+  -- Y button toggle between Native Controller Navigation and Virtual Pointer Cursor:
+  if action == "y" or button == "y" then
+    self._padCursorActive = not self._padCursorActive
+    self._padNavChosen = not self._padCursorActive
+    if okKit then Kit._ringShown = not self._padCursorActive end
+    self._cursorModeToast = self._padCursorActive and "Cursor Navigation [Y]" or "Controller Menu Navigation [Y]"
+    self._cursorModeToastTime = love.timer.getTime()
+    return
+  end
+
+  -- Select button: toggle Virtual Keyboard on handhelds
+  if self._boxPopup and not self._padCursorActive and not self.isNX then
+    local key = ({ a = "return", b = "escape", dpup = "up", dpdown = "down" })[action]
+    if key then require("src.import.BoxUI").keypressed(self, key); return end
+  end
+  if button == "back" or button == "select" or action == "select" then
+    local isHandheld = os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+      or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+      or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+      or os.getenv("POKEPORT_SBC") == "1" or os.getenv("ANBERNIC") == "1"
+    if not isHandheld then return end
+    if okKit and Kit.VirtualKeyboard then
+      if Kit.VirtualKeyboard.active then
+        Kit.VirtualKeyboard.close(false)
+        return
+      end
+      if self._boxPrompt then
+        require("src.import.BoxPrompt").openKeyboard(self)
+        return
+      elseif self._indexPrompt then
+        Kit.VirtualKeyboard.open({
+          text = self._indexPrompt.text or "",
+          title = "Add a mod index",
+          onDone = function(newText, confirmed)
+            if confirmed and self._indexPrompt then self._indexPrompt.text = newText end
+          end
+        })
+        return
+      elseif self._rename then
+        Kit.VirtualKeyboard.open({
+          text = self._rename.text or "",
+          title = "Name save slot",
+          onDone = function(newText, confirmed)
+            if confirmed and self._rename then self._rename.text = newText end
+          end
+        })
+        return
+      elseif self._profileRenamePrompt then
+        Kit.VirtualKeyboard.open({
+          text = self._profileRenamePrompt.text or "",
+          title = "Rename profile",
+          onDone = function(newText, confirmed)
+            if confirmed and self._profileRenamePrompt then self._profileRenamePrompt.text = newText end
+          end
+        })
+        return
+      elseif self._profileSavePrompt then
+        Kit.VirtualKeyboard.open({
+          text = self._profileSavePrompt.text or "",
+          title = "Save mod profile",
+          onDone = function(newText, confirmed)
+            if confirmed and self._profileSavePrompt then self._profileSavePrompt.text = newText end
+          end
+        })
+        return
+      elseif self._settingsText then
+        Kit.VirtualKeyboard.open({
+          text = self._settingsText.text or "",
+          title = (self._settingsText.row and self._settingsText.row.label) or "Edit Text",
+          onDone = function(newText, confirmed)
+            if confirmed and self._settingsText then self._settingsText.text = newText end
+          end
+        })
+        return
+      elseif self.tab == "find" then
+        Kit.VirtualKeyboard.open({
+          text = self.findQuery or "",
+          title = "Search Mods",
+          onDone = function(newText, confirmed)
+            if confirmed then
+              self.findQuery = newText
+              if self._refreshFind then self:_refreshFind() end
+            end
+          end
+        })
+        return
+      else
+        Kit.VirtualKeyboard.open({
+          text = "",
+          title = "Virtual Keyboard",
+          onDone = function() end
+        })
+        return
+      end
+    end
+  end
+
+  if self._saveExport or self._savePicker or self._modGames or self._cartPopup then
+    if action == "b" then
+      self._saveExport, self._savePicker, self._modGames, self._cartPopup = nil, nil, nil, nil
+      return
+    end
+    if button == "start" or button == "leftshoulder" or button == "rightshoulder" then return end
+  end
+
+  -- Shoulder buttons: cycle tabs
+  if (button == "leftshoulder" or button == "rightshoulder")
+      and require("src.import.LauncherView").modalKey(self) ~= nil then
+    return
+  end
+  if button == "leftshoulder" then
     self:_cycleTab(-1)
+    return
   elseif button == "rightshoulder" then
     self:_cycleTab(1)
-  elseif button == "dpup" or button == "dpdown"
-      or button == "dpleft" or button == "dpright" then
-    self._padDir[button] = true
-  elseif button == "start" or button == "back" then
-    -- Start / Select: Play if ready, else Choose ROM on the active game tab.
+    return
+  end
+
+  -- Triggers (L2 / R2): fast scroll content / lists up and down
+  if button == "triggerleft" or button == "lefttrigger" or button == "l2"
+      or action == "triggerleft" or action == "l2" then
+    require("src.import.LauncherView").wheelmoved(self, 0, 4)
+    return
+  elseif button == "triggerright" or button == "righttrigger" or button == "r2"
+      or action == "triggerright" or action == "r2" then
+    require("src.import.LauncherView").wheelmoved(self, 0, -4)
+    return
+  end
+
+  -- Start button: Play / Choose ROM
+  if button == "start" then
     if self.workState == "working" then return end
     local version = self.tab
-    if version == "red" or version == "blue" then
-      if self.ready[version] then self:play(version) else self:choose(version) end
+    if GameVersion.VERSIONS[version] then
+      if self.ready[version] then self:play(version) else self:_romAction(version) end
+    end
+    return
+  end
+
+  if not self._padCursorActive and not self.isNX then
+    if okKit then Kit._ringShown = true end
+    if action == "a" then
+      if okKit and Kit.focusId then
+        Kit.activateFocused()
+      elseif self._flex then
+        require("src.import.LauncherView").clickAt(self,
+          self._padCursor.x, self._padCursor.y)
+      end
+      return
+    elseif action == "b" then
+      if self._bugModal then self:_closeBugPanel(); return end
+      if self.tab == "online" then
+        local okOnline, OnlinePanel = pcall(require, "src.import.OnlinePanel")
+        if okOnline and OnlinePanel.back(self) then return end
+      end
+      if self._boxPrompt then require("src.import.BoxPrompt").close(self, false); return
+      elseif self._indexPrompt then self._indexPrompt = nil; self:_disarmTextInput(); return
+      elseif self._rename then self._rename = nil; self:_disarmTextInput(); return
+      elseif self._profileRenamePrompt then self._profileRenamePrompt = nil; self:_disarmTextInput(); return
+      elseif self._profileSavePrompt then self._profileSavePrompt = nil; self:_disarmTextInput(); return
+      elseif self._settingsText then self._settingsText = nil; self:_disarmTextInput(); return
+      -- B leaves Settings the way Escape does (keypressed): a pad-only
+      -- console had no way out but the pointer.
+      elseif self._settings then self:_closeSettings(); return
+      end
+    elseif button == "dpup" or action == "dpup" then
+      if okKit then Kit.navigate("up") end
+      return
+    elseif button == "dpdown" or action == "dpdown" then
+      if okKit then Kit.navigate("down") end
+      return
+    elseif button == "dpleft" or action == "dpleft" then
+      if okKit then Kit.navigate("left") end
+      return
+    elseif button == "dpright" or action == "dpright" then
+      if okKit then Kit.navigate("right") end
+      return
+    end
+  else
+    self:_activatePadCursor()
+    if action == "a" then
+      if self._flex then
+        require("src.import.LauncherView").clickAt(self,
+          self._padCursor.x, self._padCursor.y)
+      end
+    elseif action == "b" then
+      if self._bugModal then self:_closeBugPanel(); return end
+      if self.tab == "online" then
+        local okOnline, OnlinePanel = pcall(require, "src.import.OnlinePanel")
+        if okOnline and OnlinePanel.back(self) then return end
+      end
+      if self._boxPrompt then require("src.import.BoxPrompt").close(self, false); return
+      elseif self._indexPrompt then self._indexPrompt = nil; self:_disarmTextInput(); return
+      elseif self._rename then self._rename = nil; self:_disarmTextInput(); return
+      elseif self._profileRenamePrompt then self._profileRenamePrompt = nil; self:_disarmTextInput(); return
+      elseif self._profileSavePrompt then self._profileSavePrompt = nil; self:_disarmTextInput(); return
+      elseif self._settingsText then self._settingsText = nil; self:_disarmTextInput(); return
+      -- B leaves Settings the way Escape does (keypressed): a pad-only
+      -- console had no way out but the pointer.
+      elseif self._settings then self:_closeSettings(); return
+      end
+    elseif button == "dpup" or button == "dpdown"
+        or button == "dpleft" or button == "dpright" then
+      self._padDir[button] = true
     end
   end
 end
@@ -1154,47 +4976,151 @@ end
 function RomImporter:gamepadaxis(_, axis, value)
   if axis == "leftx" or axis == "lefty" or axis == "righty" then
     self._padAxis[axis] = value
-    if math.abs(value) > PAD_DEAD then self:_activatePadCursor() end
+    if self._padCursorActive and math.abs(value) > PAD_DEAD then
+      self:_activatePadCursor()
+    elseif axis == "lefty" and math.abs(value) <= PAD_DEAD then
+      self._padStickCentered = true
+    end
+  elseif axis == "triggerleft" or axis == "lefttrigger" then
+    if value > 0.4 then
+      if not self._l2TriggerActive then
+        require("src.import.LauncherView").wheelmoved(self, 0, 4)
+        self._l2TriggerActive = true
+      end
+    elseif value < 0.2 then
+      self._l2TriggerActive = false
+    end
+  elseif axis == "triggerright" or axis == "righttrigger" then
+    if value > 0.4 then
+      if not self._r2TriggerActive then
+        require("src.import.LauncherView").wheelmoved(self, 0, -4)
+        self._r2TriggerActive = true
+      end
+    elseif value < 0.2 then
+      self._r2TriggerActive = false
+    end
   end
 end
 
+-- Same gate as src/core/Input.lua: a pad SDL can map already reached
+-- gamepadpressed this frame, so re-entering it from the raw event would
+-- fire the virtual cursor's click twice off one A press (#620).
+function RomImporter:joystickpressed(joystick, button)
+  if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  local padButton = GamepadMap.mapRawToGamepadButton(button)
+  if padButton then self:gamepadpressed(joystick, padButton) end
+end
+
+function RomImporter:joystickreleased(joystick, button)
+  if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  local padButton = GamepadMap.mapRawToGamepadButton(button)
+  if padButton then self:gamepadreleased(joystick, padButton) end
+end
+
+function RomImporter:joystickaxis(joystick, axis, value)
+  if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  if axis == 1 then
+    self:gamepadaxis(joystick, "leftx", value)
+  elseif axis == 2 then
+    self:gamepadaxis(joystick, "lefty", value)
+  elseif axis == 3 or axis == 5 then
+    if value > 0.4 then
+      if not self._l2RawActive then
+        require("src.import.LauncherView").wheelmoved(self, 0, 4)
+        self._l2RawActive = true
+      end
+    elseif value < 0.2 then
+      self._l2RawActive = false
+    end
+  elseif axis == 4 or axis == 6 then
+    if value > 0.4 then
+      if not self._r2RawActive then
+        require("src.import.LauncherView").wheelmoved(self, 0, -4)
+        self._r2RawActive = true
+      end
+    elseif value < 0.2 then
+      self._r2RawActive = false
+    end
+  end
+end
+
+function RomImporter:joystickhat(joystick, hat, direction)
+  if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  for _, dir in ipairs(self._rawHatDirs[hat] or {}) do
+    self._padDir[dir] = nil
+  end
+  local dirs = ({
+    u = { "dpup" }, d = { "dpdown" }, l = { "dpleft" }, r = { "dpright" },
+    lu = { "dpleft", "dpup" }, ru = { "dpright", "dpup" },
+    ld = { "dpleft", "dpdown" }, rd = { "dpright", "dpdown" },
+  })[direction] or {}
+  for _, dir in ipairs(dirs) do self._padDir[dir] = true end
+  self._rawHatDirs[hat] = dirs
+end
+
 -- Player pressed Play on a game whose ROM is imported: hand off to boot.
-function RomImporter:play(version)
+function RomImporter:play(version, fade)
   if self.workState == "working" then return end
+  if self._hostPick then return end
+  if self._inboxJob then
+    self.tab = self._inboxJob.tab or self.tab
+    return
+  end
   if not self.ready[version] then return end
+  if fade then
+    if not self._launchFade then
+      self._launchFade = { version = version, elapsed = 0, duration = 0.24 }
+    end
+    return
+  end
   self._handedOff = true
+  -- #835: remember the game being launched so the next launcher start opens on
+  -- its column (_applyLastVersionTab).  It rides options.lua rather than a file
+  -- of its own, so portable installs and POKEPORT_IDENTITY sandboxes keep it
+  -- with the rest of the launcher's persisted state.  A failed write only
+  -- costs the memory of the choice, so it must never block the boot.
+  local cartId = self.activeCart and self.activeCart[version] or nil
+  pcall(function()
+    local SaveData = require("src.core.SaveData")
+    local opts = SaveData.loadOptions()
+    opts.lastVersion = version
+    local map = self:_activeCartMap()
+    opts.activeCart = next(map) ~= nil and map or nil
+    SaveData.saveOptions(opts)
+  end)
   resetPointerCursor(self)
-  if self.onComplete then self.onComplete(version) end
+  -- The game draws with raw love.graphics from here on; drop the view's
+  -- element tree and canvases before the handoff.
+  if self._flex then require("src.import.LauncherView").detach(self) end
+  if self.onComplete then self.onComplete(version, cartId) end
+end
+
+function RomImporter:_activeCartMap()
+  local out = {}
+  for version, id in pairs(self.activeCart or {}) do
+    if GameVersion.VERSIONS[version] and type(id) == "string" then
+      out[version] = id
+    end
+  end
+  return out
 end
 
 -- "re-import" a column: drop it back to the choose/drop state so a fresh ROM
 -- can be selected (the extract replaces that version's cache).
 function RomImporter:reimport(version)
-  if self.workState == "working" then return end
+  if self.workState == "working" or self._inboxJob then return end
   if not self.ready[version] then return end
   self.ready[version] = false
   self.returning[version] = false
   self.chooseVersion = version
-end
-
-local function clamp(v, lo, hi)
-  return math.max(lo, math.min(hi, v))
-end
-
--- set the current draw colour from a PAL triple (0-255), with optional alpha 0-1
-local function col(c, a)
-  love.graphics.setColor(c[1] / 255, c[2] / 255, c[3] / 255, a or 1)
-end
-
--- Faux-bold: the launcher's UI font ships no bold face, so 800-weight text
--- (headings, buttons) is thickened with a second sub-pixel pass.
-local function printfB(text, x, y, w, align)
-  love.graphics.printf(text, x, y, w, align)
-  love.graphics.printf(text, x + 0.6, y, w, align)
-end
-local function printB(text, x, y)
-  love.graphics.print(text, x, y)
-  love.graphics.print(text, x + 0.6, y)
+  if self.baseRomDiscovery then
+    self.baseRoms[version] = nil
+    self:_queueBaseRomScan()
+  end
 end
 
 -- UTF-8 helpers for the slot-rename field (#205).  The `utf8` library only
@@ -1222,743 +5148,1443 @@ local function utf8Cap(t, maxChars)
   return t
 end
 
--- One reusable unit quad, recoloured per call, for every vertical gradient
--- fill (LOVE has no gradient primitive and a per-frame newMesh would churn
--- the GPU).  Callers set the blend mode; this only touches colour + geometry.
-local gradMesh
-local function setGrad(cTop, cBot, aTop, aBot)
-  if not gradMesh then gradMesh = love.graphics.newMesh(4, "fan", "dynamic") end
-  gradMesh:setVertices({
-    { 0, 0, 0, 0, cTop[1] / 255, cTop[2] / 255, cTop[3] / 255, aTop },
-    { 1, 0, 1, 0, cTop[1] / 255, cTop[2] / 255, cTop[3] / 255, aTop },
-    { 1, 1, 1, 1, cBot[1] / 255, cBot[2] / 255, cBot[3] / 255, aBot },
-    { 0, 1, 0, 1, cBot[1] / 255, cBot[2] / 255, cBot[3] / 255, aBot },
-  })
-end
-local function fillGrad(x, y, w, h, cTop, cBot, aTop, aBot)
-  setGrad(cTop, cBot, aTop, aBot)
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(gradMesh, x, y, 0, w, h)
-end
--- vertical gradient clipped to a rounded rectangle (via the stencil buffer)
-local function fillGradRounded(x, y, w, h, r, cTop, cBot, aTop, aBot)
-  love.graphics.stencil(function()
-    love.graphics.rectangle("fill", x, y, w, h, r, r)
-  end, "replace", 1)
-  love.graphics.setStencilTest("greater", 0)
-  fillGrad(x, y, w, h, cTop, cBot, aTop, aBot)
-  love.graphics.setStencilTest()
-end
+-- The whole launcher surface is the FlexLove view (src/import/LauncherView):
+-- it rebuilds the element tree from this importer's state every frame and
+-- renders it.  Required lazily so a headless test require of this module
+-- never loads the UI toolkit.
+-- Dev harness: POKEPORT_LAUNCHER_PROF=<frames> times the view's build+draw
+-- for that many frames, prints mean/median/p95/worst to stdout and quits.
+-- Pair with POKEPORT_LAUNCHER_TAB / POKEPORT_WIN to profile a specific panel.
+local profN, profSamples = tonumber(os.getenv("POKEPORT_LAUNCHER_PROF") or ""), {}
 
--- Soft additive neon halo around a rounded rect.  LOVE has no blur, so stack
--- progressively larger, fainter translucent rounded rects.
-local function neonGlow(x, y, w, h, r, c, strength)
-  strength = math.max(0, strength)
-  if strength == 0 then return end
-  love.graphics.setBlendMode("add")
-  local layers = 7
-  for i = 1, layers do
-    local g = i * 2.4
-    love.graphics.setColor(c[1] / 255, c[2] / 255, c[3] / 255,
-      strength * 0.05 * (1 - (i - 1) / layers))
-    love.graphics.rectangle("fill", x - g, y - g, w + 2 * g, h + 2 * g, r + g, r + g)
-  end
-  love.graphics.setBlendMode("alpha")
-end
-
--- A white shine band that sweeps across an active button, clipped to its
--- rounded shape.  phase is 0..1 (left of the button -> right of it).
-local shineMesh
-local function buttonShine(x, y, w, h, r, phase)
-  if not shineMesh then
-    -- triangle strip: three columns (transparent, white, transparent)
-    shineMesh = love.graphics.newMesh({
-      { 0,   0, 0,   0, 1, 1, 1, 0 },
-      { 0,   1, 0,   1, 1, 1, 1, 0 },
-      { 0.5, 0, 0.5, 0, 1, 1, 1, 0.5 },
-      { 0.5, 1, 0.5, 1, 1, 1, 1, 0.5 },
-      { 1,   0, 1,   0, 1, 1, 1, 0 },
-      { 1,   1, 1,   1, 1, 1, 1, 0 },
-    }, "strip", "static")
-  end
-  local bandW = w * 0.6
-  local bx = x - bandW + phase * (w + bandW)
-  love.graphics.stencil(function()
-    love.graphics.rectangle("fill", x, y, w, h, r, r)
-  end, "replace", 1)
-  love.graphics.setStencilTest("greater", 0)
-  love.graphics.setBlendMode("add")
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(shineMesh, bx, y, 0, bandW, h)
-  love.graphics.setBlendMode("alpha")
-  love.graphics.setStencilTest()
-end
-
--- Draw letterspaced text (the UI font has no tracking control): advance glyph
--- by glyph.  Returns the total drawn width so a caller can align to it.
-local function printSpaced(font, text, x, y, spacing)
-  local cx = x
-  for i = 1, #text do
-    local ch = text:sub(i, i)
-    love.graphics.print(ch, cx, y)
-    cx = cx + font:getWidth(ch) + spacing
-  end
-  return math.max(0, cx - x - spacing)
-end
-
--- Clip text to a pixel width, appending an ellipsis when it overflows (the UI
--- font has no built-in truncation).  Used for save-slot names / meta lines.
-local function ellipsize(font, text, maxW)
-  text = tostring(text or "")
-  if maxW <= 0 or font:getWidth(text) <= maxW then return text end
-  local ell = "..."
-  local ew = font:getWidth(ell)
-  while #text > 0 and font:getWidth(text) + ew > maxW do
-    text = text:sub(1, #text - 1)
-  end
-  return text .. ell
-end
-
--- Stroke a rounded rectangle as a dashed outline (LOVE has no dashed line):
--- sample the path into a polyline -- corners as short arcs -- then walk it,
--- toggling on/off every dash/gap.  Used for the "+ New save slot" button and
--- the empty-slots box.  Caller sets colour + line width.
-local function dashedRoundRect(x, y, w, h, r, dash, gap)
-  r = math.min(r, w / 2, h / 2)
-  local seg = 4
-  local pts = {}
-  local function arc(cx, cy, a0, a1)
-    for i = 0, seg do
-      local a = a0 + (a1 - a0) * (i / seg)
-      pts[#pts + 1] = cx + math.cos(a) * r
-      pts[#pts + 1] = cy + math.sin(a) * r
+function RomImporter:toastSaveNotices()
+  local BoxUI = require("src.import.BoxUI")
+  for scope, notice in pairs(self.saveNotice or {}) do
+    if not notice.persistent and notice.text and notice.text ~= "" then
+      BoxUI.toast(self, notice.text, notice.kind or (notice.ok and "ok" or "error"), nil, self.tab)
+      self.saveNotice[scope] = notice.dir and { ok = notice.ok, text = "", dir = notice.dir } or nil
     end
   end
-  arc(x + w - r, y + r, -math.pi / 2, 0)
-  arc(x + w - r, y + h - r, 0, math.pi / 2)
-  arc(x + r, y + h - r, math.pi / 2, math.pi)
-  arc(x + r, y + r, math.pi, math.pi * 1.5)
-  pts[#pts + 1] = pts[1]; pts[#pts + 1] = pts[2]   -- close the loop
-  local remaining, drawing = dash, true
-  for i = 1, #pts - 2, 2 do
-    local x1, y1 = pts[i], pts[i + 1]
-    local dx, dy = pts[i + 2] - x1, pts[i + 3] - y1
-    local segLen = math.sqrt(dx * dx + dy * dy)
-    local pos = 0
-    while pos < segLen do
-      local step = math.min(remaining, segLen - pos)
-      if drawing then
-        local t0, t1 = pos / segLen, (pos + step) / segLen
-        love.graphics.line(x1 + dx * t0, y1 + dy * t0, x1 + dx * t1, y1 + dy * t1)
-      end
-      pos = pos + step
-      remaining = remaining - step
-      if remaining <= 0.0001 then
-        drawing = not drawing
-        remaining = drawing and dash or gap
-      end
-    end
-  end
-end
-
--- The redesign's standard content card: a faint top-lit blue tint fading into
--- a dark interior, with a thin cool-gray border.  Shared by the ROM / SAVE
--- FILES / SAVE SLOT cards and the mod cards so every panel matches.
-local function roundedCard(x, y, w, h, r)
-  fillGradRounded(x, y, w, h, r, PAL.blue, PAL.cardBlue, 0.08, 0.5)
-  love.graphics.setLineWidth(1)
-  col(PAL.cardBorder, 0.28)
-  love.graphics.rectangle("line", x, y, w, h, r, r)
 end
 
 function RomImporter:draw()
-  local width, height = love.graphics.getDimensions()
-  local s = clamp(height / 768, 0.7, 1.6)
-  local pulse = self.pulse
-  self._s = s
-
-  -- Hover state.  Desktop mouse, or the gamepad virtual cursor on handhelds
-  -- (Android stays touch-only -- no hover).  Panel methods read the pointer +
-  -- set self._anyHover through self:_hover; the cursor is set at the end.
-  -- Reset the per-frame hit rects so a tab with no controls (mods) cannot
-  -- inherit last frame's game-panel buttons.
-  if self._padCursorActive then
-    self._mx, self._my = self._padCursor.x, self._padCursor.y
-  else
-    self._mx, self._my = love.mouse.getPosition()
+  self:toastSaveNotices()
+  local View = require("src.import.LauncherView")
+  if not profN then return View.draw(self) end
+  local t0 = love.timer.getTime()
+  View.draw(self)
+  profSamples[#profSamples + 1] = (love.timer.getTime() - t0) * 1000
+  if #profSamples >= profN + 30 then
+    local s = {}
+    for i = 31, #profSamples do s[#s + 1] = profSamples[i] end -- drop warmup
+    table.sort(s)
+    local sum = 0
+    for _, v in ipairs(s) do sum = sum + v end
+    io.stderr:write(("PROF frames=%d mean=%.2fms median=%.2fms p95=%.2fms worst=%.2fms\n")
+      :format(#s, sum / #s, s[math.ceil(#s * 0.5)], s[math.ceil(#s * 0.95)], s[#s]))
+    io.stderr:flush()
+    love.event.quit()
   end
-  self._hoverEnabled = self._padCursorActive or not self.android
-  self._anyHover = false
-  self.romButtonRect = nil
-  self.playButtonRect = nil
-  self.tabRects = {}
-  -- Rebuilt only by the active version's SAVE SLOT panel, so the mods tab (or a
-  -- version with no panel drawn this frame) cannot inherit last frame's rows.
-  self.slotRects = nil
-  self.slotEditRects = nil
-  self.newSlotRect = nil
-  -- Rebuilt only by the mods panel; nil elsewhere so a game tab cannot inherit
-  -- last frame's mod toggles / import button.
-  self.modRects = nil
-  self.modImportRect = nil
-  -- Rebuilt only by the active game panel's SAVE FILES card; nil elsewhere so
-  -- the mods tab cannot inherit last frame's save Import/Export/open-folder hits.
-  self.saveImportRect = nil
-  self.saveExportRect = nil
-  self.saveFolderRect = nil
+end
 
-  -- Fonts + size-dependent scenery, rebuilt only when the window size changes.
-  local fontKey = ("%dx%d"):format(width, height)
-  if self.fontKey ~= fontKey then
-    self.fontKey = fontKey
-    local function f(px) return love.graphics.newFont(math.max(8, math.floor(px + 0.5))) end
-    self.headFont     = f(19 * s)
-    self.detailFont   = f(14 * s)
-    self.buttonFont   = f(19 * s)
-    self.hintFont     = f(13 * s)
-    self.warningFont  = f(11 * s)
-    -- redesign faces
-    self.gameNameFont = f(26 * s)   -- game / "Mods" heading
-    self.pillFont     = f(13 * s)   -- status pill
-    self.labelFont    = f(12 * s)   -- letterspaced ROM / SAVE FILES / SAVE SLOT
-    self.stateFont    = f(16 * s)   -- ROM state line
-    self.saveBtnFont  = f(14 * s)   -- glassy card buttons
-    self.chipFont     = f(20 * s)   -- R / B / Y tab letters
-    self.tabLabelFont = f(14 * s)   -- active tab label
-    self.readyFont    = f(12 * s)   -- "N of 3 ready"
-    self.playFont     = f(20 * s)   -- Play button
-    self.slotNameFont = f(15 * s)   -- save-slot player name / "NEW GAME"
+-- Nothing in the launcher can undo a delete, so every Delete control asks
+-- twice: the first press arms it, a second press on the SAME target inside
+-- the window commits, and any other queued action disarms it (#433; the view
+-- routes every non-delete action through a disarm).
+local DELETE_CONFIRM_SECONDS = 4
 
-    -- Background: a radial gradient (bright navy at top-centre -> near black).
-    -- A triangle fan from the top-centre gives the radial falloff; the screen
-    -- is cleared to the outer colour first so the corners it does not reach
-    -- match seamlessly.
-    do
-      local cx, cy = width / 2, 0
-      local rx, ry = width * 1.3, height * 1.08
-      local n = 72
-      local verts = { { cx, cy, 0, 0,
-        PAL.bgTop[1] / 255, PAL.bgTop[2] / 255, PAL.bgTop[3] / 255, 1 } }
-      for i = 0, n do
-        local a = (i / n) * math.pi * 2
-        verts[#verts + 1] = { cx + math.cos(a) * rx, cy + math.sin(a) * ry, 0, 0,
-          PAL.bgBot[1] / 255, PAL.bgBot[2] / 255, PAL.bgBot[3] / 255, 1 }
-      end
-      self.bgMesh = love.graphics.newMesh(verts, "fan", "static")
-    end
-
-    -- CRT vignette: a gentle edge darkening, centred slightly above the middle.
-    do
-      local cx, cy = width / 2, height * 0.45
-      local rx, ry = width * 0.78, height * 0.78
-      local n = 72
-      local verts = { { cx, cy, 0, 0, 0, 0, 0, 0 } }
-      for i = 0, n do
-        local a = (i / n) * math.pi * 2
-        verts[#verts + 1] =
-          { cx + math.cos(a) * rx, cy + math.sin(a) * ry, 0, 0, 0, 0, 0, 0.32 }
-      end
-      self.vignetteMesh = love.graphics.newMesh(verts, "fan", "static")
-    end
-
-    -- CRT scanlines: a 1px dark line every 3px, baked into a tiny tile and
-    -- drawn once with a repeat-wrapped quad (one draw call, correct alpha).
-    if not self.scanlineImage then
-      local id = love.image.newImageData(1, 3)
-      id:setPixel(0, 0, 0, 0, 0, 0.08)
-      id:setPixel(0, 1, 0, 0, 0, 0)
-      id:setPixel(0, 2, 0, 0, 0, 0)
-      self.scanlineImage = love.graphics.newImage(id)
-      self.scanlineImage:setWrap("repeat", "repeat")
-      self.scanlineImage:setFilter("nearest", "nearest")
-    end
-    self.scanlineQuad = love.graphics.newQuad(0, 0, width, height, 1, 3)
+function RomImporter:pressDelete(kind, id, version, commit)
+  local a = self._confirmDelete
+  self._confirmDelete = nil
+  if a ~= nil and a.kind == kind and a.id == id and a.version == version
+      and (love.timer.getTime() - a.t) <= DELETE_CONFIRM_SECONDS then
+    commit()
+    return true
   end
+  self._confirmDelete = { kind = kind, id = id, version = version,
+    t = love.timer.getTime() }
+  return false
+end
 
-  -- Invert shader: the Boi's Club Games mark is dark ink; on this dark panel it
-  -- is rendered white (the design's filter:invert(1)).  Built lazily so a
-  -- headless require never needs a GL context.
-  self.invertShader = self.invertShader or love.graphics.newShader([[
-    vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
-      vec4 p = Texel(tex, tc);
-      return vec4((vec3(1.0) - p.rgb) * color.rgb, p.a * color.a);
-    }
-  ]])
-
-  -- Shine shader: the same white sweep the active buttons get, but clipped to
-  -- the logo's own shape (a soft band brightens the pixels it crosses; fully
-  -- transparent pixels stay transparent).
-  self.shineShader = self.shineShader or love.graphics.newShader([[
-    extern number shinePos;
-    extern number shineW;
-    vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
-      vec4 p = Texel(tex, tc);
-      float band = smoothstep(shineW, 0.0, abs(tc.x - shinePos));
-      return vec4(p.rgb + band * 0.55, p.a) * color;
-    }
-  ]])
-
-  -- background
-  col(PAL.bgBot)
-  love.graphics.rectangle("fill", 0, 0, width, height)
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(self.bgMesh)
-
-  -- Centered content container (max ~1440 scaled units on very wide windows)
-  -- with a responsive side gutter; every column below derives from these.
-  local appW = math.min(width, 1440 * s)
-  local appX = (width - appW) / 2
-  local padH = clamp(appW * 0.03, 12 * s, 26 * s)
-  local third = appW / 3
-
-  -- tricolor strip (Red | Blue | Yellow), 6px tall, with a soft downward bloom
-  local stripH = math.max(4, 6 * s)
-  local segs = {
-    { PAL.red,  appX,             third },
-    { PAL.blue, appX + third,     third },
-    { PAL.gold, appX + 2 * third, appW - 2 * third },
-  }
-  love.graphics.setBlendMode("add")
-  for _, seg in ipairs(segs) do
-    fillGrad(seg[2], stripH, seg[3], stripH * 3.6, seg[1], seg[1], 0.30, 0.0)
-  end
-  love.graphics.setBlendMode("alpha")
-  for _, seg in ipairs(segs) do
-    col(seg[1]); love.graphics.rectangle("fill", seg[2], 0, seg[3], stripH)
-  end
-
-  -- Footer (Boi's Club Games logo + trust warning), measured first so the
-  -- content region knows where it must stop.  Drawn near the end.
-  local warningWidth = math.min(appW - 32 * s, 640 * s)
-  local _, warningLines = self.warningFont:getWrap(TRUST_WARNING, warningWidth)
-  local warningH = #warningLines * self.warningFont:getHeight()
-  local warningY = height - warningH - 12 * s
-  local bcgW, bcgH = self.bcg:getDimensions()
-  local bcgScale = math.min(math.min(appW - 48 * s, 190 * s) / bcgW, height * 0.06 / bcgH)
-  local bcgDW, bcgDH = bcgW * bcgScale, bcgH * bcgScale
-  local bcgX, bcgY = appX + (appW - bcgDW) / 2, warningY - bcgDH - 6 * s
-  self.bcgButton = { x = bcgX, y = bcgY, width = bcgDW, height = bcgDH }
-  local footerTop = bcgY - 10 * s
-
-  -- Logo: centred over the strip, width clamped, gentle bob + glow pulse.  The
-  -- resting metrics fix the tab bar's top so the layout never shifts as it bobs.
-  local logoW, logoH = self.logo:getDimensions()
-  local logoTargetW = math.max(math.min(180 * s, appW - 32 * s),
-    math.min(330 * s, appW - 32 * s))
-  local logoScale = math.min(logoTargetW / logoW, height * 0.15 / logoH)
-  local logoDW, logoDH = logoW * logoScale, logoH * logoScale
-  local logoY = stripH + 14 * s
-
-  -- Tab bar: R/B/Y/divider/MODS chips (label + underline on the active one),
-  -- with "N of 3 ready" right-aligned.
-  local chip = 44 * s
-  local tabBarY = logoY + logoDH + 6 * s
-  local tabBarH = chip + 22 * s
-
-  -- Self-updater banner state: computed up front so its band can be reserved
-  -- above the footer, then drawn after the content below.  Only the four
-  -- actionable states surface anything.
-  local upStatus, upLatest, upProgress
-  if self.Check then
-    local ok, st = pcall(self.Check.state)
-    st = (ok and type(st) == "table") and st or nil
-    local status = st and st.status
-    if status == "available" or status == "downloading"
-        or status == "ready" or status == "needs_full" then
-      upStatus, upLatest, upProgress = status, st.latest, st.progress
-    end
-  end
-  local bannerActive = upStatus ~= nil
-  local bannerH = 46 * s
-
-  -- Content region: from below the tab bar down to the footer, minus the
-  -- updater band when one is showing.
-  local contentTop = tabBarY + tabBarH + 16 * s
-  local contentBottom = footerTop - (bannerActive and (bannerH + 20 * s) or 6 * s)
-  local cX = appX + padH
-  local cW = appW - 2 * padH
-  local cH = math.max(0, contentBottom - contentTop)
-
-  -- tab bar (rebuilds self.tabRects)
-  self:_drawTabBar(cX, tabBarY, cW, tabBarH, chip)
-
-  -- content: game panel for a version tab, mods panel for the mods tab
-  if self.tab == "mods" then
-    self:_drawModsPanel(cX, contentTop, cW, cH)
-  else
-    self:_drawGamePanel(self.tab, cX, contentTop, cW, cH)
-  end
-
-  -- logo, over the split, with a gentle bob + gold glow + sweeping shine
-  local bob = math.sin(pulse * (2 * math.pi / 4)) * 6 * s
-  local lx, ly = (width - logoDW) / 2, logoY + bob
-  love.graphics.setBlendMode("add")
-  love.graphics.setColor(1, 0.85, 0.2, 0.16 + 0.12 * (0.5 + 0.5 * math.sin(pulse * 1.6)))
-  love.graphics.draw(self.logo, (width - logoDW * 1.05) / 2, ly - logoDH * 0.025, 0,
-    logoScale * 1.05, logoScale * 1.05)
-  love.graphics.setBlendMode("alpha")
-  local shineW = 0.16
-  self.shineShader:send("shinePos", -shineW + ((pulse % 2.8) / 2.8) * (1 + 2 * shineW))
-  self.shineShader:send("shineW", shineW)
-  love.graphics.setShader(self.shineShader)
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(self.logo, lx, ly, 0, logoScale, logoScale)
-  love.graphics.setShader()
-
-  -- Self-updater banner: a compact pill centred in the reserved band just above
-  -- the footer, on every tab.  Same green "Play" treatment on its CTA.
-  self.updateButton = nil
-  if bannerActive then
-    local bannerW = math.min(appW - 32 * s, 560 * s)
-    local bx = appX + (appW - bannerW) / 2
-    local by = contentBottom + math.max(0, (footerTop - contentBottom - bannerH) / 2)
-    local r = 12 * s
-    local accent = PAL.gold
-
-    neonGlow(bx, by, bannerW, bannerH, r, accent, 0.28)
-    fillGradRounded(bx, by, bannerW, bannerH, r, accent, PAL.bgBot, 0.14, 0.6)
-    love.graphics.setLineWidth(math.max(1, 1.2 * s))
-    col(accent, 0.5)
-    love.graphics.rectangle("line", bx, by, bannerW, bannerH, r, r)
-
-    local padX = 16 * s
-    local innerX = bx + padX
-    local innerW = bannerW - 2 * padX
-
-    local function actionButton(label)
-      love.graphics.setFont(self.detailFont)
-      local bw = math.min(innerW * 0.62, self.detailFont:getWidth(label) + 34 * s)
-      local bh = bannerH - 12 * s
-      local abx = bx + bannerW - padX - bw
-      local aby = by + (bannerH - bh) / 2
-      local br = 9 * s
-      local rect = { x = abx, y = aby, width = bw, height = bh }
-      local hot = self:_hover(rect)
-      local gp = 0.5 + 0.5 * math.sin(pulse * 2 * math.pi / 2.4)
-      neonGlow(abx, aby, bw, bh, br, PAL.playTop, (0.6 + 0.25 * gp) * (hot and 1.7 or 1))
-      fillGradRounded(abx, aby, bw, bh, br, PAL.playTop, PAL.playBot, 1, 1)
-      if hot then
-        love.graphics.setBlendMode("add")
-        love.graphics.setColor(1, 1, 1, 0.12)
-        love.graphics.rectangle("fill", abx, aby, bw, bh, br, br)
-        love.graphics.setBlendMode("alpha")
-      end
-      buttonShine(abx, aby, bw, bh, br, (pulse % 2.8) / 2.8)
-      love.graphics.setFont(self.detailFont)
-      col(PAL.playInk)
-      printfB(label, abx, aby + (bh - self.detailFont:getHeight()) / 2, bw, "center")
-      return rect
-    end
-
-    local function message(text, reserveW)
-      love.graphics.setFont(self.detailFont)
-      col(PAL.heading)
-      love.graphics.printf(text, innerX,
-        by + (bannerH - self.detailFont:getHeight()) / 2,
-        math.max(1, innerW - reserveW - 12 * s), "left")
-    end
-
-    if upStatus == "available" then
-      local rect = actionButton("Update")
-      self.updateButton = { x = rect.x, y = rect.y, width = rect.width,
-        height = rect.height, action = "download" }
-      message(upLatest and ("Update v" .. upLatest .. " available")
-        or Strings("An update is available"), rect.width)
-    elseif upStatus == "needs_full" then
-      local rect = actionButton("Open releases")
-      self.updateButton = { x = rect.x, y = rect.y, width = rect.width,
-        height = rect.height, action = "openurl" }
-      message("A new version needs a fresh download", rect.width)
-    elseif upStatus == "ready" then
-      local rect = actionButton("Restart to update")
-      self.updateButton = { x = rect.x, y = rect.y, width = rect.width,
-        height = rect.height, action = "restart" }
-      message("Update downloaded", rect.width)
-    elseif upStatus == "downloading" then
-      love.graphics.setFont(self.hintFont)
-      col(PAL.detail)
-      love.graphics.print("Downloading update", innerX, by + 7 * s)
-      local h2 = math.max(8, 10 * s)
-      local track = by + bannerH - h2 - 8 * s
-      col(PAL.bgBot, 0.85)
-      love.graphics.rectangle("fill", innerX, track, innerW, h2, h2 / 2, h2 / 2)
-      local pw = innerW * clamp(upProgress or 0, 0, 1)
-      if pw > h2 then
-        neonGlow(innerX, track, pw, h2, h2 / 2, accent, 0.6)
-        col(accent)
-        love.graphics.rectangle("fill", innerX, track, pw, h2, h2 / 2, h2 / 2)
-      end
-    end
-  end
-
-  -- footer: a hairline top border, the BCG mark (inverted to white, glowing
-  -- brighter on hover) + the trust warning with its live bois.icu link.
-  love.graphics.setLineWidth(1)
-  col(PAL.cardBorder, 0.18)
-  love.graphics.line(appX + padH, footerTop, appX + appW - padH, footerTop)
-
-  local bcgHot = self:_hover(self.bcgButton)
-  love.graphics.setShader(self.invertShader)
-  love.graphics.setBlendMode("add")
-  love.graphics.setColor(1, 1, 1, bcgHot and 0.5 or 0.22)
-  love.graphics.draw(self.bcg, bcgX - bcgDW * 0.02, bcgY - bcgDH * 0.02, 0,
-    bcgScale * 1.04, bcgScale * 1.04)
-  love.graphics.setBlendMode("alpha")
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(self.bcg, bcgX, bcgY, 0, bcgScale, bcgScale)
-  love.graphics.setShader()
-
-  love.graphics.setFont(self.warningFont)
-  col(PAL.warning)
-  local wrapX = appX + (appW - warningWidth) / 2
-  love.graphics.printf(TRUST_WARNING, wrapX, warningY, warningWidth, "center")
-  self.linkUrlRect = nil
-  do
-    local lh = self.warningFont:getHeight()
-    local _, lines = self.warningFont:getWrap(TRUST_WARNING, warningWidth)
-    for i, line in ipairs(lines) do
-      local sidx = line:find(COMMUNITY_URL, 1, true)
-      if sidx then
-        local before = line:sub(1, sidx - 1)
-        local lineW = self.warningFont:getWidth(line)
-        local ux = wrapX + (warningWidth - lineW) / 2 + self.warningFont:getWidth(before)
-        local uy = warningY + (i - 1) * lh
-        local uw = self.warningFont:getWidth(COMMUNITY_URL)
-        self.linkUrlRect = { x = ux, y = uy, width = uw, height = lh }
-        local linkHot = self:_hover(self.linkUrlRect)
-        col(linkHot and PAL.linkHover or PAL.link)
-        love.graphics.print(COMMUNITY_URL, ux, uy)
-        love.graphics.setLineWidth(1)
-        love.graphics.line(ux, uy + lh - 1, ux + uw, uy + lh - 1)
+-- Drain one frame's queued launcher actions; LauncherView.update hands the
+-- batch straight over.  A touch tap fires on EVERY element whose bounds hold
+-- the finger, not only the topmost one: FlexLove gates its mouse path on
+-- Context.findInteractiveAtPosition (libs/flexlove/modules/behaviors/
+-- Clickable.lua) but polls touches per element with a bare bounds test
+-- (EventHandler:processTouchEvents), so a phone tap on a save row's Delete
+-- chip also lands on the row behind it.  Control keys inside a row are the
+-- row's key plus "-<what>", so a row's own action is dropped whenever a
+-- control inside that row queued in the same batch, and #433's disarm runs
+-- here instead of at queue time.  Without both halves an Android tap on
+-- Delete selected the slot and wiped the arm it had just set, so a secondary
+-- slot became the loaded one and could never be deleted (#780).
+function RomImporter:runActions(queue)
+  if self._hostPick then return end
+  for i = 1, #queue do
+    local entry = queue[i]
+    local key = type(entry.key) == "string" and entry.key or ""
+    local superseded = false
+    for j = 1, #queue do
+      local other = queue[j]
+      if j ~= i and type(other.key) == "string"
+          and other.key:sub(1, #key + 1) == key .. "-" then
+        superseded = true
         break
       end
     end
-  end
-
-  -- CRT scanlines + vignette, over everything
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(self.scanlineImage, self.scanlineQuad, 0, 0)
-  love.graphics.draw(self.vignetteMesh)
-  love.graphics.setColor(1, 1, 1, 1)
-
-  -- drag-to-scroll the save-slot list (polls the pointer; no move/release
-  -- events reach the launcher, so click-vs-drag is resolved here)
-  self:_updateSlotDrag()
-
-  -- save-slot rename modal (#205), drawn over everything
-  if self._rename then
-    col(PAL.bgBot, 0.72)
-    love.graphics.rectangle("fill", 0, 0, width, height)
-    local dw = math.min(appW - 32 * s, 420 * s)
-    local dh = 128 * s
-    local dx = appX + (appW - dw) / 2
-    local dy = (height - dh) / 2
-    local rr = 12 * s
-    neonGlow(dx, dy, dw, dh, rr, PAL.green, 0.4)
-    fillGradRounded(dx, dy, dw, dh, rr, PAL.slotBg, PAL.slotBg, 0.85, 0.85)
-    love.graphics.setLineWidth(math.max(1, 1.2 * s))
-    col(PAL.green, 0.5)
-    love.graphics.rectangle("line", dx, dy, dw, dh, rr, rr)
-
-    love.graphics.setFont(self.slotNameFont)
-    col(PAL.white)
-    love.graphics.print(Strings("Name save slot"), dx + 16 * s, dy + 14 * s)
-
-    -- the field: bordered strip, current text, blinking caret on the pulse
-    local fx, fy = dx + 16 * s, dy + 44 * s
-    local fw, fh = dw - 32 * s, 30 * s
-    col(PAL.bgBot, 0.9)
-    love.graphics.rectangle("fill", fx, fy, fw, fh, 8 * s, 8 * s)
-    love.graphics.setLineWidth(math.max(1, s))
-    col(PAL.cardBorder, 0.45)
-    love.graphics.rectangle("line", fx, fy, fw, fh, 8 * s, 8 * s)
-    love.graphics.setFont(self.detailFont)
-    col(PAL.heading)
-    local shown = ellipsize(self.detailFont, self._rename.text, fw - 20 * s)
-    love.graphics.print(shown, fx + 10 * s, fy + (fh - self.detailFont:getHeight()) / 2)
-    if (self.pulse * 2 % 1) < 0.5 then
-      local cx = fx + 10 * s + self.detailFont:getWidth(shown) + 2 * s
-      col(PAL.green)
-      love.graphics.rectangle("fill", cx, fy + 6 * s, math.max(1, 1.5 * s),
-        fh - 12 * s)
+    if not superseded then
+      if not entry.keepArm then self._confirmDelete = nil end
+      local ok, err = pcall(entry.fn)
+      if not ok then print("launcher action error: " .. tostring(err)) end
     end
-
-    love.graphics.setFont(self.hintFont)
-    col(PAL.detail)
-    printfB(Strings("Enter to save - Esc to cancel - empty clears"),
-      dx + 16 * s, dy + dh - 30 * s, dw - 32 * s, "left")
-  end
-
-  -- pointer cursor over any interactive element (desktop only)
-  if self._hoverEnabled and not self._padCursorActive
-      and love.mouse.isCursorSupported and love.mouse.isCursorSupported() then
-    if self._anyHover then
-      self.handCursor = self.handCursor or love.mouse.getSystemCursor("hand")
-      love.mouse.setCursor(self.handCursor)
-    else
-      resetPointerCursor(self)
-    end
-  end
-
-  -- Gamepad virtual cursor (drawn last so it sits above the CRT overlay).
-  if self._padCursorActive then
-    local x, y = self._padCursor.x, self._padCursor.y
-    local hot = self._anyHover
-    love.graphics.push("all")
-    love.graphics.origin()
-    love.graphics.setLineWidth(1)
-    -- Drop shadow
-    love.graphics.setColor(0, 0, 0, 0.45)
-    love.graphics.polygon("fill",
-      x + 2, y + 2, x + 2, y + 22, x + 8, y + 16, x + 14, y + 26,
-      x + 18, y + 24, x + 11, y + 14, x + 20, y + 14)
-    -- Pointer body
-    if hot then
-      love.graphics.setColor(0.25, 0.95, 0.55, 1)
-    else
-      love.graphics.setColor(1, 1, 1, 1)
-    end
-    love.graphics.polygon("fill",
-      x, y, x, y + 20, x + 6, y + 14, x + 12, y + 24,
-      x + 16, y + 22, x + 9, y + 12, x + 18, y + 12)
-    love.graphics.setColor(0.05, 0.07, 0.12, 1)
-    love.graphics.polygon("line",
-      x, y, x, y + 20, x + 6, y + 14, x + 12, y + 24,
-      x + 16, y + 22, x + 9, y + 12, x + 18, y + 12)
-    love.graphics.pop()
   end
 end
 
-local function inside(r, x, y)
-  return r and x >= r.x and x <= r.x + r.width and y >= r.y and y <= r.y + r.height
+-- Clicks are polled inside FlexLove (mouse + love.touch); host-forwarded
+-- mousepressed mints no click, so Android's synthesized mouse path cannot
+-- double-fire a tap (#553).  It DOES hand the pointer back from the pad
+-- cursor (#781): a Linux boot with a joystick present arms it (see the
+-- getJoystickCount block in new()), and while it is active
+-- LauncherView.update refuses to mint mouse clicks, so a real press must
+-- win the pointer back even when the polled motion yield misses (X11
+-- multi-monitor coords).  Same contract as PadCursor.yieldToPointer for
+-- the overlay hosts.  Touch move/press/release must still reach
+-- FlexLove.touch* or scroll containers never drag on phones.
+function RomImporter:mousepressed(x, y, button, istouch)
+  self._padCursorActive = false
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit then Kit.pointerUsed() end
+  if istouch or button ~= 1 or not self._flex then return end
+  local LauncherView = require("src.import.LauncherView")
+  if LauncherView.consumedTouchLive(self) then
+    LauncherView.consumePress(self)
+    return
+  end
+  if self.tab == "box" and require("src.import.ShowcaseEditor").pointerPressed(self,"mouse",x,y) then
+    LauncherView.consumePress(self)
+    return
+  end
+  LauncherView.mousepressed(self, x, y)
 end
 
-function RomImporter:mousepressed(x, y, button)
-  if self._rename then return end -- the rename modal swallows all clicks
-  -- right-click a save-slot row to rename it (#205); desktop only (touch
-  -- has no secondary button)
-  if button == 2 then
-    if not self.android and self.workState ~= "working" then
-      for _, r in ipairs(self.slotRects or {}) do
-        if inside(r, x, y) then
-          self:_beginRename(self.panelVersion, r.id)
-          return
-        end
-      end
+function RomImporter:touchpressed(id, x, y, dx, dy, pressure)
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit then Kit.pointerUsed() end
+  if not self._flex then return end
+  require("src.import.LauncherView").forgetConsumedTouch(self, id)
+  if self.tab == "box" and require("src.import.ShowcaseEditor").pointerPressed(self,id,x,y) then
+    require("src.import.LauncherView").consumeTouch(self, id)
+    return
+  end
+  require("src.import.LauncherView").touchpressed(
+    self, id, x, y, dx, dy, pressure)
+end
+
+function RomImporter:touchmoved(id, x, y, dx, dy, pressure)
+  if not self._flex then return end
+  if self.tab == "box" and require("src.import.ShowcaseEditor").pointerMoved(self,id,x,y) then return end
+  require("src.import.LauncherView").touchmoved(
+    self, id, x, y, dx, dy, pressure)
+end
+
+function RomImporter:touchreleased(id, x, y, dx, dy, pressure)
+  local consumed = require("src.import.LauncherView").releaseConsumedTouch(self, id)
+  if not self._flex then return end
+  if self.tab == "box" and require("src.import.ShowcaseEditor").pointerReleased(self,id) then return end
+  if consumed then return end
+  require("src.import.LauncherView").touchreleased(
+    self, id, x, y, dx, dy, pressure)
+end
+
+function RomImporter:mousemoved(x,y,_,_,istouch)
+  if istouch then return end
+  if self.tab=="box" then return require("src.import.ShowcaseEditor").pointerMoved(self,"mouse",x,y) end
+end
+function RomImporter:mousereleased(_,_,button,istouch)
+  if button==1 and not istouch and self.tab=="box" then return require("src.import.ShowcaseEditor").pointerReleased(self,"mouse") end
+end
+
+-- Switch the active tab (chips, shoulder buttons).  The find search caret and
+-- the soft keyboard drop with the panel they belonged to; each tab's scroll
+-- offset persists inside the view's per-tab scroll container.
+function RomImporter:_beginImporterImport(importerId)
+  if self:_importerPickPending() then return end
+  local Importers = require("src.import.Importers")
+  local desc = Importers.get(importerId)
+  if not desc or desc.status == "planned" then return end
+  if self._importerJob then return end
+  self._importerNotice = nil
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "importer"
+    self.pickerPendingImporterId = importerId
+    if not pickFile("rom", table.concat(desc.source.formats or { "sfc" }, ",")) then
+      self.pickerPendingKind, self.pickerPendingImporterId = nil, nil
+      self._importerNotice = { text = "Could not open the file picker." }
     end
     return
   end
-  if button ~= 1 then return end
-  if inside(self.bcgButton, x, y) or inside(self.linkUrlRect, x, y) then
-    love.system.openURL(COMMUNITY_URL)
-    return
-  end
-  -- Self-updater banner (touch routes here through love.touchpressed too).
-  -- Kept ahead of the "working" guard so it stays live during a ROM import.
-  if inside(self.updateButton, x, y) then
-    local action = self.updateButton.action
-    if action == "download" and self.Check then
-      pcall(self.Check.download)
-    elseif action == "restart" then
-      HostShell.restart()
-    elseif action == "openurl" and self.Check then
-      love.system.openURL(self.Check.releaseUrl())
-    end
-    return
-  end
-  -- Tab chips switch panels even mid-import so the player can look around
-  -- while a ROM extracts.
-  for _, t in ipairs(self.tabRects or {}) do
-    if inside(t, x, y) then
-      self.tab = t.id
-      self._slotPress = nil   -- drop any half-started slot drag on tab change
-      self._modPress = nil    -- and any half-started mod toggle press
+  if self.android then
+    self.pickerPendingKind = "importer"
+    self.pickerPendingImporterId = importerId
+    if pickFile("required_import", importerPickName(importerId)) then
+      self.pickPending = true
+      self.pickTimer = 0
       return
     end
+    self.pickerPendingKind = nil
+    self.pickerPendingImporterId = nil
   end
+  local path = chooseImporterFile(desc.name, desc.source.formats or { "sfc" })
+  if path then
+    self:_runImporter(importerId, path)
+    return
+  end
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and Kit.FileBrowser then
+    self._padCursorActive = false
+    Kit.FileBrowser.open({
+      title = "Select " .. desc.name,
+      mode = "all",
+      onSelect = function(pickedPath)
+        self:_runImporter(importerId, pickedPath)
+      end,
+    })
+    return
+  end
+  self._importerNotice = {
+    text = "Drop your " .. desc.name .. " dump onto this window.",
+  }
+  self._importerDropFor = importerId
+end
+
+function RomImporter:_runImporter(importerId, path)
+  local data, readErr = readExternalPath(path)
+  if not data then
+    self._importerNotice = { text = "Could not read that file: "
+      .. tostring(readErr) }
+    return
+  end
+  return self:_runImporterData(importerId, data)
+end
+
+function RomImporter:_runImporterData(importerId, data)
+  local descriptor = require("src.import.Importers").get(importerId)
+  if not (descriptor and descriptor.module) then return end
+  local importer = require(descriptor.module)
+  local source, err = importer.identify(data)
+  if not source then
+    self._importerNotice = { text = tostring(err) }
+    return
+  end
+  self._importerJob = {
+    id = importerId,
+    co = importer.job(data),
+    progress = 0,
+    status = "Reading " .. source.name,
+  }
+  self._importerNotice = nil
+end
+
+function RomImporter:_stepImporter()
+  local job = self._importerJob
+  if not job then return end
+  local budget = job.id == "pmd_red" and 1 or 24
+  local clock = love and love.timer and love.timer.getTime
+  local deadline = job.id == "gen5_bw" and clock and (clock() + 0.006)
+  while budget > 0 do
+    budget = budget - 1
+    if coroutine.status(job.co) == "dead" then break end
+    local ok, value = coroutine.resume(job.co)
+    if not ok then
+      self._importerJob = nil
+      self._importerNotice = { text = "Import failed: " .. tostring(value) }
+      self._importerRows = nil
+      return
+    end
+    if coroutine.status(job.co) == "dead" then
+      self._importerJob = nil
+      self._importerRows = nil
+      local packs = {}
+      for id, count in pairs(type(value) == "table" and value.packs or {}) do
+        packs[#packs + 1] = id .. " (" .. count .. ")"
+      end
+      table.sort(packs)
+      self._importerNotice = { ok = true,
+        text = "Imported " .. table.concat(packs, ", ") }
+      return
+    end
+    if type(value) == "table" and value.total and value.total > 0 then
+      job.progress = value.done / value.total
+      job.status = value.status or job.status
+    end
+
+
+    if deadline and clock() >= deadline then break end
+  end
+end
+
+function RomImporter:_switchTab(id)
+  if id == "bug" then return self:_openBugPanel() end
+  if GameVersion.VERSIONS[id] and not SecretGames.shown(self, id) then return end
+  if self.tab == id and id == "box" and self._boxState then return end
+  local tabTransition
+  if self.tab and self.tab ~= id then
+    local at = tabOrder()
+    local from = self.tab == "find" and "mods" or self.tab
+    local to = id == "find" and "mods" or id
+    local dir = from == "mods" and to == "mods" and (id == "find" and 1 or -1)
+      or ((at[to] or 0) >= (at[from] or 0) and 1 or -1)
+    tabTransition = {
+      dir = dir,
+      from = self.tab, to = id,
+    }
+  end
+  if self.tab == "box" then
+    require("src.import.BoxUI").close(self)
+    Transition.clear("box")
+    require("src.import.BoxPrompt").close(self, false)
+    require("src.box.Cry").stop()
+    if self._boxState then
+      require("src.box.Animation").release(self._boxState.animation)
+      self._boxState.animation, self._boxState.animationEntry = nil, nil
+    end
+    require("src.box.Showcase").stopMusic()
+    require("src.ui.kit.Kit").blur()
+    if self._boxState then self._boxState.moving = nil end
+    require("src.import.LauncherView").forgetConsumedTouch(self)
+  end
+  self.tab = id
+  if id == "mods" or id == "find" then self._modsInnerTab = id end
+  if id == "box" then require("src.import.BoxPanel").refresh(self) end
+  if id ~= "find" then self._findVisibleEntries = nil end
+  self._findSearchFocus = false
+  self._skinUrlFocus = false
+  self._onlineFocus = nil
+  self:_disarmTextInput()
+  -- the skins list is cheap and can change behind the launcher's back
+  -- (an export, a hand-dropped folder), so re-read it on every visit
+  if id == "skins" then self:_ensureSkins(true) end
+  if id == "importers" then self._importerRows = nil end
+  if GameVersion.VERSIONS[id] then
+    self:_setModScope(id)
+    self:_queueReimport(id)
+  end
+  if tabTransition then Transition.start("tabs", "tab", tabTransition) end
+end
+
+-- ------- skins tab (touch skins + the desktop Skin Studio)
+
+function RomImporter:_ensureSkins(force)
+  if self._skins and not force then return self._skins end
+  local TouchSkin = require("src.core.TouchSkin")
+  local out = {}
+  for _, entry in ipairs(TouchSkin.list()) do
+    local skin = TouchSkin.load(entry.root, entry.id)
+    local page = skin and skin.pages[1]
+    local controls = 0
+    for _, ctl in ipairs(page and page.controls or {}) do
+      if not ctl.decorative then controls = controls + 1 end
+    end
+    out[#out + 1] = {
+      id = entry.id,
+      source = entry.source,
+      format = skin and skin.format or nil,
+      pages = skin and #skin.pages or 0,
+      controls = controls,
+      -- The launcher owns the visual skin picker, so retain the already
+      -- loaded first-page bezel for its preview card instead of decoding it
+      -- again every frame.
+      preview = page and page.image or nil,
+      screen = page ~= nil
+        and (page.viewport ~= nil or page.screenFit == "remainder"),
+      ok = skin ~= nil,
+    }
+  end
+  self._skins = out
+  return out
+end
+
+function RomImporter:_forgetActiveSkin()
+  self._activeSkinCache = nil
+end
+
+function RomImporter:_activeSkin()
+  if self._activeSkinCache == nil then
+    local opts = require("src.core.SaveData").loadOptions()
+    local tc = type(opts.touchControls) == "table" and opts.touchControls or {}
+    self._activeSkinCache = (tc.enabled ~= false and tc.skin) or false
+  end
+  return self._activeSkinCache or nil
+end
+
+function RomImporter:_useSkin(id)
+  local SaveData = require("src.core.SaveData")
+  local opts = SaveData.loadOptions()
+  local tc = type(opts.touchControls) == "table" and opts.touchControls or {}
+  tc.enabled = true
+  tc.skin = id
+  opts.touchControls = tc
+  SaveData.saveOptions(opts)
+  self:_forgetActiveSkin()
+  self._skinNotice = {
+    ok = true,
+    text = id and ("Now using " .. id) or "Now using the built-in pad",
+  }
+end
+
+function RomImporter:_disableSkins()
+  local SaveData = require("src.core.SaveData")
+  local opts = SaveData.loadOptions()
+  local tc = type(opts.touchControls) == "table" and opts.touchControls or {}
+  -- `enabled` is the pad's own switch, not a skins switch: turning a skin off
+  -- has to leave the built-in pad on, which is what the notice promises.  A
+  -- skin can only be active while the pad is enabled, so this never overrides
+  -- a player who turned the pad off deliberately.
+  tc.enabled, tc.skin = true, nil
+  opts.touchControls = tc
+  SaveData.saveOptions(opts)
+  self:_forgetActiveSkin()
+  self._skinNotice = { ok = true, text = "Skins are off. Mobile will use the built-in pad when needed." }
+end
+
+function RomImporter:_installSkinZip(source)
   if self.workState == "working" then return end
-  -- Active game panel's controls (only the shown version has live hit rects).
-  if inside(self.playButtonRect, x, y) then
-    self:play(self.panelVersion); return
+  self.tab = "skins"
+  local name, data, readError
+  if type(source) == "string" then
+    name = source
+    if not source:match("^/") and not source:match("^%a:[/\\]")
+        and not source:match("^[Ss][Dd][Mm][Cc]:") then
+      data = love.filesystem.read(source)
+    end
+    if not data then data, readError = readExternalPath(source) end
+    if not data then data = love.filesystem.read(source) end
+  else
+    name = source:getFilename() or ""
+    data, readError = readDroppedFile(source)
   end
-  if inside(self.romButtonRect, x, y) then
-    local version = self.panelVersion
-    if self.ready[version] then self:reimport(version) else self:choose(version) end
+  if not data then
+    self._skinNotice = { ok = false,
+      text = "Could not read the skin archive: "
+        .. tostring(readError or name) }
     return
   end
-  -- SAVE FILES card: Import save / Export save, and the open-folder affordance
-  -- shown on the notice line after a successful export.
-  if inside(self.saveImportRect, x, y) then
-    self:chooseSaveImport(self.panelVersion); return
+  self:_installSkinData(name, data)
+end
+
+local MAX_SKIN_URL = 300
+local SKIN_TEMP_DIR = "skins/_download"
+
+function RomImporter.skinUrlName(url)
+  local path = tostring(url or ""):gsub("[?#].*$", "")
+  local base = (path:match("([^/\\]+)$") or ""):gsub("[^%w%._%-]", "_")
+  local ext = base:match("%.([%w]+)$")
+  if not ext then
+    return (base ~= "" and base or "skin") .. ".zip"
   end
-  if inside(self.saveExportRect, x, y) then
-    self:exportSave(self.panelVersion); return
+  ext = ext:lower()
+  local TouchSkin = require("src.core.TouchSkin")
+  if TouchSkin.ARCHIVE_EXTS[ext] or ext == "cfg" then return base end
+  return (base:gsub("%.[%w]+$", "")) .. ".zip"
+end
+
+function RomImporter.wrapSkinPayload(name, data)
+  name = tostring(name or "")
+  if not name:lower():match("%.cfg$") then return name, data end
+  if not data then return name, data end
+  if data:sub(1, 2) == "PK" then
+    return (name:gsub("%.[Cc][Ff][Gg]$", "")) .. ".zip", data
   end
-  if inside(self.saveFolderRect, x, y) then
-    if self.saveFolderRect.dir then
-      love.system.openURL(fileUrl(self.saveFolderRect.dir))
+  local blob = require("src.core.SkinZip").encode({
+    { name = "overlay.cfg", data = data },
+  })
+  return (name:gsub("%.[Cc][Ff][Gg]$", "")) .. ".zip", blob
+end
+
+function RomImporter:_installSkinData(name, data)
+  local TouchSkin = require("src.core.TouchSkin")
+  if not data or data == "" then
+    self._skinNotice = { ok = false, text = Strings("The skin file was empty.") }
+    return nil
+  end
+  local wrappedName, payload = RomImporter.wrapSkinPayload(name, data)
+  local id, note = TouchSkin.installArchive(wrappedName, payload)
+  self:_ensureSkins(true)
+  if not id then
+    self._skinNotice = { ok = false, text = "Import failed: " .. tostring(note) }
+    return nil
+  end
+  local text = "Imported " .. id
+  if type(note) == "table" and note[1] then
+    text = text .. ": " .. tostring(note[1])
+  end
+  self._skinNotice = { ok = true, text = text }
+  return id
+end
+
+function RomImporter:_toggleSkinUrlFocus()
+  self._skinUrlFocus = not self._skinUrlFocus
+  if self._skinUrlFocus then
+    self:_armTextInput()
+  else
+    self:_disarmTextInput()
+  end
+end
+
+function RomImporter:_pasteSkinUrl()
+  local ok, text = pcall(love.system.getClipboardText)
+  if ok and type(text) == "string" then
+    self.skinUrl = utf8Cap((self.skinUrl or "") .. text:gsub("%s", ""),
+      MAX_SKIN_URL)
+  end
+end
+
+function RomImporter:_addSkinFromUrl(url)
+  if self._skinFetch then return false end
+  url = tostring(url or self.skinUrl or ""):gsub("%s", "")
+  if url == "" then
+    self._skinNotice = { ok = false,
+      text = Strings("Paste a link to a skin archive first.") }
+    return false
+  end
+  if not url:match("^https?://") then
+    self._skinNotice = { ok = false,
+      text = Strings("A skin link has to start with http:// or https://") }
+    return false
+  end
+  if not require("src.core.Platform").canFetchRemote() then
+    self._skinNotice = { ok = false,
+      text = Strings("Downloading needs a network transport this build has not got.") }
+    return false
+  end
+  local name = RomImporter.skinUrlName(url)
+  local Fetch = require("src.net.Fetch")
+  self._skinFetch = {
+    url = url, name = name, dest = SKIN_TEMP_DIR .. "/" .. name,
+    job = Fetch.download(url, SKIN_TEMP_DIR .. "/" .. name,
+      { userAgent = "gen1recomp-skin", maxSeconds = 90 }),
+  }
+  self._skinNotice = { ok = true, text = Strings("Downloading %s...", name) }
+  return true
+end
+
+function RomImporter:_pumpSkinFetch()
+  local f = self._skinFetch
+  if not f then return end
+  local Fetch = require("src.net.Fetch")
+  local st = Fetch.poll(f.job)
+  if st.status == "pending" then
+    self._skinFetchProgress = st.progress
+    return
+  end
+  Fetch.release(f.job)
+  self._skinFetch, self._skinFetchProgress = nil, nil
+  if st.status ~= "ok" or not st.path then
+    self._skinNotice = { ok = false,
+      text = "Download failed: " .. tostring(st.err or "no data") }
+    return
+  end
+  local data = love.filesystem.read(st.path)
+  love.filesystem.remove(st.path)
+  if self:_installSkinData(f.name, data) then
+    self.skinUrl = ""
+  end
+end
+
+function RomImporter:_exportSkin(id, kind)
+  local TouchSkin = require("src.core.TouchSkin")
+  local entry = id and TouchSkin.find(id)
+  if not entry then
+    self._skinNotice = { ok = false, text = Strings("That skin is gone.") }
+    return nil
+  end
+  local skin = TouchSkin.load(entry.root, entry.id)
+  if not skin then
+    self._skinNotice = { ok = false,
+      text = Strings("Could not read %s", tostring(id)) }
+    return nil
+  end
+  local path, missing, warnings
+  if kind == "retroarch" then
+    path, missing = TouchSkin.exportRetroArch(skin)
+  elseif kind == "delta" then
+    path, missing, warnings = TouchSkin.exportDelta(skin)
+  else
+    path, missing = TouchSkin.export(skin)
+  end
+  if not path then
+    self._skinNotice = { ok = false,
+      text = "Export failed: " .. tostring(missing) }
+    return nil
+  end
+  local dir = love.filesystem.getSaveDirectory
+    and love.filesystem.getSaveDirectory() or nil
+  self._skinExport = { path = path, dir = dir }
+  local text = Strings("Exported to %s", (dir and (dir .. "/") or "") .. path)
+  if type(missing) == "table" and missing[1] then
+    text = text .. " (" .. #missing .. " image(s) missing)"
+  end
+  if type(warnings) == "table" and warnings[1] then
+    text = text .. " " .. tostring(warnings[1])
+  end
+  self._skinNotice = { ok = true, text = text }
+  return path
+end
+
+function RomImporter:_revealSkinExport()
+  local e = self._skinExport
+  if not e or not e.dir then return false end
+  if love.system and love.system.openURL then
+    pcall(love.system.openURL, fileUrl(e.dir))
+  end
+  return true
+end
+
+local MAX_SYNC_CODE = 8
+local MAX_SHARE_CODE = 6
+
+function RomImporter.syncDigits(text)
+  local digits = tostring(text or ""):gsub("[^%d]", "")
+  return digits:sub(1, MAX_SYNC_CODE)
+end
+
+function RomImporter.syncShareCode(text)
+  local out = tostring(text or ""):upper():gsub("[^A-Z2-9]", "")
+  return out:sub(1, MAX_SHARE_CODE)
+end
+
+function RomImporter:_syncDeviceLabel()
+  local name = love.system and love.system.getOS and love.system.getOS()
+  if type(name) ~= "string" or name == "" then return "device" end
+  return name
+end
+
+function RomImporter:_syncEngine()
+  if self._sync ~= nil then return self._sync or nil end
+  local ok, SyncEngine = pcall(require, "src.sync.SyncEngine")
+  if not ok or type(SyncEngine) ~= "table" then
+    self._sync = false
+    return nil
+  end
+  local made, eng = pcall(SyncEngine.shared)
+  if not made or type(eng) ~= "table" then
+    self._sync = false
+    return nil
+  end
+  self._sync = eng
+  return eng
+end
+
+function RomImporter:_syncSupported()
+  if self._syncTransportOk ~= nil then return self._syncTransportOk end
+  local ok, HostShell = pcall(require, "src.core.HostShell")
+  if not ok or type(HostShell) ~= "table"
+      or type(HostShell.canHttpRequest) ~= "function" then
+    self._syncTransportOk = true
+    return true
+  end
+  local asked, can = pcall(HostShell.canHttpRequest)
+  self._syncTransportOk = (not asked) or (can and true or false)
+  return self._syncTransportOk
+end
+
+function RomImporter:_pumpOnline(dt)
+  pcall(function() require("src.online.Trade").pumpPending(dt) end)
+  if not self._online then return end
+  local ok, OnlinePanel = pcall(require, "src.import.OnlinePanel")
+  if not ok then return end
+  pcall(OnlinePanel.update, self, dt)
+end
+
+function RomImporter:_pumpSync(dt)
+  if self._sync == nil then
+    if not self.launcher or self._syncBooted then return end
+    if not self:_syncSupported() then return end
+    self._syncBooted = true
+    local booted = self:_syncEngine()
+    if booted and booted.state.enabled and booted:linked() then
+      pcall(booted.syncNow, booted)
+    end
+  end
+  local eng = self._sync
+  if not eng then return end
+  pcall(eng.update, eng, dt)
+  if eng.changed then
+    eng.changed = nil
+    local rows = eng.lastDownloads
+    eng.lastDownloads = nil
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+      self:_syncNoteDownload(row)
+    end
+  end
+  local notice = type(eng.takeNotice) == "function" and eng:takeNotice() or nil
+  if notice and self._boxState then self._boxState.notice, self._boxState.noticeKind = notice, "info" end
+  if eng.phase == "conflict" and eng.conflicts and #eng.conflicts > 0 then
+    if not self._syncModal and not self._syncConflictShown then
+      self._syncConflictShown = true
+      self:_openSync()
+    end
+  else
+    self._syncConflictShown = nil
+  end
+end
+
+function RomImporter:_syncNoteDownload(row)
+  if type(row) == "table" and row.box then
+    if self.tab == "box" then
+      require("src.import.BoxPrompt").close(self, false)
+      local fresh = require("src.import.BoxPanel").refresh(self)
+      fresh.notice, fresh.noticeKind = "Box sync complete.", "ok"
+    elseif self._boxState then
+      require("src.import.BoxPrompt").close(self, false)
+      require("src.import.BoxPanel").refresh(self)
     end
     return
   end
-  -- SAVE SLOT rows / Edit / Delete.  The two labels are checked first so a tap
-  -- on either never also selects the row.  On desktop a press only ARMS a row
-  -- click: _updateSlotDrag commits it on release when the pointer did not move
-  -- (a moved pointer scrolls instead).  Android has no reliable pointer
-  -- polling, so it selects on press.  Edit and Delete fire immediately (small
-  -- fixed targets, no scroll conflict).
-  for _, r in ipairs(self.slotDeleteRects or {}) do
-    if inside(r, x, y) then
-      self:_deleteSlot(self.panelVersion, r.id)
+  local version = type(row) == "table" and row.version
+  if type(version) ~= "string" or not GameVersion.VERSIONS[version] then return end
+  local cart = type(row.cart) == "string" and row.cart ~= "" and row.cart or nil
+  local scope = cart and (CART_SCOPE .. cart) or version
+  self:_refreshSlots(scope)
+  if row.created then self.slotScroll[scope] = math.huge end
+  local from = row.device and (" from " .. tostring(row.device)) or ""
+  local what
+  if cart then
+    local ok, found = pcall(self._cartById, self, version, cart)
+    what = (ok and type(found) == "table" and found.title) or cart
+  end
+  if row.removed then
+    self.saveNotice[scope] = { ok = true,
+      text = ("Removed %s, deleted%s."):format(tostring(row.slot),
+        row.device and (" on " .. tostring(row.device)) or " on another device") }
+    return
+  end
+  self.saveNotice[scope] = { ok = true,
+    text = what
+      and ("Downloaded a %s save%s into %s."):format(
+        tostring(what), from, tostring(row.slot))
+      or ("Downloaded a save%s into %s."):format(from, tostring(row.slot)) }
+end
+
+function RomImporter:_openSync()
+  local eng = self:_syncEngine()
+  local kept = eng and not eng:linked() and eng.state or {}
+  self._syncModal = self._syncModal
+    or { view = "home", code1 = kept.code1 or "", code2 = kept.code2 or "",
+      share = "", withOptions = true }
+  self._syncFocus = nil
+  self:_disarmTextInput()
+end
+
+function RomImporter:_closeSync()
+  self._syncModal = nil
+  self._syncFocus = nil
+  self:_disarmTextInput()
+end
+
+function RomImporter:_syncView(view)
+  if not self._syncModal then return end
+  self._syncModal.view = view
+  self._syncFocus = nil
+  self:_disarmTextInput()
+end
+
+function RomImporter:_syncFocusField(field)
+  if not self._syncModal then return end
+  if self._syncFocus == field then
+    self._syncFocus = nil
+    self:_disarmTextInput()
+    return
+  end
+  self._syncFocus = field
+  self:_armTextInput()
+end
+
+function RomImporter:_syncTypeInto(field, text)
+  local mo = self._syncModal
+  if not mo or not field then return end
+  if field == "share" then
+    mo.share = RomImporter.syncShareCode((mo.share or "") .. tostring(text or ""))
+  else
+    mo[field] = RomImporter.syncDigits((mo[field] or "") .. tostring(text or ""))
+  end
+end
+
+function RomImporter:_syncPaste()
+  local field = self._syncFocus
+  if not field then return end
+  local ok, text = pcall(love.system.getClipboardText)
+  if ok and type(text) == "string" then self:_syncTypeInto(field, text) end
+end
+
+function RomImporter:_syncCreate()
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  return eng:createAccount(self:_syncDeviceLabel())
+end
+
+function RomImporter:_syncLink()
+  local eng, mo = self:_syncEngine(), self._syncModal
+  if not eng or not mo then return false end
+  local ok = eng:linkDevice(mo.code1, mo.code2, self:_syncDeviceLabel())
+  if ok then
+    mo.code1, mo.code2, mo.view = "", "", "home"
+    self._syncFocus = nil
+    self:_disarmTextInput()
+  end
+  return ok
+end
+
+function RomImporter:_syncNow()
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  return eng:syncNow()
+end
+
+function RomImporter:_syncCodes()
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  return eng:reissueCodes()
+end
+
+function RomImporter:_syncUnlink()
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  eng:unlink()
+  if self._syncModal then self._syncModal.view = "home" end
+  return true
+end
+
+function RomImporter:_syncUnlinkDevice(deviceId)
+  local eng = self:_syncEngine()
+  if not eng or type(eng.unlinkDevice) ~= "function" then return false end
+  return eng:unlinkDevice(deviceId)
+end
+
+function RomImporter:_syncShareMods()
+  local eng, mo = self:_syncEngine(), self._syncModal
+  if not eng then return false end
+  return eng:shareMods(mo and mo.withOptions ~= false)
+end
+
+function RomImporter:_syncToggleShareOptions()
+  local mo = self._syncModal
+  if not mo then return false end
+  mo.withOptions = not (mo.withOptions ~= false)
+  return mo.withOptions
+end
+
+function RomImporter:_syncAnswerModOptions(importThem)
+  local eng = self:_syncEngine()
+  if not eng or type(eng.answerModOptions) ~= "function" then return false end
+  return eng:answerModOptions(importThem)
+end
+
+function RomImporter:_syncGetShare()
+  local eng, mo = self:_syncEngine(), self._syncModal
+  if not eng or not mo then return false end
+  return eng:fetchShare(mo.share or "")
+end
+
+function RomImporter:_syncApplyMods()
+  local eng, mo = self:_syncEngine(), self._syncModal
+  if not eng then return false end
+  local ok, err = eng:applyModPlan(function(done, total, label, finished)
+    if not mo then return end
+    if finished then
+      mo.progress = nil
+      if self._refreshMods then self:_refreshMods() end
+    else
+      mo.progress = { done = done, total = total, label = label }
+    end
+  end)
+  if mo then mo.progress = nil end
+  if ok and self._refreshMods then self:_refreshMods() end
+  return ok, err
+end
+
+function RomImporter:_syncResolve(key, choice)
+  local eng = self:_syncEngine()
+  if not eng then return false end
+  return eng:resolveConflict(key, choice)
+end
+
+function RomImporter:_skinsImportButtonLabel()
+  if self:_inboxImport() then return Strings("Scan again") end
+  return Strings("Import skin .zip")
+end
+
+function RomImporter:chooseSkin()
+  if self:_importerPickPending() then return end
+  if self.workState == "working" then return end
+  if self:_inboxImport() then
+    local found = #self:_ensureSkins(true)
+    self._skinNotice = { ok = true, text = Strings(
+      Platform.inboxTransfer() == "ftp"
+        and "%d skins found. Copy a skin .zip into %s/ over FTP, then scan again."
+        or "%d skins found. Copy a skin .zip into %s/ over MTP, then scan again.",
+      found, require("src.core.TouchSkin").USER_ROOT) }
+    return
+  end
+  if self.nativePicker and love.system.getPickedFile then
+    self.pickerPendingKind = "skin"
+    if not pickFile("mod") then
+      self.pickerPendingKind = nil
+      self._skinNotice = { ok = false, text = "Could not open the file picker." }
+    end
+    return
+  end
+  if self.android then
+    local name = findPendingMod(true, self.pickSkip)
+    if name then
+      self:_installSkinZip(name)
+      consumePick(self, name, "picked_mod.zip",
+        self._skinNotice and self._skinNotice.ok)
       return
     end
+    self.pickerPendingKind = "skin"
+    if not pickFile("mod") then
+      self.pickerPendingKind = nil
+      self._skinNotice = { ok = false,
+        text = "Could not open the file picker. Copy a skin .zip via USB." }
+    else
+      self.pickPending = true
+      self.pickTimer = 0
+    end
+    return
   end
-  for _, r in ipairs(self.slotEditRects or {}) do
-    if inside(r, x, y) then
-      if self.onEditSave then self.onEditSave(self.panelVersion, r.id) end
-      return
+  local path = chooseSkinZip()
+  if path then self:_installSkinZip(path) end
+end
+
+function RomImporter:_toggleFindSearchFocus()
+  self._findSearchFocus = not self._findSearchFocus
+  if self._findSearchFocus then
+    self:_armTextInput()
+  else
+    self:_disarmTextInput()
+  end
+end
+
+-- ------- settings gear (options.lua + enabled mods' option schemas)
+
+function RomImporter:_openBugPanel()
+  self._settings = nil
+  self._bugModal = true
+  return true
+end
+
+function RomImporter:_closeBugPanel()
+  self._bugModal = nil
+  return true
+end
+
+function RomImporter:_openSettings()
+  -- The touch-overlay editor is a host screen, so the model gets it as a
+  -- hook rather than reaching for main.lua's handler itself.  Closing the
+  -- settings panel FIRST persists the pending edits (_closeSettings saves)
+  -- and leaves no modal behind the editor to return to.
+  -- The tab rides along: the editor persists the layout into that game's own
+  -- option block, and Gold's is not the flat Gen 1 one (#1100).
+  local hooks = {}
+  hooks.openExtras = function()
+    self:_closeSettings()
+    self:_switchTab("importers")
+  end
+  local version = self.tab
+  if self.onEditTouchControls then
+    local version = self.tab
+    hooks.editTouchControls = function()
+      self:_closeSettings()
+      self.onEditTouchControls(version)
     end
   end
-  for _, r in ipairs(self.slotRects or {}) do
-    if inside(r, x, y) then
-      if self.android then
-        self:_selectSlot(self.panelVersion, r.id)
-      else
-        self._slotPress = { version = self.panelVersion, id = r.id, y0 = y,
-          scroll0 = self.slotScroll[self.panelVersion] or 0, moved = false }
-      end
-      return
+  if self.onOpenSkinStudio then
+    local version = self.tab
+    hooks.openSkinStudio = function(skinId)
+      self:_closeSettings()
+      self.onOpenSkinStudio(version, skinId)
     end
   end
-  if inside(self.newSlotRect, x, y) then
-    self:_newSlot(self.panelVersion); return
+  -- The tab the gear was opened on decides the row set: Gold reads a
+  -- different option block entirely, and offering it Gen 1's rows meant a
+  -- dozen controls that changed nothing (see LauncherSettings.gen2Rows).
+  local ok, model = pcall(function()
+    return require("src.import.LauncherSettings").open(hooks, version)
+  end)
+  if ok and model then
+    self._settings = model
   end
-  -- Mods panel: the import button dispatches on press (fixed header, no scroll
-  -- conflict); Delete fires immediately; a toggle switch, which lives in the
-  -- scrollable list, only ARMS a press so _updateSlotDrag can tell a click from
-  -- a drag-scroll (Android, with no pointer polling, toggles on press).
-  if inside(self.modImportRect, x, y) then
-    self:chooseMod(); return
+end
+
+-- Quit from the launcher's own X.  It goes through love.event.quit so main.lua's
+-- love.quit hook still runs: that is where the worker threads are shut down
+-- (#339) and where a launcher close is told apart from a running game's (#785).
+function RomImporter:_quitApp()
+  if love.event and love.event.quit then love.event.quit() end
+end
+
+function RomImporter:_closeSettings()
+  local model = self._settings
+  if model then
+    model.save()
   end
-  for _, r in ipairs(self.modDeleteRects or {}) do
-    if inside(r, x, y) then
-      self:_deleteMod(r.id)
-      return
+  self._settings = nil
+  self:_forgetActiveSkin()
+end
+
+function RomImporter:_safeModeEnabled()
+  if self.safeMode == nil then
+    local SaveData = require("src.core.SaveData")
+    self.safeMode = SaveData.isSafeMode(SaveData.loadOptions())
+  end
+  return self.safeMode == true
+end
+
+function RomImporter:_toggleSafeMode()
+  local SaveData = require("src.core.SaveData")
+  local options = SaveData.loadOptions()
+  local enabled = not SaveData.isSafeMode(options)
+  SaveData.setSafeMode(options, enabled)
+  SaveData.saveOptions(options)
+  self.safeMode = enabled
+  self.mods = nil
+  self.findInstalled = nil
+  self._modSortCache = nil
+  self._cartCaptureCache = nil
+  self._modInfoFetch = nil
+  self.modNotice = nil
+end
+
+function RomImporter:_reportIssue(options, version)
+  self.issueNotice = nil
+  local ok, IssueReport = pcall(require, "src.core.IssueReport")
+  if not ok then
+    self.issueNotice = { ok = false, text = "Could not prepare the issue report." }
+    return false
+  end
+  local opened, url, reason = IssueReport.open(options, {
+    version = version,
+    mods = self.mods,
+  })
+  if not opened then
+    self.issueNotice = { ok = false, text = reason or "Could not open the issue report." }
+    return false
+  end
+  self._lastIssueReportURL = url
+  if reason then self.issueNotice = { ok = true, text = reason } end
+  return true
+end
+
+function RomImporter:_commitSettingsText()
+  local st = self._settingsText
+  self._settingsText = nil
+  self:_disarmTextInput()
+  if st and st.row.setText then
+    st.row.setText(st.text)
+    if self._settings then self._settings.save() end
+  end
+end
+
+-- The view's open-folder affordance needs the same file:// encoding the old
+-- notice line used.
+function RomImporter:_resyncPointerAfterDialog()
+  self._mouseAt = nil
+  self._clickPt = nil
+  self._prevMouseDown = (love and love.mouse and love.mouse.isDown
+    and love.mouse.isDown(1)) and true or false
+end
+
+local CART_PICK = { label = "Cart", exts = { "g1rcart" } }
+
+local function hostAbsolute(path)
+  return type(path) == "string" and (
+      path:match("^/")
+      or path:match("^%a:[/\\]")
+      or path:match("^[Ss][Dd][Mm][Cc]:"))
+end
+
+local function readCartSource(source)
+  local t = type(source)
+  if (t == "userdata" or t == "table") and type(source.open) == "function" then
+    return readDroppedFile(source)
+  end
+  if t ~= "string" then return nil end
+  if not hostAbsolute(source) and love and love.filesystem then
+    local data = love.filesystem.read(source)
+    if type(data) == "string" and data ~= "" then return data end
+  end
+  local file = io.open(source, "rb")
+  if file then
+    local data = file:read("*a")
+    file:close()
+    if type(data) == "string" and data ~= "" then return data end
+  end
+  if love and love.filesystem then
+    local data = love.filesystem.read(source)
+    if type(data) == "string" and data ~= "" then return data end
+  end
+  return nil
+end
+
+local function cartSourceName(source)
+  if type(source) == "string" then
+    return source:match("([^/\\]+)$") or source
+  end
+  if source and source.getFilename then
+    return source:getFilename() or "cart"
+  end
+  return "cart"
+end
+
+local function handheldHost()
+  return os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+end
+
+function RomImporter:_installCartFile(source, version, batch)
+  local CartStore = require("src.carts.CartStore")
+  local name = cartSourceName(source)
+  local bytes = readCartSource(source)
+  if not bytes then
+    self._cartNotice = Strings("Could not read %s", name)
+    return false
+  end
+  local cart, err = CartStore.install(bytes)
+  if not cart then
+    self._cartNotice = Strings("That cart could not be imported: %s",
+      tostring(err))
+    return false
+  end
+  if batch then
+    if cart.base then batch[cart.base] = true end
+  else
+    if cart.base then self:_refreshCarts(cart.base) end
+    if version and version ~= cart.base then self:_refreshCarts(version) end
+  end
+  local title = tostring(cart.title or cart.id)
+  if version and cart.base and cart.base ~= version then
+    local info = GameVersion.info(cart.base)
+    self._cartNotice = Strings("Imported %s for %s.", title,
+      (info and info.displayName) or cart.base)
+  else
+    self._cartNotice = Strings("Imported %s. It is in this list now.", title)
+  end
+  return true, cart.id
+end
+
+function RomImporter:_openCartBrowser(version)
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit and Kit.FileBrowser then
+    self._padCursorActive = false
+    Kit.FileBrowser.open({
+      title = "Select Cart (.g1rcart)",
+      mode = "cart",
+      onSelect = function(pickedPath)
+        self:_installCartFile(pickedPath, version)
+      end,
+    })
+    return true
+  end
+  return false
+end
+
+local function cartInstalled(id)
+  local CartStore = require("src.carts.CartStore")
+  return love.filesystem.getInfo(CartStore.fileFor(id), "file") ~= nil
+end
+
+local function runCartScan(self, job)
+  for i, item in ipairs(job.items) do
+    job.index = i
+    local ok, id = self:_installCartFile(item.path, job.version, job.bases)
+    if ok then
+      job.anyOk = true
+      job.lastOk = self._cartNotice
+      if type(id) == "string" then saveReceipt(CARTS_RECEIPTS, job.receipts, item.stamp, id) end
+    else
+      job.fails = job.fails + 1
+      job.lastFail = self._cartNotice
+    end
+    coroutine.yield()
+  end
+end
+
+local function cartScanProgress(self, job)
+  local item = job.items[job.index + 1] or job.items[job.index]
+  if not item then return end
+  self._cartNotice = Strings("Importing %s (%d of %d) ...", item.name,
+    math.min(job.index + 1, #job.items), #job.items)
+  job.text = self._cartNotice
+end
+
+local function finishCartScan(self, job, err)
+  if err then
+    job.fails = job.fails + 1
+    job.lastFail = Strings("That cart could not be imported: %s", err)
+  end
+  if job.anyOk then
+    for base in pairs(job.bases) do self:_refreshCarts(base) end
+    if job.version and not job.bases[job.version] then self:_refreshCarts(job.version) end
+  end
+  if job.anyOk and job.lastFail then
+    self._cartNotice = Strings("%s (%d could not be imported.)", job.lastOk, job.fails)
+  elseif job.anyOk then
+    self._cartNotice = job.lastOk
+  else
+    self._cartNotice = job.lastFail
+  end
+end
+
+function RomImporter:rescanCartsAction(version)
+  if self.workState == "working" or self._inboxJob then return false end
+  self:ensureCartsInboxDir()
+  local candidates = self:scanCartsInbox()
+  if #candidates == 0 then
+    self:_setNxCartsInboxNotice()
+    return false
+  end
+  local receipts = loadReceipts(CARTS_RECEIPTS)
+  local items = {}
+  for _, path in ipairs(candidates) do
+    local stamp = inboxStamp(path)
+    local id = stamp and receipts[stamp]
+    if not (id and cartInstalled(id)) then
+      items[#items + 1] = { path = path, stamp = stamp, name = path:match("[^/]+$") or path }
     end
   end
-  for _, r in ipairs(self.modRects or {}) do
-    if inside(r, x, y) then
-      if self.android then
-        self:_toggleMod(r.id)
-      else
-        self._modPress = { id = r.id, y0 = y,
-          scroll0 = self.modScroll or 0, moved = false }
-      end
-      return
+  if #items == 0 then
+    self._cartNotice = Strings("Every .g1rcart in %s/ is already imported.", CARTS_INBOX_DIR)
+    return false
+  end
+  local job = self:_startInboxJob({ kind = "carts", tab = version, version = version,
+    items = items, receipts = receipts, bases = {}, fails = 0, anyOk = false,
+    progress = cartScanProgress, finish = finishCartScan }, runCartScan)
+  if self._inboxJob == job then return true end
+  return job.anyOk
+end
+
+function RomImporter:_cartImportButtonLabel()
+  if self:_inboxImport() then return Strings("Scan again") end
+  return Strings("Import .g1rcart")
+end
+
+-- "Import .g1rcart" on the Custom Carts modal. Same platform split as ROM,
+-- mod, and save import: NX and PS4 rescan imports/carts/, Android and iOS stage
+-- picked_cart.g1rcart through love.system.pickFile("cart"), UWP returns the
+-- pick from getPickedFile, handhelds use the in-launcher browser, and desktop
+-- opens the OS dialog (async on Windows so the window keeps drawing).
+function RomImporter:importCartFile(version)
+  if self:_importerPickPending() then return end
+  if self.workState == "working" then return false end
+  if self._hostPick then return false end
+  if self:_inboxImport() then
+    self:ensureCartsInboxDir()
+    return self:rescanCartsAction(version)
+  end
+  if self.nativePicker and love.system.getPickedFile then
+    if pickerHasKind("cart") and pickFile("cart") then
+      self.pickerPendingKind = "cart"
+      self.pickerPendingVersion = version
+      return true
+    end
+    self.pickerPendingKind = nil
+    local dir = self:cartsDir()
+    self._cartNotice = dir
+      and Strings("Drop .g1rcart files in %s, then reopen this list.", dir)
+      or Strings("Could not open the file picker.")
+    return false
+  end
+  if self.android then
+    local name = findPendingCart(true, self.pickSkip)
+    if name then
+      local installed = self:_installCartFile(name, version)
+      consumePick(self, name, PICKED_CART, installed)
+      return installed
+    end
+    local kind
+    if pickerHasKind("cart") then
+      kind = "cart"
+    elseif pickerHasKind("mod") or love.system.pickFileKinds == nil then
+      kind = "mod"
+    end
+    self.pickerPendingKind = "cart"
+    self.pickerPendingVersion = version
+    self.cartLegacyModPick = (kind == "mod") or nil
+    if kind and pickFile(kind) then
+      self.pickPending = true
+      self.pickTimer = 0
+      return true
+    end
+    self.pickerPendingKind, self.pickerPendingVersion = nil, nil
+    self.cartLegacyModPick = nil
+    local dir = love.filesystem.getSaveDirectory()
+    self._cartNotice = Strings(
+      "Could not open the file picker. Update the app, or copy a .g1rcart into:\n%s", dir)
+    return false
+  end
+  if handheldHost() and self:_openCartBrowser(version) then return true end
+  local FilePicker = require("src.core.FilePicker")
+  if love.system.getOS() == "Windows" and Platform.canSpawnProcess() then
+    local id = HostPicker.start(FilePicker.commands(
+      Strings("Choose a .g1rcart cart"), CART_PICK))
+    if id then
+      local notice = Strings(
+        "Choose a .g1rcart in the file dialog. The launcher waits until it closes.")
+      self._hostPick = { id = id, kind = "cart", version = version, notice = notice }
+      self._cartNotice = notice
+      return true
     end
   end
+  if FilePicker.available() then
+    local path = FilePicker.open(Strings("Choose a .g1rcart cart"), CART_PICK)
+    self:_resyncPointerAfterDialog()
+    if not path then return false end
+    return self:_installCartFile(path, version)
+  end
+  if self:_openCartBrowser(version) then return true end
+  local dir = self:cartsDir()
+  self._cartNotice = dir
+    and Strings("Drop .g1rcart files in %s, then reopen this list.", dir)
+    or Strings("No filesystem available to import from.")
+  return false
+end
+
+-- The real OS path of the cart folder, so the launcher can open it and so a
+-- player can drop a .cart in by hand.
+function RomImporter:cartsDir()
+  local CartStore = require("src.carts.CartStore")
+  local fs = love and love.filesystem
+  if not fs then return nil end
+  if fs.createDirectory then pcall(fs.createDirectory, CartStore.DIR) end
+  local base = fs.getSaveDirectory and fs.getSaveDirectory()
+  if not base or base == "" then return nil end
+  return base .. "/" .. CartStore.DIR
+end
+
+function RomImporter:fileUrl(path)
+  return fileUrl(path)
 end
 
 function RomImporter:keypressed(key)
+  if Transition.active() then return end
+  if self._hostPick then return end
+  local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+  if okKit then
+    if Kit.FileBrowser and Kit.FileBrowser.active then
+      if Kit.FileBrowser.keypressed(key) then return end
+    end
+    if Kit.VirtualKeyboard and Kit.VirtualKeyboard.active then
+      if Kit.VirtualKeyboard.keypressed(key) then return end
+    end
+  end
+  if self._boxPrompt then
+    local prompt = self._boxPrompt
+    if key == "backspace" then prompt.text = utf8Back(prompt.text)
+    elseif key == "return" or key == "kpenter" then require("src.import.BoxPrompt").close(self, true)
+    elseif key == "escape" then require("src.import.BoxPrompt").close(self, false)
+    end
+    return
+  end
+  if self._boxPopup and require("src.import.BoxUI").keypressed(self, key) then return end
+  if self.tab == "box" and require("src.import.BoxPanel").keypressed(self, key) then return end
+  if self._secretPopup then
+    if key == "return" or key == "kpenter" or key == "space" then
+      self:_confirmSecret()
+    end
+    return
+  end
+  if self._profileSavePrompt then
+    if key == "backspace" then
+      self._profileSavePrompt.text = utf8Back(self._profileSavePrompt.text or "")
+    elseif key == "return" or key == "kpenter" then
+      local txt = self._profileSavePrompt and self._profileSavePrompt.text
+      if txt and txt ~= "" then
+        local LauncherMods = require("src.mods.LauncherMods")
+        LauncherMods.saveProfile(txt)
+        self._profileSavePrompt = nil
+        self:_disarmTextInput()
+        if self._refreshMods then self:_refreshMods() end
+      end
+    elseif key == "escape" then
+      self._profileSavePrompt = nil
+      self:_disarmTextInput()
+    end
+    return
+  end
+  if self._profileRenamePrompt then
+    if key == "backspace" then
+      self._profileRenamePrompt.text = utf8Back(self._profileRenamePrompt.text or "")
+    elseif key == "return" or key == "kpenter" then
+      local txt = self._profileRenamePrompt and self._profileRenamePrompt.text
+      local old = self._profileRenamePrompt and self._profileRenamePrompt.oldName
+      if txt and txt ~= "" and old then
+        local LauncherMods = require("src.mods.LauncherMods")
+        LauncherMods.renameProfile(old, txt)
+        self._profileRenamePrompt = nil
+        self:_disarmTextInput()
+        if self._refreshMods then self:_refreshMods() end
+      end
+    elseif key == "escape" then
+      self._profileRenamePrompt = nil
+      self:_disarmTextInput()
+    end
+    return
+  end
+  if self._cartSave then
+    if key == "backspace" then
+      self._cartSave.text = utf8Back(self._cartSave.text)
+      self._cartSave.error = nil
+    elseif key == "return" or key == "kpenter" then
+      self:_commitCartSave()
+    elseif key == "escape" then
+      self:_cancelCartSave()
+    end
+    return
+  end
+  if self._settingsText then
+    if key == "backspace" then
+      self._settingsText.text = utf8Back(self._settingsText.text)
+    elseif key == "return" or key == "kpenter" then
+      self:_commitSettingsText()
+    elseif key == "escape" then
+      self._settingsText = nil
+      self:_disarmTextInput()
+    end
+    return
+  end
+  if self._settings then
+    if key == "escape" then
+      if self._settings.confirm then
+        self._settings.confirm = nil
+      else
+        self:_closeSettings()
+      end
+    end
+    return
+  end
+  if self._syncModal then
+    local field = self._syncFocus
+    if field then
+      local mo = self._syncModal
+      if key == "backspace" then
+        mo[field] = tostring(mo[field] or ""):sub(1, -2)
+      elseif key == "return" or key == "kpenter" or key == "escape" then
+        self._syncFocus = nil
+        self:_disarmTextInput()
+      elseif key == "v"
+          and love.keyboard.isDown("lctrl", "rctrl", "lgui", "rgui") then
+        self:_syncPaste()
+      end
+      return
+    end
+    if self._flex and require("src.import.LauncherView").keypressed(self, key) then
+      return
+    end
+    if key == "escape" then self:_closeSync() end
+    return
+  end
   if self._rename then
     if key == "backspace" then
       self._rename.text = utf8Back(self._rename.text)
@@ -1966,427 +6592,723 @@ function RomImporter:keypressed(key)
       self:_commitRename()
     elseif key == "escape" then
       self._rename = nil
+      self:_disarmTextInput()
     end
     return
   end
+  if self._indexPrompt then
+    if key == "backspace" then
+      self._indexPrompt.text = utf8Back(self._indexPrompt.text)
+    elseif key == "return" or key == "kpenter" then
+      self:_commitAddIndex()
+    elseif key == "escape" then
+      self._indexPrompt = nil
+      self:_disarmTextInput()
+    elseif key == "v" and (love.keyboard.isDown("lctrl", "rctrl", "lgui", "rgui")) then
+      -- an index URL is long and comes from a browser: typing it out by hand
+      -- is the difference between adding one and giving up
+      self:_pasteIndexUrl()
+    end
+    return
+  end
+  if self._modConfirm or self._modVersions or self._modReleaseNotes
+      or self._findDetails or self._appPatchNotes or self._idSyncResult then
+    -- Focus navigation belongs to the visible modal as well as the launcher
+    -- beneath it. Route arrows and an already-armed confirm before this guard
+    -- returns; unarmed Enter still falls through to the modal guard. Keep this
+    -- inside the modal branch so text fields retain exclusive keyboard input.
+    if self._flex and require("src.import.LauncherView").keypressed(self, key) then
+      return
+    end
+    if key == "escape" then
+      if self._findDetails then
+        self._findDetails = nil
+        self:_cancelFindDetails()
+      elseif self._modReleaseNotes then
+        self._modReleaseNotes = nil
+      elseif self._appPatchNotes then
+        self._appPatchNotes = nil
+      elseif self._idSyncResult then
+        self._idSyncResult = nil
+      else
+        self._modConfirm = nil
+        self._modVersions = nil
+      end
+    end
+    return
+  end
+  if self._saveExport or self._savePicker or self._modGames then
+    if key == "escape" then
+      self._saveExport, self._savePicker, self._modGames = nil, nil, nil
+    elseif self._flex then
+      require("src.import.LauncherView").keypressed(self, key)
+    end
+    return
+  end
+  if self._cartPopup then
+    if self._flex and require("src.import.LauncherView").keypressed(self, key) then
+      return
+    end
+    if key == "escape" then self._cartPopup = nil end
+    return
+  end
+  if self._bugModal and key == "escape" then
+    self:_closeBugPanel()
+    return
+  end
+  if self._pcPicker and key == "escape" and not self._onlineFocus then
+    require("src.import.OnlinePanel").pcClose(self)
+    return
+  end
+  if self._onlineFocus then
+    local OnlinePanel = require("src.import.OnlinePanel")
+    local st = OnlinePanel.state(self)
+    local field = self._onlineFocus
+    if key == "backspace" then
+      OnlinePanel.fieldBack(self, field)
+    elseif (key == "return" or key == "kpenter")
+        and field == OnlinePanel.PIN_FIELD then
+      OnlinePanel.pinSubmit(self)
+    elseif key == "return" or key == "kpenter" then
+      self:_commitOnlineField()
+    elseif key == "escape" and field == OnlinePanel.PIN_FIELD then
+      OnlinePanel.pinClose(self)
+    elseif key == "escape" then
+      self._onlineFocus = nil
+      st.nameDraft = nil
+      self:_disarmTextInput()
+    end
+    return
+  end
+  if self._skinUrlFocus then
+    if key == "backspace" then
+      self.skinUrl = utf8Back(self.skinUrl or "")
+    elseif key == "return" or key == "kpenter" then
+      self._skinUrlFocus = false
+      self:_disarmTextInput()
+      self:_addSkinFromUrl()
+    elseif key == "escape" then
+      self._skinUrlFocus = false
+      self:_disarmTextInput()
+    elseif key == "v" and love.keyboard.isDown("lctrl", "rctrl", "lgui", "rgui") then
+      self:_pasteSkinUrl()
+    end
+    return
+  end
+  if self._findSearchFocus then
+    if key == "backspace" then
+      self.findQuery = utf8Back(self.findQuery or "")
+      self.findScroll = 0
+    elseif key == "escape" or key == "return" or key == "kpenter" then
+      self._findSearchFocus = false
+      self:_disarmTextInput()
+    end
+    return
+  end
+  if key == "escape" and self.tab == "online" then
+    local okOnline, OnlinePanel = pcall(require, "src.import.OnlinePanel")
+    if okOnline and OnlinePanel.back(self) then return end
+  end
   if self.workState == "working" then return end
+  if self._flex and (key == "q" or key == "e") then
+    local okKit, Kit = pcall(require, "src.ui.kit.Kit")
+    local modal = require("src.import.LauncherView").modalKey(self)
+    if not (okKit and Kit.focus) and (modal == nil or modal == "_gamePopup") then
+      self:_cycleGame(key == "e" and 1 or -1)
+      return
+    end
+  end
+  -- Keyboard focus ring: arrows move it, Enter activates it -- but only once
+  -- the arrows have been used, so the long-standing "Enter plays the visible
+  -- game" shortcut below still works for anyone who never touches the ring.
+  if self._flex and require("src.import.LauncherView").keypressed(self, key) then
+    return
+  end
   if key == "return" or key == "space" or key == "kpenter" then
     -- Enter acts on the visible game tab: Play if its ROM is ready, otherwise
-    -- open its picker.  The mods / placeholder tabs have no keyboard action.
+    -- open its picker.  The mods tab has no keyboard action.
     local version = self.tab
-    if version == "red" or version == "blue" then
-      if self.ready[version] then self:play(version) else self:choose(version) end
+    if GameVersion.VERSIONS[version] then
+      if self.ready[version] then self:play(version) else self:_romAction(version) end
     end
   end
 end
 
--- ------- Redesign panel rendering (FirstRun.dc.html) ------------------------
--- These run inside draw(): they read the per-frame pointer through self:_hover
--- and self._s, and set the hit rects mousepressed dispatches (self.tabRects,
--- self.romButtonRect, self.playButtonRect, self.panelVersion).
-
-function RomImporter:_ptIn(r)
-  local mx, my = self._mx, self._my
-  return r and mx >= r.x and mx <= r.x + r.width and my >= r.y and my <= r.y + r.height
-end
-
-function RomImporter:_hover(r)
-  local hot = self._hoverEnabled and self:_ptIn(r) or false
-  if hot then self._anyHover = true end
-  return hot
-end
-
--- A glassy white-on-dark button (ROM import + the disabled SAVE FILES pair).
--- Returns its hit rect when live, or nil when disabled (inert).
-function RomImporter:_glassyButton(x, y, w, h, label, font, enabled)
-  local s = self._s
-  local r = 10 * s
-  love.graphics.setFont(font)
-  if enabled == false then
-    col(PAL.disabled, 0.25)
-    love.graphics.rectangle("fill", x, y, w, h, r, r)
-    love.graphics.setLineWidth(1)
-    col(PAL.disabledInk, 0.3)
-    love.graphics.rectangle("line", x, y, w, h, r, r)
-    col(PAL.disabledInk)
-    printfB(label, x, y + (h - font:getHeight()) / 2, w, "center")
-    return nil
+-- list, not index: index reads only the registry, so a .g1rcart dropped into
+-- the carts folder by hand would never appear.  list adopts strays and heals
+-- the registry, and this is cached per version so it parses once.
+function RomImporter:_refreshCarts(version)
+  local out = {}
+  local ok, rows = pcall(function()
+    return require("src.carts.CartStore").listFor(version)
+  end)
+  if ok and type(rows) == "table" then
+    for _, row in ipairs(rows) do out[#out + 1] = row end
   end
-  local rect = { x = x, y = y, width = w, height = h }
-  local hot = self:_hover(rect)
-  fillGradRounded(x, y, w, h, r, PAL.white, PAL.white, hot and 0.24 or 0.16, 0.04)
-  love.graphics.setLineWidth(1)
-  col(PAL.white, 0.18)
-  love.graphics.rectangle("line", x, y, w, h, r, r)
-  col(PAL.white)
-  printfB(label, x, y + (h - font:getHeight()) / 2, w, "center")
-  return rect
+  self.carts[version] = out
+  -- The FIND panel's installed-cart map spans every game, so it goes stale
+  -- on any cart change, not just this version's.
+  self._findCartMap = nil
+  return out
 end
 
--- The tall green Play button (ready) or a disabled placeholder.  Sets
--- self.playButtonRect.
-function RomImporter:_playButton(x, y, w, h, gameName, ready, locked)
-  local s, pulse = self._s, self.pulse
-  local r = 12 * s
-  love.graphics.setFont(self.playFont)
-  if ready then
-    local rect = { x = x, y = y, width = w, height = h }
-    local hot = self:_hover(rect)
-    local g = 0.5 + 0.5 * math.sin(pulse * 2 * math.pi / 2.4)
-    neonGlow(x, y, w, h, r, PAL.playTop, (0.7 + 0.25 * g) * (hot and 1.6 or 1))
-    fillGradRounded(x, y, w, h, r, PAL.playTop, PAL.playBot, 1, 1)
-    if hot then
-      love.graphics.setBlendMode("add")
-      love.graphics.setColor(1, 1, 1, 0.12)
-      love.graphics.rectangle("fill", x, y, w, h, r, r)
-      love.graphics.setBlendMode("alpha")
-    end
-    buttonShine(x, y, w, h, r, (pulse % 2.8) / 2.8)
-    local label = "Play " .. gameName
-    local tw = self.playFont:getWidth(label)
-    local tri = self.playFont:getHeight() * 0.55
-    local groupW = tri + 12 * s + tw
-    local gx = x + (w - groupW) / 2
-    local gy = y + h / 2
-    col(PAL.playInk)
-    love.graphics.polygon("fill", gx, gy - tri / 2, gx, gy + tri / 2, gx + tri * 0.9, gy)
-    printB(label, gx + tri + 12 * s, y + (h - self.playFont:getHeight()) / 2)
-    self.playButtonRect = rect
-  else
-    col(PAL.disabled, 0.3)
-    love.graphics.rectangle("fill", x, y, w, h, r, r)
-    love.graphics.setLineWidth(1)
-    col(PAL.disabledInk, 0.3)
-    love.graphics.rectangle("line", x, y, w, h, r, r)
-    col(PAL.disabledInk)
-    local label = locked and "Coming soon" or Strings("Import a ROM to play")
-    printfB(label, x, y + (h - self.playFont:getHeight()) / 2, w, "center")
-    self.playButtonRect = nil
+function RomImporter:_ensureCarts(version)
+  return self.carts[version] or self:_refreshCarts(version)
+end
+
+function RomImporter:_cartById(version, id)
+  if type(id) ~= "string" then return nil end
+  for _, row in ipairs(self:_ensureCarts(version)) do
+    if row.id == id then return row end
   end
+  return nil
 end
 
--- The R/B/Y/divider/MODS chip row.  Only the active tab shows its label +
--- underline; the rest are dimmed.  Rebuilds self.tabRects (chip squares).
-function RomImporter:_drawTabBar(x, y, w, h, chip)
-  local s, pulse = self._s, self.pulse
-  local tabs = {
-    { id = "red",    letter = "R", top = PAL.chipRedTop,  bot = PAL.chipRedBot,
-      under = PAL.red,    label = Strings("RED"),    ink = PAL.white },
-    { id = "blue",   letter = "B", top = PAL.chipBlueTop, bot = PAL.chipBlueBot,
-      under = PAL.blue,   label = Strings("BLUE"),   ink = PAL.white },
-    { id = "yellow", letter = "Y", top = PAL.chipGoldTop, bot = PAL.chipGoldBot,
-      under = PAL.gold,   label = Strings("YELLOW"), ink = PAL.chipInkGold },
-    { id = "mods",   mods = true,  top = PAL.chipModTop,  bot = PAL.chipModBot,
-      under = PAL.modDot, label = Strings("MODS") },
-  }
-  local gap = 10 * s
-  local r = 12 * s
-  local chipY = y + (h - chip) / 2 - 2 * s
-  local underY = y + h - 3 * s
-  local cursorX = x
-  for _, t in ipairs(tabs) do
-    if t.mods then
-      -- divider between the game chips and MODS
-      col(PAL.cardBorder, 0.25)
-      love.graphics.rectangle("fill", cursorX, y + (h - 34 * s) / 2,
-        math.max(1, 1 * s), 34 * s)
-      cursorX = cursorX + gap + 6 * s
-    end
-    local active = self.tab == t.id
-    -- chip body
-    fillGradRounded(cursorX, chipY, chip, chip, r, t.top, t.bot, 1, 1)
-    if t.mods then
-      local d = 5 * s
-      local gd = 3 * s
-      local grid = 3 * d + 2 * gd
-      local gx = cursorX + (chip - grid) / 2
-      local gy = chipY + (chip - grid) / 2
-      col(PAL.modDot)
-      for row = 0, 2 do
-        for c2 = 0, 2 do
-          love.graphics.rectangle("fill", gx + c2 * (d + gd), gy + row * (d + gd), d, d)
-        end
+function RomImporter:activeCartRow(version)
+  local id = self.activeCart[version]
+  if not id then return nil end
+  return self:_cartById(version, id)
+end
+
+function RomImporter:slotScope(version)
+  local id = self.activeCart[version]
+  if id then return CART_SCOPE .. id end
+  return version
+end
+
+function RomImporter:_selectCart(version, id)
+  self._cartPopup = nil
+  self._cartNotice = nil
+  self.cartFillNotice = nil
+  if id ~= nil and not self:_cartById(version, id) then return end
+  self.activeCart[version] = id
+  self._cartPlan = nil
+  -- the MODS panel answers for the cart now, so its cached rows are stale
+  self.mods, self._modSortCache, self._cartCaptureCache = nil, nil, nil
+  local scope = self:slotScope(version)
+  self.slots[scope] = nil
+  self.slotScroll[scope] = nil
+  if self._pages then self._pages["slots-" .. scope] = 1 end
+end
+
+function RomImporter:_cartSealSlot(version)
+  local id = self.activeCart and self.activeCart[version] or nil
+  if not id then return nil, nil end
+  local scope = self:slotScope(version)
+  self:_ensureSlots(scope)
+  local active = self.activeSlot[scope]
+  for _, slot in ipairs(self.slots[scope] or {}) do
+    if slot.id == active then return slot, scope end
+  end
+  return nil, scope
+end
+
+function RomImporter:cartPlan(version, listed)
+  local id = self.activeCart and self.activeCart[version] or nil
+  if not id then return nil, nil end
+  local slot = self:_cartSealSlot(version)
+  local broken = (slot and slot.sealBroken == true) or false
+  local key = table.concat(
+    { id, tostring(slot and slot.id), tostring(broken) }, "|")
+  local cached = self._cartPlan
+  if cached and cached.key == key then return cached.report, slot end
+  local installed = {}
+  pcall(function()
+    local rows = listed or require("src.mods.LauncherMods").list(version) or {}
+    for _, row in ipairs(rows) do
+      local manifest = type(row.manifest) == "table" and row.manifest or row
+      if type(manifest.id) == "string" then
+        installed[manifest.id] =
+          { id = manifest.id, version = manifest.version }
       end
-    else
-      love.graphics.setFont(self.chipFont)
-      col(t.ink)
-      printfB(t.letter, cursorX, chipY + (chip - self.chipFont:getHeight()) / 2, chip, "center")
     end
-    if not active then
-      col(PAL.bgBot, 0.62)
-      love.graphics.rectangle("fill", cursorX, chipY, chip, chip, r, r)
-    end
-    self.tabRects[#self.tabRects + 1] =
-      { x = cursorX, y = chipY, width = chip, height = chip, id = t.id }
-    local segEnd = cursorX + chip
-    if active then
-      love.graphics.setFont(self.tabLabelFont)
-      col(PAL.white)
-      local labelX = cursorX + chip + gap
-      local lw = printSpaced(self.tabLabelFont, t.label, labelX,
-        y + (h - self.tabLabelFont:getHeight()) / 2, 2 * s)
-      segEnd = labelX + lw
-      neonGlow(cursorX, underY, segEnd - cursorX, 3 * s, 2 * s, t.under, 0.45)
-      col(t.under)
-      love.graphics.rectangle("fill", cursorX, underY, segEnd - cursorX, 3 * s)
-    end
-    cursorX = segEnd + gap
-  end
-  -- "N of 3 ready" (Red + Blue count; Yellow never ready), hidden if no room
-  local ready = 0
-  for _, v in ipairs(GameVersion.ORDER) do if self.ready[v] then ready = ready + 1 end end
-  love.graphics.setFont(self.readyFont)
-  local label = Strings("%d of 3 ready", ready)
-  local lw = self.readyFont:getWidth(label)
-  if x + w - lw > cursorX + 8 * s then
-    col(PAL.labelGray)
-    love.graphics.print(label, x + w - lw, y + h - self.readyFont:getHeight() - 6 * s)
-  end
-  love.graphics.setLineWidth(1)
-  col(PAL.cardBorder, 0.22)
-  love.graphics.line(x, y + h, x + w, y + h)
+  end)
+  local ok, cart = pcall(function()
+    return require("src.carts.CartStore").get(id)
+  end)
+  if not ok or type(cart) ~= "table" then cart = nil end
+  local report = require("src.mods.Loader").planCart(cart, installed, broken)
+  report.id = id
+  self._cartPlan = { key = key, report = report }
+  return report, slot
 end
 
--- One version's game panel: header (name + status pill), then a responsive
--- two-column grid (left: ROM + SAVE FILES cards + Play; right: SAVE SLOT).
-function RomImporter:_drawGamePanel(version, x, y, w, h)
-  local s, pulse = self._s, self.pulse
-  self.panelVersion = version
-  local locked = version == "yellow"
-  local info = (not locked) and GameVersion.info(version) or nil
-  local gameName = locked and "Pokemon Yellow" or info.displayName
-  local ready = (not locked) and self.ready[version] or false
+function RomImporter:pressBreakSeal(version)
+  local slot, scope = self:_cartSealSlot(version)
+  if not scope then return false end
+  return self:pressDelete("seal", slot and slot.id or nil, scope, function()
+    self:breakCartSeal(version)
+  end)
+end
 
-  -- header: name + status pill
-  love.graphics.setFont(self.gameNameFont)
-  col(PAL.white)
-  printB(gameName, x, y)
-  local nameW = self.gameNameFont:getWidth(gameName)
-  local pill
-  if ready then pill = { text = "GOOD TO GO", c = PAL.green }
-  elseif locked then pill = { text = "COMING SOON", c = PAL.disabledInk }
-  else pill = { text = "ROM REQUIRED", c = PAL.gold } end
-  love.graphics.setFont(self.pillFont)
-  local pw = self.pillFont:getWidth(pill.text) + 24 * s
-  local ph = self.pillFont:getHeight() + 8 * s
-  local px = x + nameW + 14 * s
-  local py = y + (self.gameNameFont:getHeight() - ph) / 2
-  col(pill.c, 0.1)
-  love.graphics.rectangle("fill", px, py, pw, ph, ph / 2, ph / 2)
-  love.graphics.setLineWidth(1)
-  col(pill.c, 0.55)
-  love.graphics.rectangle("line", px, py, pw, ph, ph / 2, ph / 2)
-  col(pill.c)
-  printfB(pill.text, px, py + (ph - self.pillFont:getHeight()) / 2, pw, "center")
+function RomImporter:breakCartSeal(version)
+  local id = self.activeCart and self.activeCart[version] or nil
+  if not id then return false end
+  local SaveData = require("src.core.SaveData")
+  local scope = self:slotScope(version)
+  self:_ensureSlots(scope)
+  local slotId = self.activeSlot[scope]
+  if type(slotId) ~= "string" then
+    slotId = SaveData.createCartSlot(id)
+    if type(slotId) ~= "string" then return false end
+    SaveData.setActiveCartSlot(id, slotId)
+  end
+  local ok = SaveData.markSlotSealBroken(id, slotId)
+  self:_refreshSlots(scope)
+  self.activeSlot[scope] = slotId
+  self._cartPlan = nil
+  return ok and true or false
+end
 
-  local headerH = math.max(self.gameNameFont:getHeight(), ph)
-  local bodyTop = y + headerH + 14 * s
-  local bodyH = math.max(0, (y + h) - bodyTop)
+-- ------- installing the mods a cart pins
+--
+-- The other way out of a refusal: fetch every pin at the version the cart
+-- names, verified against the sha256 it recorded, instead of breaking the seal.
 
-  -- responsive grid: two columns when they comfortably fit, else stacked
-  local colGap = 18 * s
-  local twoCol = w >= (300 * s * 2 + colGap)
-  local colW = twoCol and (w - colGap) / 2 or w
-  local leftX = x
-  local rightX = twoCol and (x + colW + colGap) or x
+local function pinSameVersion(want, have)
+  local Semver = require("src.mods.Semver")
+  local order = Semver.compare(want, have)
+  if order ~= nil then return order == 0 end
+  return want == have
+end
 
-  -- ROM card contents by state (rehomes the existing import flow)
-  local dropHint = self.android and "Copy the .gb via USB."
-    or Strings("Or drop the .gb file here.")
-  local accent = locked and PAL.gold or (version == "red" and PAL.red or PAL.blue)
-  local romState, romDetail, romBtnLabel, romBtnEnabled, romProgress
-  if locked then
-    romState, romDetail = "Not supported yet", "Yellow support is on the way."
-    romBtnLabel, romBtnEnabled = "Import unavailable", false
-  else
-    local importing = self.importing == version
-    local erroring = self.workState == "error" and self.errorVersion == version
-    local notice = self.notice and self.notice.version == version and self.notice
-    if importing and (self.workState == "working" or self.workState == "complete") then
-      romState = self.status or "Importing"
-      romDetail = self.detail or ""
-      romProgress = self.progress or 0
-    elseif ready then
-      romState = self.romName[version] or Strings("ROM imported")
-      romDetail = "Verified."
-      romBtnLabel, romBtnEnabled = "Re-import ROM", true
-    elseif erroring then
-      romState = "Import failed"
-      romDetail = self.detail or Strings("That ROM could not be imported.")
-      romBtnLabel, romBtnEnabled = "Import ROM", true
-    elseif notice then
-      romState = "No ROM imported"
-      romDetail = trim((notice.status or "") .. " " .. (notice.detail or ""))
-      romBtnLabel, romBtnEnabled = "Import ROM", true
-    elseif self.returning[version] then
-      romState = "Update required"
-      romDetail = "This build needs a few more things from your "
-        .. info.label .. " ROM. Re-import to continue."
-      romBtnLabel, romBtnEnabled = "Re-import ROM", true
-    else
-      romState = "No ROM imported"
-      romDetail = "The ROM is verified before any files are created. " .. dropHint
-      romBtnLabel, romBtnEnabled = "Import ROM", true
+-- Why a pin cannot be fetched.  Only a github pin carries a repo, a version
+-- and an archive hash, which is all three things an install needs.
+local function pinUnresolvable(pin)
+  local source = type(pin) == "table" and pin.source or nil
+  if source == "gamebanana" then
+    return "is pinned to a GameBanana file, which the launcher cannot download"
+  end
+  if source == "local" then
+    return "is pinned to a copy on the machine that built the cart, so there is nothing to download"
+  end
+  if source ~= "github" then
+    return "carries no source the launcher can install from"
+  end
+  if type(pin.repo) ~= "string" or pin.repo == "" then
+    return "names no GitHub repository"
+  end
+  if type(pin.version) ~= "string" or pin.version == "" then
+    return "names no version to install"
+  end
+  if type(pin.sha256) ~= "string" or #pin.sha256 ~= 64 then
+    return "records no sha256, so its archive could not be verified"
+  end
+  return nil
+end
+
+-- The pins the player cannot satisfy: absent, or installed at some other
+-- version.  A mismatch needs the PINNED version, so it queues like a gap.
+function RomImporter:cartFillRows(version)
+  local report = self:cartPlan(version)
+  if type(report) ~= "table" then return {} end
+  local rows = {}
+  for _, row in ipairs(report.missing or {}) do
+    rows[#rows + 1] = { id = row.id, version = row.version,
+      pin = (report.pins or {})[row.id] }
+  end
+  for _, row in ipairs(report.mismatched or {}) do
+    rows[#rows + 1] = { id = row.id, version = row.version,
+      installed = row.installed, pin = (report.pins or {})[row.id] }
+  end
+  return rows
+end
+
+-- A configured index already knows where a mod's archive lives, so it saves a
+-- round trip -- but only when it points at exactly the pinned version.
+function RomImporter:_cartPinIndexRelease(row)
+  local mods = self.findIndex and self.findIndex.mods or nil
+  if type(mods) ~= "table" then return nil end
+  local ModIndex = require("src.mods.ModIndex")
+  for _, entry in ipairs(mods) do
+    if type(entry) == "table" and entry.id == row.id
+        and pinSameVersion(row.version, ModIndex.displayVersion(entry)) then
+      local release = ModIndex.releaseFor(entry)
+      if type(release) == "table" and release.zip and release.zip.url then
+        return release
+      end
     end
   end
+  return nil
+end
 
-  -- card metrics
-  local pad = 16 * s
-  local innerW = colW - 2 * pad
-  local labelH = self.labelFont:getHeight()
-  love.graphics.setFont(self.stateFont)
-  local _, stl = self.stateFont:getWrap(romState, innerW)
-  local stateH = math.max(1, #stl) * self.stateFont:getHeight()
-  love.graphics.setFont(self.hintFont)
-  local _, dtl = self.hintFont:getWrap(romDetail, innerW)
-  local detailH = math.max(1, #dtl) * self.hintFont:getHeight()
-  local btnH = math.max(40 * s, self.saveBtnFont:getHeight() + 22 * s)
-  local romCardH = pad + labelH + 10 * s + stateH + 5 * s + detailH + 14 * s + btnH + pad
+function RomImporter:pressInstallCartMods(version)
+  if self._cartFill or self._modInstall or self._cartInstall
+      or self._updateAll then return false end
+  local rows = self:cartFillRows(version)
+  if #rows == 0 then return false end
+  self.cartFillNotice = nil
+  self._cartFill = { version = version, rows = rows, index = 0,
+    installed = 0, failures = {}, stage = "next" }
+  self:_pumpCartFill()
+  return true
+end
 
-  -- SAVE FILES card: Import save is live once the ROM is imported (playable);
-  -- Export save is live only when the active slot actually holds a save.  The
-  -- locked yellow placeholder has no save backend, so both stay disabled.  The
-  -- hint line doubles as the last import/export outcome (green ok / red error).
-  local sfImportEnabled, sfExportEnabled = false, false
-  if not locked then
-    self:_ensureSlots(version)
-    sfImportEnabled = ready and true or false
-    local activeId = self.activeSlot[version]
-    for _, sl in ipairs(self.slots[version] or {}) do
-      if sl.id == activeId and sl.exists then sfExportEnabled = true; break end
+function RomImporter:_cartFillFailed(msg)
+  local job = self._cartFill
+  if not job then return end
+  local row = job.row
+  job.failures[#job.failures + 1] =
+    ("%s %s"):format(tostring(row and row.id or "?"), tostring(msg))
+  job.stage = "next"
+end
+
+function RomImporter:_finishCartFill()
+  local job = self._cartFill
+  self._cartFill = nil
+  self:_clearBusy()
+  -- Re-plan against what is on disk now, so the card answers for itself.
+  self._cartPlan = nil
+  pcall(self._refreshMods, self)
+  if not job then return end
+  if #job.failures == 0 then
+    self.cartFillNotice = { ok = true,
+      text = Strings("Installed %d of the mods this cart pins.", job.installed) }
+    return
+  end
+  self.cartFillNotice = { ok = false, failures = job.failures,
+    text = Strings("Installed %d of %d. %d could not be installed:",
+      job.installed, #job.rows, #job.failures) }
+end
+
+function RomImporter:_pumpCartFill()
+  local job = self._cartFill
+  if not job then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+
+  if job.stage == "next" then
+    job.index = job.index + 1
+    job.row = job.rows[job.index]
+    if not job.row then return self:_finishCartFill() end
+    local pin = job.row.pin
+    local why = pinUnresolvable(pin)
+    if why then return self:_cartFillFailed(why) end
+    local release = self:_cartPinIndexRelease(job.row)
+    if release then
+      job.release, job.stage = release, "install"
+      return
     end
-  end
-  local sfNotice = (not locked) and self.saveNotice[version] or nil
-  local sfHintText, sfHintCol
-  if sfNotice then
-    sfHintText, sfHintCol = sfNotice.text, (sfNotice.ok and PAL.green or PAL.red)
-  elseif locked then
-    sfHintText, sfHintCol = "Not available yet.", PAL.warning
-  elseif self.android then
-    sfHintText, sfHintCol =
-      "Import or export a .sav with the system file picker.", PAL.warning
-  else
-    sfHintText, sfHintCol =
-      "Import a .sav to a new slot, or export the active slot.", PAL.warning
+    job.fetch = ModUpdate.beginFetchReleases(pin.repo, job.row.id,
+      { force = true })
+    job.stage = "fetch"
+    self:_setBusy(Strings("Finding %s v%s", tostring(job.row.id),
+      tostring(job.row.version)))
+    return
   end
 
-  local sfBtnH = math.max(38 * s, self.saveBtnFont:getHeight() + 20 * s)
-  love.graphics.setFont(self.hintFont)
-  local _, sfHl = self.hintFont:getWrap(sfHintText, innerW)
-  local sfHintH = math.max(1, #sfHl) * self.hintFont:getHeight()
-  local sfFolderH = (sfNotice and sfNotice.dir) and (self.hintFont:getHeight() + 4 * s) or 0
-  local saveFilesH = pad + labelH + 10 * s + sfBtnH + 6 * s + sfHintH + sfFolderH + pad
-  local playH = math.max(50 * s, self.playFont:getHeight() + 30 * s)
-
-  -- vertical placement of the left column
-  local romY = bodyTop
-  local saveFilesY = romY + romCardH + 12 * s
-  local playY
-  if twoCol then
-    playY = bodyTop + bodyH - playH        -- pinned to the column's bottom
-  else
-    playY = saveFilesY + saveFilesH + 12 * s
-  end
-
-  -- ROM card
-  roundedCard(leftX, romY, colW, romCardH, 16 * s)
-  local ix, iy = leftX + pad, romY + pad
-  love.graphics.setFont(self.labelFont)
-  col(PAL.labelGray)
-  printSpaced(self.labelFont, "ROM", ix, iy, 2 * s)
-  iy = iy + labelH + 10 * s
-  love.graphics.setFont(self.stateFont)
-  col(PAL.white)
-  printfB(romState, ix, iy, innerW, "left")
-  iy = iy + stateH + 5 * s
-  love.graphics.setFont(self.hintFont)
-  col(PAL.detail)
-  love.graphics.printf(romDetail, ix, iy, innerW, "left")
-  iy = iy + detailH + 14 * s
-  if romProgress ~= nil then
-    local barH = math.max(8, 10 * s)
-    local track = iy + (btnH - barH) / 2
-    col(PAL.bgBot, 0.85)
-    love.graphics.rectangle("fill", ix, track, innerW, barH, barH / 2, barH / 2)
-    local pw2 = innerW * clamp(romProgress, 0, 1)
-    if pw2 > barH then
-      neonGlow(ix, track, pw2, barH, barH / 2, accent, 0.6)
-      col(accent)
-      love.graphics.rectangle("fill", ix, track, pw2, barH, barH / 2, barH / 2)
+  if job.stage == "fetch" then
+    local done, releases, err = ModUpdate.pumpFetchReleases(job.fetch)
+    if not done then return end
+    job.fetch = nil
+    if type(releases) ~= "table" then
+      return self:_cartFillFailed("could not be looked up: "
+        .. tostring(err or "release check failed"))
     end
-  else
-    self.romButtonRect =
-      self:_glassyButton(ix, iy, innerW, btnH, romBtnLabel, self.saveBtnFont, romBtnEnabled)
+    local pick
+    for _, rel in ipairs(releases) do
+      if type(rel) == "table" and pinSameVersion(job.row.version, rel.version) then
+        pick = rel
+        break
+      end
+    end
+    if not pick then
+      return self:_cartFillFailed(("has no release tagged v%s")
+        :format(tostring(job.row.version)))
+    end
+    if not (pick.zip and pick.zip.url) then
+      return self:_cartFillFailed(("v%s has no .zip asset")
+        :format(tostring(job.row.version)))
+    end
+    job.release, job.stage = pick, "install"
+    return
   end
 
-  -- SAVE FILES card: Import save (new slot) + Export save (active slot), with an
-  -- outcome/hint line under them and an open-folder affordance after an export.
-  roundedCard(leftX, saveFilesY, colW, saveFilesH, 16 * s)
-  ix, iy = leftX + pad, saveFilesY + pad
-  love.graphics.setFont(self.labelFont)
-  col(PAL.labelGray)
-  printSpaced(self.labelFont, "SAVE FILES", ix, iy, 2 * s)
-  iy = iy + labelH + 10 * s
-  local bGap = 10 * s
-  local halfW = (innerW - bGap) / 2
-  self.saveImportRect =
-    self:_glassyButton(ix, iy, halfW, sfBtnH, "Import save", self.saveBtnFont, sfImportEnabled)
-  self.saveExportRect = self:_glassyButton(ix + halfW + bGap, iy, halfW, sfBtnH,
-    "Export save", self.saveBtnFont, sfExportEnabled)
-  iy = iy + sfBtnH + 6 * s
-  love.graphics.setFont(self.hintFont)
-  col(sfHintCol)
-  love.graphics.printf(sfHintText, ix, iy, innerW, "left")
-  iy = iy + sfHintH
-  if sfNotice and sfNotice.dir then
-    iy = iy + 4 * s
-    love.graphics.setFont(self.hintFont)
-    local label = Strings("Open folder")
-    local lw = self.hintFont:getWidth(label)
-    local frect = { x = ix, y = iy, width = lw, height = self.hintFont:getHeight(),
-      dir = sfNotice.dir }
-    local fhot = self:_hover(frect)
-    col(fhot and PAL.linkHover or PAL.link)
-    love.graphics.print(label, ix, iy)
-    love.graphics.setLineWidth(1)
-    love.graphics.line(ix, iy + self.hintFont:getHeight() - 1, ix + lw,
-      iy + self.hintFont:getHeight() - 1)
-    self.saveFolderRect = frect
+  if job.stage == "install" then
+    if self._modInstall then return end
+    local row = job.row
+    job.stage = "installing"
+    self:_beginModInstall({
+      modId = row.id, name = row.id, release = job.release,
+      verb = "Installed", notice = "cart", sha256 = row.pin.sha256,
+      done = function(ok, text)
+        if ok then
+          job.installed = job.installed + 1
+          job.stage = "next"
+        else
+          self:_cartFillFailed(text)
+        end
+      end,
+    })
   end
+end
 
-  -- Play button
-  self:_playButton(leftX, playY, colW, playH, gameName, ready, locked)
-
-  -- SAVE SLOT card (right column, or stacked below Play when single-column).
-  -- The locked Yellow placeholder has no save backend (no GameVersion entry, so
-  -- no slots can exist); skip the panel entirely rather than draw an empty,
-  -- non-functional "+ New save slot" on a COMING SOON game.
-  if not locked then
-    if twoCol then
-      self:_drawSaveSlotPanel(version, rightX, bodyTop, colW, bodyH)
-    else
-      local slotY = playY + playH + 12 * s
-      local slotH = math.max(160 * s, (bodyTop + bodyH) - slotY)
-      self:_drawSaveSlotPanel(version, leftX, slotY, colW, slotH)
+function RomImporter:_restoreActiveCarts(opts)
+  local saved = opts and opts.activeCart
+  if type(saved) ~= "table" then return end
+  for version, id in pairs(saved) do
+    if GameVersion.VERSIONS[version] and type(id) == "string"
+        and self:_cartById(version, id) then
+      self.activeCart[version] = id
     end
   end
 end
 
--- Reload a version's slot list + active id from SaveData (the source of truth).
+local CART_RAIL = { red = "railRed", blue = "railBlue", yellow = "railGold",
+                    gold = "railAmber", silver = "railSilver", crystal = "railCrystal",
+                    firered = "railFireRed", leafgreen = "railLeafGreen",
+                    emerald = "railEmerald", ruby = "railRuby", sapphire = "railSapphire" }
+local CART_START_VERSION = "1.0.0"
+
+local function cartShellHex(version)
+  local Theme = require("src.ui.kit.Theme")
+  local col = Theme.PAL[CART_RAIL[version] or ""] or Theme.PAL.green
+  return ("#%02x%02x%02x"):format(col[1] or 0, col[2] or 0, col[3] or 0)
+end
+
+local function cartIdFromTitle(title)
+  local CartManifest = require("src.carts.CartManifest")
+  local id = tostring(title or ""):lower():gsub("[^%w]+", "_")
+  id = id:sub(1, CartManifest.MAX_ID):gsub("^_+", ""):gsub("_+$", "")
+  if id == "" then return nil end
+  return id
+end
+
+local function cartModRows(imp, version)
+  local LauncherMods = require("src.mods.LauncherMods")
+  local rows, kept = LauncherMods.list(version) or {}, {}
+  for _, row in ipairs(rows) do
+    if row.targetsHere ~= false then kept[#kept + 1] = row end
+  end
+  return kept
+end
+
+-- Every mod that targets this game, switched on or off: CartStore.capture
+-- pins the off ones too, so they are part of the cart it would write.
+function RomImporter:_cartCaptureCount(version)
+  if not GameVersion.VERSIONS[version] then return 0 end
+  local cache = self._cartCaptureCache
+  if cache and cache.version == version then return cache.n end
+  local n = #cartModRows(self, version)
+  self._cartCaptureCache = { version = version, n = n }
+  return n
+end
+
+function RomImporter:_cartAuthor()
+  local SaveData = require("src.core.SaveData")
+  local ok, opts = pcall(SaveData.loadOptions)
+  local sync = ok and type(opts) == "table" and opts.saveSync or nil
+  local label = type(sync) == "table" and sync.deviceLabel or nil
+  if type(label) == "string" and label:match("%S") then return label end
+  return Strings("Unknown")
+end
+
+function RomImporter:_cartSaveId()
+  local st = self._cartSave
+  if not st then return nil end
+  return cartIdFromTitle(st.text)
+end
+
+local function cartIdentity(st, id, title)
+  return { id = id, title = title, version = st.cartVersion,
+           author = st.author, base = st.version,
+           shell = st.shell, seal = "sealed" }
+end
+
+function RomImporter:_beginCartSave(version)
+  if not GameVersion.VERSIONS[version] then return end
+  local LauncherMods = require("src.mods.LauncherMods")
+  local CartStore = require("src.carts.CartStore")
+  local st = {
+    version = version, text = "", author = self:_cartAuthor(),
+    cartVersion = CART_START_VERSION, shell = cartShellHex(version),
+    mods = cartModRows(self, version),
+    modOptions = LauncherMods.modOptions(),
+    unresolved = {}, publishable = false,
+  }
+  st.count = #st.mods
+  local cart, unresolved = CartStore.capture(
+    cartIdentity(st, "preview", "Preview"), st.mods, st.modOptions)
+  if cart then
+    st.unresolved = unresolved or {}
+    local CartManifest = require("src.carts.CartManifest")
+    st.publishable = CartManifest.publishable(cart) and true or false
+  else
+    st.error = tostring(unresolved)
+  end
+  self._cartSave = st
+  self:_armTextInput()
+end
+
+function RomImporter:_cancelCartSave()
+  self._cartSave = nil
+  self:_disarmTextInput()
+end
+
+function RomImporter:_commitCartSave()
+  local st = self._cartSave
+  if not st then return end
+  local CartManifest = require("src.carts.CartManifest")
+  local CartStore = require("src.carts.CartStore")
+  local title = tostring(st.text or ""):match("^%s*(.-)%s*$")
+  if title == "" then
+    st.error = Strings("Type a title for this cart.")
+    return
+  end
+  local id = cartIdFromTitle(title)
+  if not id then
+    st.error = Strings("That title has no letters or numbers to build an id from.")
+    return
+  end
+  local existing = CartStore.get(id)
+  if existing then
+    st.error = Strings("%s already uses the id %s. Pick a different title.",
+      tostring(existing.title), id)
+    return
+  end
+  local cart, unresolved = CartStore.capture(
+    cartIdentity(st, id, title), st.mods, st.modOptions)
+  if not cart then
+    st.error = tostring(unresolved)
+    return
+  end
+  st.unresolved = unresolved or {}
+  st.publishable = CartManifest.publishable(cart) and true or false
+  local ok, err = CartStore.install(CartManifest.encode(cart))
+  if not ok then
+    st.error = tostring(err)
+    return
+  end
+  local version = st.version
+  self._cartSave = nil
+  self:_disarmTextInput()
+  self:_refreshCarts(version)
+  self._cartPopup = version
+  self._cartNotice = Strings("Saved %s. It is in this list now.", title)
+end
+
+function RomImporter:deleteCart(version, id, opts)
+  local fromFind = type(opts) == "table" and opts.from == "find"
+  if self.workState == "working" then
+    local busy = Strings("Wait for the current import to finish, then delete the cart.")
+    if fromFind then
+      self.findNotice = { ok = false, text = busy }
+    else
+      self._cartNotice = busy
+    end
+    return false
+  end
+  local CartStore = require("src.carts.CartStore")
+  local installed = fromFind and CartStore.get(id) or nil
+  if installed and installed.base then version = installed.base end
+  local ok, err = CartStore.uninstall(id)
+  if not ok then
+    if fromFind then
+      self.findNotice = { ok = false, text = tostring(err) }
+    else
+      self._cartNotice = tostring(err)
+    end
+    return false
+  end
+  if self.activeCart[version] == id then self:_selectCart(version, nil) end
+  self:_refreshCarts(version)
+  self._cartPlan = nil
+  local cartKey = "cart:" .. tostring(id)
+  for _, cache in ipairs({ self._cartridgeLabels or {}, self._gbaLabels or {} }) do
+    cache[cartKey] = nil
+    cache["gba:" .. cartKey] = nil
+  end
+  if fromFind then
+    self.findNotice = { ok = true,
+      text = Strings("Cart deleted. Its saves and installed mods were kept.") }
+    return true
+  end
+  self._cartPicker = nil
+  self._cartPopup = version
+  self._cartNotice = Strings("Cart deleted. Its saves and installed mods were kept.")
+  return true
+end
+
+function RomImporter:exportCart(id)
+  if self.workState == "working" then return end
+  local CartStore = require("src.carts.CartStore")
+  local SaveData = require("src.core.SaveData")
+  local bytes, err = CartStore.export(id)
+  if type(bytes) ~= "string" then
+    self._cartNotice = tostring(err or "that cart could not be read")
+    return
+  end
+  local fs = SaveData.portableFs() or (love and love.filesystem)
+  if not (fs and fs.write) then
+    self._cartNotice = Strings("No filesystem available to export to.")
+    return
+  end
+  if fs.createDirectory then
+    fs.createDirectory("exports")
+    fs.createDirectory("exports/carts")
+  end
+  local rel = "exports/carts/" .. id .. CartStore.EXT
+  local wrote, writeErr = fs.write(rel, bytes)
+  if not wrote then
+    self._cartNotice = Strings("Could not write the export: %s", tostring(writeErr))
+    return
+  end
+  local abs, portableBase = rel, SaveData.portableBaseDir()
+  if portableBase then
+    local sep = package.config:sub(1, 1)
+    abs = portableBase .. sep .. rel:gsub("/", sep)
+  else
+    local base = fs.getSaveDirectory and fs.getSaveDirectory() or ""
+    if base ~= "" then abs = base .. "/" .. rel end
+  end
+  if self:_inboxImport() then
+    local hint = RomImporter.mtpHintPath(love.filesystem.getSaveDirectory())
+    if hint ~= "" and hint:sub(-1) ~= "/" then hint = hint .. "/" end
+    self._cartNotice =
+      Platform.inboxTransfer() == "ftp" and Strings("Exported to %s\nget it over FTP (GoldHEN, port 2121)", abs)
+      or Strings("Exported to %s\nDBI MTP → 1: SD Card/%sexports/carts/", abs, hint)
+    return
+  end
+  if self.android then
+    local suggested = id .. CartStore.EXT
+    local staged = love.filesystem.write("pending_export.sav", bytes)
+    if staged and love.system.createFile
+        and love.system.createFile(suggested, love.filesystem.getSaveDirectory()) then
+      self.pickPending = true
+      self.pickTimer = 0
+      self.androidPendingCartExport = true
+      self._cartNotice = Strings("Pick where to save %s...", suggested)
+    else
+      self._cartNotice = Strings("Exported inside the app folder: %s", abs)
+    end
+    return
+  end
+  self._cartNotice = Strings("Exported to %s", abs)
+end
+
+-- Reload a scope's slot list + active id from SaveData (the source of truth).
 -- Cheap enough to call on any mutation; the per-frame draw only calls it lazily
 -- through _ensureSlots so a still list costs nothing after the first paint.
-function RomImporter:_refreshSlots(version)
+function RomImporter:_refreshSlots(scope)
   local SaveData = require("src.core.SaveData")
-  self.slots[version] = SaveData.listSlots(version) or {}
+  local cart = cartOfScope(scope)
+  if cart then
+    self.slots[scope] = SaveData.listCartSlots(cart) or {}
+    local opts = SaveData.loadOptions()
+    local reg = opts.cartSlots and opts.cartSlots[cart]
+    self.activeSlot[scope] =
+      reg and (reg.active or (reg.list and reg.list[1])) or nil
+    return
+  end
+  self.slots[scope] = SaveData.listSlots(scope) or {}
   local opts = SaveData.loadOptions()
-  local reg = opts.saveSlots and opts.saveSlots[version]
+  local reg = opts.saveSlots and opts.saveSlots[scope]
   -- fall back to the first slot as the shown "loaded" one when the registry
   -- has a list but no explicit active id (matches saveNames' own resolution)
-  self.activeSlot[version] = reg and (reg.active or reg.list[1]) or nil
+  self.activeSlot[scope] = reg and (reg.active or reg.list[1]) or nil
 end
 
-function RomImporter:_ensureSlots(version)
-  if not self.slots[version] then self:_refreshSlots(version) end
+function RomImporter:_ensureSlots(scope)
+  if not self.slots[scope] then self:_refreshSlots(scope) end
 end
 
 -- The host calls this when the save editor closes: the edited slot's player
@@ -2398,297 +7320,346 @@ end
 
 -- Point the active slot at id (persisted immediately, per the contract) and
 -- reflect it in the LOADED pill without a full relist.
-function RomImporter:_selectSlot(version, id)
-  require("src.core.SaveData").setActiveSlot(version, id)
-  self.activeSlot[version] = id
+function RomImporter:_selectSlot(scope, id)
+  local SaveData = require("src.core.SaveData")
+  local cart = cartOfScope(scope)
+  if cart then
+    SaveData.setActiveCartSlot(cart, id)
+  else
+    SaveData.setActiveSlot(scope, id)
+  end
+  self.activeSlot[scope] = id
+end
+
+function RomImporter:askIdSync(version)
+  local scope = self:slotScope(version)
+  self:_ensureSlots(scope)
+  local slotId = self.activeSlot[scope]
+  local slot
+  for _, row in ipairs(self.slots[scope] or {}) do
+    if row.id == slotId and row.exists then slot = row end
+  end
+  if not slot then
+    self._idSyncResult = { title = Strings("ID Sync"),
+      body = Strings("Pick your save first. Every save will use its trainer name and ID.") }
+    return
+  end
+  local SaveData = require("src.core.SaveData")
+  local TrainerIdSync = require("src.core.TrainerIdSync")
+  local cart = cartOfScope(scope)
+  local okRead, source = pcall(function()
+    if cart then return SaveData.readCartSlotSource(cart, slot.id) end
+    return SaveData.readSlotSource(scope, slot.id)
+  end)
+  local save = okRead and source and SaveData.decode(source) or nil
+  local profile = save and require("src.core.TrainerIdentity").profile(save,
+    TrainerIdSync.generationOf(save, version))
+  if not profile then
+    self._idSyncResult = { title = Strings("ID Sync"), body = Strings("This save needs a trainer name and ID before it can sync.") }
+    return
+  end
+  self._modConfirm = {
+    title = Strings("ID Sync"),
+    yesLabel = Strings("Sync"),
+    lines = {
+      Strings("Use %s · ID %05d across your saves?", profile.name, profile.id),
+      Strings("Your Pokemon get the same OT name and ID, including the secret ID in Gen 3. Party, PC, daycare and launcher Box are included."),
+      Strings("Shiny stays shiny. Personality only changes if needed; a Spinda's spots can change with it."),
+    },
+    onYes = function() self:_startIdSync(scope, slot.id) end,
+  }
+end
+
+function RomImporter:_startIdSync(scope, slotId)
+  local TrainerIdSync = require("src.core.TrainerIdSync")
+  local ok, job = pcall(TrainerIdSync.newJob, { scope = scope, slot = slotId })
+  if not ok then
+    self._idSyncResult = { title = Strings("ID Sync"), body = tostring(job) }
+    return
+  end
+  self._idSync = job
+  self._busy = { title = Strings("Syncing trainer identity"), detail = "", progress = 0 }
+end
+
+function RomImporter:_pumpIdSync()
+  local job = self._idSync
+  if not job then return end
+  local ok, done = pcall(job.step, job)
+  if ok and not done then
+    if self._busy then
+      self._busy.progress = job:progress()
+      local n = math.min(job.at, #job.entries)
+      self._busy.detail = job.phase == "read"
+        and Strings("Reading saves %d / %d", n, #job.entries)
+        or Strings("Preparing saves %d / %d", n, #job.entries)
+    end
+    return
+  end
+  self._idSync = nil
+  self:_clearBusy()
+  self.slots = {}
+  self._boxState = nil
+  if not ok or job.error then
+    self._idSyncResult = { title = Strings("ID Sync failed"), body = tostring(ok and job.error or done) }
+    return
+  end
+  local body = Strings("%s · ID %05d is now on your saves. %d save(s) updated.", job.target.name, job.newId, job.written)
+  if job.boxUpdated then body = body .. "\n" .. Strings("Launcher Box updated too.") end
+  if job.report.personalities > 0 then
+    body = body .. "\n" .. Strings("Shiny status kept. %d personality value(s) adjusted.", job.report.personalities)
+  end
+  if job.report.spinda > 0 then body = body .. "\n" .. Strings("%d Spinda spot pattern(s) changed.", job.report.spinda) end
+  if job.report.unknown > 0 then
+    body = body .. "\n" .. Strings("%d record(s) had no OT name, so their ownership couldn't be checked.", job.report.unknown)
+  end
+  local eng = (job.written > 0 or job.boxUpdated) and self:_syncEngine() or nil
+  if eng and eng.state.enabled and eng:linked() then
+    if eng:busy() then
+      eng:noteSaveWritten()
+    else
+      pcall(eng.syncNow, eng)
+    end
+    body = body .. "\n\n" .. Strings("Save sync is uploading the updated saves.")
+  end
+  self._idSyncResult = { title = Strings("ID Sync"), body = body }
 end
 
 -- Inline slot rename (#205): right-click arms a modal text field; Enter
 -- commits through SaveData.renameSlot (empty clears the label), Esc cancels.
 -- While it is up, keypressed/textinput/mousepressed all route here first.
 local MAX_SLOT_LABEL = 24
+-- Long enough for a Pages URL with a deep path; short enough that a paste of
+-- something that is not a URL at all cannot fill options.lua.
+local MAX_INDEX_URL = 200
+local MAX_FIND_QUERY = 48
 
-function RomImporter:_beginRename(version, id)
+-- Mobile LOVE only delivers love.textinput while setTextInput(true) is armed,
+-- and arming it is also what raises the soft keyboard, so a cabled USB
+-- keyboard is just as dead without it (#578).  Every site that opens one of
+-- the launcher's three text fields (_rename, _indexPrompt, _findSearchFocus)
+-- arms through here, and every site that closes one disarms.  Desktop has
+-- text input on by default and the save editor hosted from this launcher
+-- depends on it staying on (tools/save-editor/Kit.lua, #529), so disarm only
+-- lowers on mobile -- setTextInput is global SDL state, not per-widget.
+function RomImporter:_armTextInput()
+  if love.keyboard and love.keyboard.setTextInput then
+    pcall(love.keyboard.setTextInput, true)
+  end
+end
+
+function RomImporter:_disarmTextInput()
+  if not self.android then return end
+  if love.keyboard and love.keyboard.setTextInput then
+    pcall(love.keyboard.setTextInput, false)
+  end
+end
+
+function RomImporter:_focusOnlineField(key)
+  self._onlineFocus = key
+  local OnlinePanel = require("src.import.OnlinePanel")
+  local st = OnlinePanel.state(self)
+  if key == "online-name" then st.nameDraft = st.name or "" end
+  self:_armTextInput()
+end
+
+function RomImporter:_commitOnlineField()
+  local key = self._onlineFocus
+  self._onlineFocus = nil
+  self:_disarmTextInput()
+  if key ~= "online-name" then return end
+  local OnlinePanel = require("src.import.OnlinePanel")
+  local st = OnlinePanel.state(self)
+  OnlinePanel.setName(self, st.nameDraft or "")
+  st.nameDraft = nil
+end
+
+function RomImporter:playArena(version, cartId, spec)
+  if not version or not spec then return false end
+  self:_cancelInboxJob()
+  self._handedOff = true
+  resetPointerCursor(self)
+  if self._flex then require("src.import.LauncherView").detach(self) end
+  if self.onComplete then self.onComplete(version, cartId, { arena = spec }) end
+  return true
+end
+
+function RomImporter:_blurPanelFields()
+  local Kit = require("src.ui.kit.Kit")
+  if Kit.focus == "box-search" then Kit.blur() end
+  if self._pcPicker or self._pinModal then return end
+  if self._onlineFocus then
+    self:_commitOnlineField()
+    return
+  end
+  if not (self._findSearchFocus or self._skinUrlFocus) then return end
+  if self._boxPrompt or self._indexPrompt or self._rename or self._settingsText
+      or self._profileSavePrompt or self._profileRenamePrompt
+      or (self._syncModal and self._syncFocus) then
+    return
+  end
+  self._findSearchFocus = false
+  self._skinUrlFocus = false
+  self:_disarmTextInput()
+end
+
+function RomImporter:_beginRename(scope, id)
   local label
-  for _, slot in ipairs(self.slots[version] or {}) do
+  for _, slot in ipairs(self.slots[scope] or {}) do
     if slot.id == id then label = slot.label break end
   end
-  self._rename = { version = version, id = id, text = label or "" }
+  self._rename = { version = scope, id = id, text = label or "" }
   self._slotPress = nil -- cancel any armed click/drag on the list
+  self:_armTextInput()
 end
 
 function RomImporter:_commitRename()
   local r = self._rename
   if not r then return end
   self._rename = nil
-  require("src.core.SaveData").renameSlot(r.version, r.id, r.text)
+  self:_disarmTextInput()
+  local SaveData = require("src.core.SaveData")
+  local cart = cartOfScope(r.version)
+  if cart then
+    SaveData.renameCartSlot(cart, r.id, r.text)
+  else
+    SaveData.renameSlot(r.version, r.id, r.text)
+  end
   self:_refreshSlots(r.version)
 end
 
 function RomImporter:textinput(text)
+  if self._hostPick then return end
+  if self.tab == "box" then
+    local Kit = require("src.ui.kit.Kit")
+    if Kit.VirtualKeyboard.active and Kit.VirtualKeyboard.textinput(text) then return end
+    if self._boxPrompt then
+      local prompt = self._boxPrompt
+      prompt.text = utf8Cap(prompt.text .. text, prompt.maxLen)
+      return
+    end
+    if require("src.import.BoxPanel").textinput(self, text) then return end
+  end
+  if self._syncModal and self._syncFocus then
+    self:_syncTypeInto(self._syncFocus, text)
+    return
+  end
+  if self._profileSavePrompt then
+    self._profileSavePrompt.text = utf8Cap((self._profileSavePrompt.text or "") .. text, MAX_SLOT_LABEL)
+    return
+  end
+  if self._profileRenamePrompt then
+    self._profileRenamePrompt.text = utf8Cap((self._profileRenamePrompt.text or "") .. text, MAX_SLOT_LABEL)
+    return
+  end
+  if self._cartSave then
+    local CartManifest = require("src.carts.CartManifest")
+    self._cartSave.text =
+      utf8Cap(self._cartSave.text .. text, CartManifest.MAX_TITLE)
+    self._cartSave.error = nil
+    return
+  end
+  if self._settingsText then
+    local st = self._settingsText
+    st.text = utf8Cap(st.text .. text, st.maxLen or MAX_SLOT_LABEL)
+    return
+  end
+  if self._indexPrompt then
+    -- URLs never contain a literal space, and a pasted one usually arrives
+    -- with a stray newline attached
+    self._indexPrompt.text =
+      utf8Cap(self._indexPrompt.text .. text:gsub("%s", ""), MAX_INDEX_URL)
+    return
+  end
+  if self._onlineFocus then
+    local OnlinePanel = require("src.import.OnlinePanel")
+    if self._onlineFocus == "online-note" then
+      local st = OnlinePanel.state(self)
+      st.note = utf8Cap((st.note or "") .. text, OnlinePanel.NOTE_MAX)
+    else
+      OnlinePanel.fieldType(self, self._onlineFocus, text)
+    end
+    return
+  end
+  if self._skinUrlFocus then
+    self.skinUrl = utf8Cap((self.skinUrl or "") .. text:gsub("%s", ""),
+      MAX_SKIN_URL)
+    return
+  end
+  if self._findSearchFocus then
+    self.findQuery = utf8Cap((self.findQuery or "") .. text, MAX_FIND_QUERY)
+    self.findScroll = 0
+    return
+  end
   if not self._rename then return end
   self._rename.text = utf8Cap(self._rename.text .. text, MAX_SLOT_LABEL)
 end
 
+-- Clipboard into the index prompt, shared by ctrl/cmd+V and the prompt's
+-- on-screen PASTE button (#578).  Same rule as typed input: URLs never
+-- contain a literal space, and a pasted one usually arrives with a stray
+-- newline attached.
+function RomImporter:_pasteIndexUrl()
+  if not self._indexPrompt then return end
+  local ok, text = pcall(love.system.getClipboardText)
+  if ok and type(text) == "string" then
+    self._indexPrompt.text =
+      utf8Cap(self._indexPrompt.text .. text:gsub("%s", ""), MAX_INDEX_URL)
+  end
+end
+
 -- "+ New save slot": register an empty slot, make it active, relist, and pin the
 -- scroll to the bottom (clamped next draw) so the new row is on screen.
-function RomImporter:_newSlot(version)
+function RomImporter:_newSlot(scope)
   local SaveData = require("src.core.SaveData")
-  local id = SaveData.createSlot(version)
-  SaveData.setActiveSlot(version, id)
-  self:_refreshSlots(version)
-  self.activeSlot[version] = id
-  self.slotScroll[version] = math.huge
+  local cart = cartOfScope(scope)
+  local id
+  if cart then
+    id = SaveData.createCartSlot(cart)
+    if id then SaveData.setActiveCartSlot(cart, id) end
+  else
+    id = SaveData.createSlot(scope)
+    SaveData.setActiveSlot(scope, id)
+  end
+  self:_refreshSlots(scope)
+  self.activeSlot[scope] = id
+  self.slotScroll[scope] = math.huge
 end
 
--- Poll the pointer once per frame to drive drag-scroll + deferred click on the
--- save-slot list.  main.lua forwards neither move nor release events to the
--- launcher, so a press only ARMS a click (see mousepressed) and this resolves
--- it: a pointer that moved past the threshold scrolls; one that did not, on
--- release, selects.  Desktop only -- Android selects on press instead.
-function RomImporter:_updateSlotDrag()
-  if self.android then return end
-  local down = love.mouse.isDown(1)
-  local p = self._slotPress
-  if p then
-    if down then
-      local d = self._my - p.y0
-      if math.abs(d) > 4 * (self._s or 1) then p.moved = true end
-      if p.moved then
-        local maxS = (self._slotMax and self._slotMax[p.version]) or 0
-        self.slotScroll[p.version] = clamp(p.scroll0 - d, 0, maxS)
-      end
-    else
-      if not p.moved then self:_selectSlot(p.version, p.id) end
-      self._slotPress = nil
-    end
+function RomImporter:_duplicateSlot(scope, id)
+  if self.workState == "working" then return end
+  local SaveData = require("src.core.SaveData")
+  local cart = cartOfScope(scope)
+  local base
+  for _, slot in ipairs(self.slots[scope] or {}) do
+    if slot.id == id then base = slot.label or slot.name break end
   end
-  -- The same click-vs-drag resolution for the mods list: a moved pointer scrolls
-  -- the list, a still one toggles the armed mod on release.
-  local mp = self._modPress
-  if mp then
-    if down then
-      local d = self._my - mp.y0
-      if math.abs(d) > 4 * (self._s or 1) then mp.moved = true end
-      if mp.moved then
-        self.modScroll = clamp(mp.scroll0 - d, 0, self._modMax or 0)
-      end
-    else
-      if not mp.moved then self:_toggleMod(mp.id) end
-      self._modPress = nil
-    end
+  base = (type(base) == "string" and base ~= "") and base or tostring(id)
+  local label = utf8Cap(Strings("%s copy", utf8Cap(base, MAX_SLOT_LABEL - 5)),
+    MAX_SLOT_LABEL)
+  local newId, err
+  if cart then
+    newId, err = SaveData.duplicateCartSlot(cart, id, label)
+  else
+    newId, err = SaveData.duplicateSlot(scope, id, label)
   end
-end
-
--- Mouse wheel over a game tab scrolls its save-slot list (installed onto the
--- global love.wheelmoved in new(); see the chain there).  Clamped to the last
--- content extent draw computed for that version.
-function RomImporter:wheelmoved(_, dy)
-  local step = 48 * (self._s or 1)
-  if self.tab == "mods" then
-    local maxS = self._modMax or 0
-    if maxS <= 0 then return end
-    self.modScroll = clamp((self.modScroll or 0) - dy * step, 0, maxS)
+  if not newId then
+    self.saveNotice[scope] = { ok = false, text = tostring(err) }
     return
   end
-  local version = self.panelVersion
-  if not version or self.tab ~= version then return end
-  local maxS = (self._slotMax and self._slotMax[version]) or 0
-  if maxS <= 0 then return end
-  self.slotScroll[version] = clamp((self.slotScroll[version] or 0) - dy * step, 0, maxS)
+  self:_selectSlot(scope, newId)
+  self:_refreshSlots(scope)
+  self.activeSlot[scope] = newId
+  local eng = self:_syncEngine()
+  if eng then pcall(eng.noteSaveWritten, eng) end
+  self.saveNotice[scope] = { ok = true, text = Strings("Copied to %s.", label) }
 end
 
--- SAVE SLOT card: header ("SAVE SLOT" + "N slots"), a scrollable list of slot
--- rows (name + meta, LOADED pill on the active one), and a dashed "+ New save
--- slot" button pinned to the bottom.  Empty registries show a dashed hint box.
-function RomImporter:_drawSaveSlotPanel(version, x, y, w, h)
-  local s = self._s
-  local pad = 16 * s
-  roundedCard(x, y, w, h, 16 * s)
-  self:_ensureSlots(version)
-  local slots = self.slots[version] or {}
-  local active = self.activeSlot[version]
-  local n = #slots
-
-  -- header: "SAVE SLOT" (left) + "N slots" / "1 slot" (right)
-  love.graphics.setFont(self.labelFont)
-  col(PAL.labelGray)
-  printSpaced(self.labelFont, "SAVE SLOT", x + pad, y + pad, 2 * s)
-  local countTxt = (n == 1) and "1 slot" or (n .. " slots")
-  local cw = self.labelFont:getWidth(countTxt)
-  love.graphics.print(countTxt, x + w - pad - cw, y + pad)
-
-  local labelH = self.labelFont:getHeight()
-  local listTop = y + pad + labelH + 12 * s
-
-  -- "+ New save slot" pinned to the card bottom; the list fills the gap above.
-  local newBtnH = math.max(38 * s, self.saveBtnFont:getHeight() + 18 * s)
-  local newBtnY = y + h - pad - newBtnH
-  local listBottom = newBtnY - 10 * s
-  local listH = math.max(0, listBottom - listTop)
-  local rx, rw = x + pad, w - 2 * pad
-
-  if n == 0 then
-    -- empty state: a dashed box with the centred hint
-    love.graphics.setLineWidth(math.max(1, 1 * s))
-    col(PAL.cardBorder, 0.45)
-    dashedRoundRect(rx, listTop, rw, listH, 12 * s, 7 * s, 5 * s)
-    love.graphics.setFont(self.hintFont)
-    col(PAL.warning)
-    love.graphics.printf("No saves yet - start a new game or import one.",
-      rx + 12 * s, listTop + listH / 2 - self.hintFont:getHeight() / 2,
-      rw - 24 * s, "center")
-    self.slotRects = {}
-    self.slotDeleteRects = {}
-    self.slotEditRects = {}
-  elseif listH > 0 then
-    local nameH = self.slotNameFont:getHeight()
-    local metaH = self.labelFont:getHeight()
-    local rowPadV = 10 * s
-    local rowH = rowPadV * 2 + nameH + 4 * s + metaH
-    local rowGap = 8 * s
-    local rr = 12 * s
-
-    -- clamp scroll against the current content extent, and stash the max so the
-    -- wheel handler (which has no geometry) can clamp against the same value
-    local totalH = n * rowH + (n - 1) * rowGap
-    local maxScroll = math.max(0, totalH - listH)
-    self._slotMax = self._slotMax or {}
-    self._slotMax[version] = maxScroll
-    local scroll = clamp(self.slotScroll[version] or 0, 0, maxScroll)
-    self.slotScroll[version] = scroll
-
-    self.slotRects = {}
-    self.slotDeleteRects = {}
-    self.slotEditRects = {}
-    love.graphics.setScissor(math.floor(rx), math.floor(listTop),
-      math.ceil(rw), math.ceil(listH))
-    for i, slot in ipairs(slots) do
-      local ry = listTop - scroll + (i - 1) * (rowH + rowGap)
-      if ry + rowH >= listTop and ry <= listBottom then
-        local selected = slot.id == active
-        if selected then neonGlow(rx, ry, rw, rowH, rr, PAL.green, 0.5) end
-        fillGradRounded(rx, ry, rw, rowH, rr, PAL.slotBg, PAL.slotBg, 0.6, 0.6)
-        love.graphics.setLineWidth(math.max(1, (selected and 1.5 or 1) * s))
-        col(selected and PAL.green or PAL.cardBorder, selected and 0.9 or 0.22)
-        love.graphics.rectangle("line", rx, ry, rw, rowH, rr, rr)
-
-        -- Delete label (bottom-right); reserve its width so name/meta don't overlap
-        love.graphics.setFont(self.hintFont)
-        local delText = "Delete"
-        local delW = self.hintFont:getWidth(delText)
-        local delH = self.hintFont:getHeight()
-        local delX = rx + rw - 12 * s - delW
-        local delY = ry + rowH - rowPadV - delH
-        local drect = { x = delX - 6 * s, y = delY - 4 * s,
-          width = delW + 12 * s, height = delH + 8 * s, id = slot.id }
-        local dhot = self:_hover(drect)
-        col(dhot and PAL.red or PAL.warning)
-        love.graphics.print(delText, delX, delY)
-        local rightReserve = delW + 18 * s
-
-        -- Edit label, immediately left of Delete: opens the bundled save
-        -- editor (tools/save-editor) on this slot's file.  Only drawn when the
-        -- host supplied onEditSave and the slot actually holds a save -- there
-        -- is nothing to edit in an empty slot, and offering it would open the
-        -- editor on a new-game stub the player never asked for.
-        local erect = nil
-        if self.onEditSave and slot.exists then
-          local edText = "Edit"
-          local edW = self.hintFont:getWidth(edText)
-          local edX = delX - 14 * s - edW
-          erect = { x = edX - 6 * s, y = delY - 4 * s,
-            width = edW + 12 * s, height = delH + 8 * s, id = slot.id }
-          local ehot = self:_hover(erect)
-          col(ehot and PAL.blue or PAL.warning)
-          love.graphics.print(edText, edX, delY)
-          rightReserve = rightReserve + edW + 20 * s
-        end
-
-        -- LOADED pill (top-right of the active row), then reserve its width
-        local pillW = 0
-        if selected then
-          love.graphics.setFont(self.warningFont)
-          local pText = "LOADED"
-          local pw = self.warningFont:getWidth(pText) + 14 * s
-          local ph = self.warningFont:getHeight() + 6 * s
-          local ppx = rx + rw - 12 * s - pw
-          local ppy = ry + rowPadV
-          col(PAL.green)
-          love.graphics.rectangle("fill", ppx, ppy, pw, ph, ph / 2, ph / 2)
-          col(PAL.playInk)
-          printfB(pText, ppx, ppy + (ph - self.warningFont:getHeight()) / 2, pw, "center")
-          pillW = pw + 10 * s
-        end
-
-        love.graphics.setFont(self.slotNameFont)
-        col(PAL.white)
-        -- a custom label (#205) wins over the player name; both ellipsize
-        local name = slot.label or slot.name or Strings("NEW GAME")
-        printB(ellipsize(self.slotNameFont, name, rw - 24 * s - math.max(pillW, rightReserve)),
-          rx + 12 * s, ry + rowPadV)
-
-        local metaTxt
-        if slot.exists and slot.meta then
-          metaTxt = Strings("%d badges - %s - %d caught", slot.meta.badges or 0, slot.meta.timeText or "0:00",
-            slot.meta.dexCount or 0)
-        else
-          metaTxt = "empty slot"
-        end
-        love.graphics.setFont(self.labelFont)
-        col(PAL.warning)
-        love.graphics.print(ellipsize(self.labelFont, metaTxt, rw - 24 * s - rightReserve),
-          rx + 12 * s, ry + rowPadV + nameH + 4 * s)
-
-        -- clip the hit rect to the visible list band so a partly-scrolled row
-        -- is only clickable where it actually shows
-        local vy = math.max(ry, listTop)
-        local vy2 = math.min(ry + rowH, listBottom)
-        if vy2 > vy then
-          self.slotRects[#self.slotRects + 1] =
-            { x = rx, y = vy, width = rw, height = vy2 - vy, id = slot.id }
-        end
-        local dvy = math.max(drect.y, listTop)
-        local dvy2 = math.min(drect.y + drect.height, listBottom)
-        if dvy2 > dvy then
-          self.slotDeleteRects[#self.slotDeleteRects + 1] =
-            { x = drect.x, y = dvy, width = drect.width, height = dvy2 - dvy, id = slot.id }
-        end
-        if erect then
-          local evy = math.max(erect.y, listTop)
-          local evy2 = math.min(erect.y + erect.height, listBottom)
-          if evy2 > evy then
-            self.slotEditRects[#self.slotEditRects + 1] =
-              { x = erect.x, y = evy, width = erect.width, height = evy2 - evy,
-                id = slot.id }
-          end
-        end
-      end
-    end
-    love.graphics.setScissor()
-
-    -- thin scrollbar thumb when the list overflows
-    if maxScroll > 0 then
-      local trackH = listH
-      local thumbH = math.max(24 * s, trackH * (listH / totalH))
-      local thumbY = listTop + (trackH - thumbH) * (scroll / maxScroll)
-      col(PAL.cardBorder, 0.35)
-      love.graphics.rectangle("fill", rx + rw - 3 * s, thumbY, 3 * s, thumbH,
-        1.5 * s, 1.5 * s)
-    end
-  end
-
-  -- "+ New save slot" (dashed, transparent) pinned to the bottom
-  local nrect = { x = rx, y = newBtnY, width = rw, height = newBtnH }
-  local nhot = self:_hover(nrect)
-  love.graphics.setLineWidth(math.max(1, 1.4 * s))
-  col(PAL.cardBorder, nhot and 0.7 or 0.45)
-  dashedRoundRect(nrect.x, nrect.y, nrect.width, nrect.height, 10 * s, 6 * s, 5 * s)
-  love.graphics.setFont(self.saveBtnFont)
-  col(PAL.detail, nhot and 1 or 0.9)
-  printfB("+ New save slot", nrect.x,
-    nrect.y + (newBtnH - self.saveBtnFont:getHeight()) / 2, nrect.width, "center")
-  self.newSlotRect = nrect
+-- Mouse wheel: forwarded into the FlexLove view (installed onto the global
+-- love.wheelmoved in new(); see the chain there).  Scroll containers and the
+-- modal scrollers all resolve inside the toolkit.
+function RomImporter:wheelmoved(dx, dy)
+  if not self._flex then return end
+  require("src.import.LauncherView").wheelmoved(self, dx, dy)
 end
 
 -- Reload the mods list from LauncherMods (the source of truth: it reads the
@@ -2697,245 +7668,2108 @@ end
 -- so a still list costs nothing after the first paint.
 function RomImporter:_refreshMods()
   local LauncherMods = require("src.mods.LauncherMods")
-  self.mods = LauncherMods.list() or {}
+  local SaveData = require("src.core.SaveData")
+  self._cartPlan = nil
+  self._profileCache = nil
+  self._cartCaptureCache = nil
+  self.findInstalled = nil
+  self.safeMode = SaveData.isSafeMode(SaveData.loadOptions())
+  -- Once per session, ahead of the first listing: pull in any mod the player
+  -- unzipped beside the executable, which an ordinary (non-portable) install
+  -- has no way to read.  It happens here rather than behind a button because
+  -- the failure being fixed is one where nothing on screen suggests there is
+  -- anything to press -- the panel just comes up empty.  Guarded so a toggle
+  -- or a delete does not re-scan; adoptStrays is idempotent regardless.
+  if not self.modStraysChecked then
+    self.modStraysChecked = true
+    local imported, failed = {}, {}
+    for _, s in ipairs(LauncherMods.adoptStrays() or {}) do
+      table.insert(s.err and failed or imported, s.id)
+    end
+    -- the failure wins the notice: an import that worked speaks for itself in
+    -- the list right below it, one that did not is the only word they get
+    if #imported > 0 then
+      self.modNotice = { ok = true,
+        text = "Imported from the game folder: " .. table.concat(imported, ", ") }
+    end
+    if #failed > 0 then
+      self.modNotice = { ok = false,
+        text = "Found beside the game but could not import: "
+               .. table.concat(failed, ", ") }
+    end
+  end
+  local listed = LauncherMods.list(self.modScope) or {}
+  self.mods = listed
+  if self.modScope then
+    local kept = {}
+    for _, m in ipairs(listed) do
+      if m.targetsHere ~= false then kept[#kept + 1] = m end
+    end
+    self.mods = kept
+    self._cartCaptureCache = { version = self.modScope, n = #kept }
+  end
+  -- a pin is judged against the whole listing: the cart named it, so it is
+  -- listed even where the game filter above would have dropped it
+  local cartId, report = self:modCartPlan(listed)
+  if cartId then self.mods = self:_cartPinRows(cartId, report, listed) end
+end
+
+-- The cart the MODS panel is answering for, with the plan that resolves its
+-- pins, or nil when the panel is on a base game.
+function RomImporter:modCartPlan(listed)
+  local version = self.modScope
+  if not version then return nil end
+  local id = self.activeCart and self.activeCart[version] or nil
+  if not id then return nil end
+  local report = self:cartPlan(version, listed)
+  if type(report) ~= "table" or type(report.pins) ~= "table" then return nil end
+  return id, report, version
+end
+
+function RomImporter:cartPinsNote(cartId, cartReport)
+  if not cartId then return nil end
+  return Strings(
+    "%s decides which mods run. Switch its pins one at a time, or pick the base game above.",
+    (cartReport and cartReport.title) or cartId)
+end
+
+local function missingPinRow(imp, id, pin)
+  local version = type(pin) == "table" and pin.version or nil
+  return { id = id, name = id, version = version, badge = "MOD",
+           description = "", enabled = false, status = "missing",
+           statusDetail = Strings("Pinned by this cart but not installed"),
+           experimental = false, targetsHere = true,
+           manifest = { id = id, version = version },
+           dependencySpecs = {}, requiredImports = {}, imports = {},
+           missingRequiredImports = 0, missingOptionalImports = 0,
+           safeMode = imp.safeMode == true, cartMissing = true }
+end
+
+-- The pinned set, resolved exactly as Loader:_applyCart resolves it: the
+-- cart's own switch, overridden by the player's answer only where the seal
+-- hands that switch over (Loader.pinTogglable).
+function RomImporter:_cartPinRows(cartId, report, rows)
+  local CartManifest = require("src.carts.CartManifest")
+  local Loader = require("src.mods.Loader")
+  local SaveData = require("src.core.SaveData")
+  local byId = {}
+  for _, row in ipairs(rows or {}) do byId[row.id] = row end
+  local options = SaveData.loadOptions()
+  local out = {}
+  for _, id in ipairs(report.order or {}) do
+    local pin = report.pins[id]
+    local source = byId[id]
+    -- a copy: the listing's own row still answers for the base game
+    local row = {}
+    if source then
+      for key, value in pairs(source) do row[key] = value end
+      row.cartMissing = nil
+    else
+      row = missingPinRow(self, id, pin)
+    end
+    local togglable = Loader.pinTogglable(report, pin)
+    local on = CartManifest.modEnabled(pin)
+    if togglable then
+      local chosen = SaveData.cartModEnabled(options, cartId, id)
+      if type(chosen) == "boolean" then on = chosen end
+    end
+    row.cartId, row.cartSeal = cartId, report.seal
+    row.cartTitle = report.title or cartId
+    row.cartPin, row.cartTogglable = true, togglable and not row.cartMissing
+    row.cartBase = self.modScope
+    -- a pin nothing provides cannot run, whatever the cart asked for
+    row.enabled = on and not self.safeMode and not row.cartMissing
+    -- one cart, one game: the per-game checkbox row is not this row's answer
+    row.enabledByVersion = nil
+    out[#out + 1] = row
+  end
+  return out
+end
+
+-- Point the MODS panel at one game (or nil for all of them) and relist, so
+-- every row's status is answered for that game.
+function RomImporter:_setModScope(version)
+  self.modScope = GameVersion.VERSIONS[version] and version or nil
+  self:_refreshMods()
 end
 
 function RomImporter:_ensureMods()
   if not self.mods then self:_refreshMods() end
 end
 
--- Flip a mod's enabled flag (persisted via LauncherMods.setEnabled) and relist
--- so the toggle, count, and every status chip reflect the new resolution.
-function RomImporter:_toggleMod(id)
-  local LauncherMods = require("src.mods.LauncherMods")
-  local cur = false
+-- Resolve GitHub status for every installed mod that declares a github field.
+-- This is deliberately opt-in: only the explicit "Check for updates" action
+-- calls it. Opening, scrolling, toggling, or relisting the MODS tab must not
+-- create a burst of release work behind the list. force=true bypasses the 6h
+-- cache on every repo. Results live on self.modUpdateInfo[id] = {
+-- status, latest, best, releases } and resolve asynchronously across frames.
+function RomImporter:_syncModUpdateInfo(force)
+  local ModUpdate = require("src.mods.ModUpdate")
+  self.modUpdateInfo = self.modUpdateInfo or {}
+  local pending = {}
   for _, m in ipairs(self.mods or {}) do
-    if m.id == id then cur = m.enabled; break end
+    if m.github and m.github ~= "" then
+      pending[#pending + 1] = { mod = m,
+        h = ModUpdate.beginFetchReleases(m.github, m.id, { force = force == true }) }
+    else
+      self.modUpdateInfo[m.id] = nil
+    end
   end
-  LauncherMods.setEnabled(id, not cur)
+  self._modInfoFetch = (#pending > 0) and pending or nil
+  -- Bump immediately so a mod that lost its github field (or a list that
+  -- shrank) is reflected without waiting on the network.
+  self._modUpdateRev = (self._modUpdateRev or 0) + 1
+end
+
+-- Drive in-flight release checks one frame at a time.  Called from update().
+-- Deliberately NOT behind the blocking overlay: this is background enrichment
+-- of rows that are already usable, so the list stays interactive while the
+-- download counts and update badges fill in.  Individual rows show their own
+-- inline spinner instead.
+function RomImporter:_pumpModInfoFetch()
+  local pending = self._modInfoFetch
+  if not pending then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local remaining, changed = {}, false
+  for _, item in ipairs(pending) do
+    local m = item.mod
+    local ok, done, releases, err = pcall(ModUpdate.pumpFetchReleases, item.h)
+    if not ok then
+      self.modUpdateInfo[m.id] = { status = "error", err = tostring(done) }
+      changed = true
+    elseif done then
+      changed = true
+      if releases then
+        local status, best = ModUpdate.statusFor(m.version, releases)
+        local cached = ModUpdate.readCache(m.github)
+        self.modUpdateInfo[m.id] = {
+          status = status,
+          latest = best and best.version or nil,
+          best = best,
+          releases = releases,
+          downloads = ModUpdate.totalDownloads(releases),
+          dates = ModUpdate.releaseDates(releases),
+          err = nil,
+          checkedAt = (cached and cached.checkedAt) or os.time(),
+        }
+      else
+        self.modUpdateInfo[m.id] = {
+          status = "error", latest = nil, best = nil, releases = nil,
+          err = tostring(err),
+        }
+      end
+    else
+      remaining[#remaining + 1] = item
+    end
+  end
+  self._modInfoFetch = (#remaining > 0) and remaining or nil
+  if changed then
+    -- Bump so the view's sorted-list cache (keyed on this revision) rebuilds
+    -- when release/download data actually changes, not every frame.
+    self._modUpdateRev = (self._modUpdateRev or 0) + 1
+  end
+end
+
+-- True while any mod's release check is still in flight, so a row can show
+-- an inline spinner instead of "Not checked for updates yet".
+function RomImporter:_modInfoPending(id)
+  for _, item in ipairs(self._modInfoFetch or {}) do
+    if item.mod.id == id then return true end
+  end
+  return false
+end
+
+function RomImporter:_modUpdateInfo(id)
+  return self.modUpdateInfo and self.modUpdateInfo[id] or nil
+end
+
+function RomImporter:_rejudgeModUpdate(id, fallbackVersion)
+  if type(id) ~= "string" then return end
+  local info = self:_modUpdateInfo(id)
+  local releases = info and info.releases
+  if type(releases) ~= "table" or #releases == 0 then return end
+  local installed
+  for _, m in ipairs(self.mods or {}) do
+    if m.id == id then installed = m.version break end
+  end
+  installed = installed or fallbackVersion
+  if type(installed) ~= "string" or installed == "" then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local status, best = ModUpdate.statusFor(installed, releases)
+  info.status = status
+  info.latest = best and best.version or nil
+  info.best = best
+  info.err = nil
+  self._modUpdateRev = (self._modUpdateRev or 0) + 1
+  for _, item in ipairs(self._modInfoFetch or {}) do
+    if item.mod and item.mod.id == id then item.mod.version = installed end
+  end
+end
+
+-- Flip one game's mod flag (persisted via LauncherMods.setEnabled) and relist
+-- so that game's checkbox and status chips reflect the new resolution.
+-- Enabling an experimental mod arms a confirmation for that same game.
+function RomImporter:_toggleMod(id, confirmed, version)
+  if self.safeMode then
+    self.modNotice = { ok = false, text = "Safe mode is active. Turn it off in the Bug tab to change mods." }
+    return
+  end
+  local cartId, cartReport = self:modCartPlan()
+  if cartId then
+    self:_toggleCartMod(cartId, cartReport, id, confirmed)
+    return
+  end
+  local LauncherMods = require("src.mods.LauncherMods")
+  local cur, experimental = false, false
+  for _, m in ipairs(self.mods or {}) do
+    if m.id == id then
+      if version and m.enabledByVersion then
+        cur = m.enabledByVersion[version] == true
+      else
+        cur = m.enabled
+      end
+      experimental = m.experimental == true
+      break
+    end
+  end
+  local want = not cur
+  if want and experimental and not confirmed then
+    self._modConfirm = {
+      kind = "experimental", id = id, version = version,
+      title = "Experimental mod",
+      yesLabel = "Enable",
+      lines = {
+        "This mod is marked experimental.",
+        "It may be unfinished or unstable.",
+        "Enable it anyway?",
+      },
+    }
+    return
+  end
+  self._modConfirm = nil
+  LauncherMods.setEnabled(id, want, version or self.modScope)
   self:_refreshMods()
 end
 
--- The status-chip label + colour for a mod row (deriveList's status verdict).
-local function modStatusChip(status)
-  if status == "ok" then return "Ready", PAL.green end
-  if status == "conflict" then return "Conflict", PAL.red end
-  return "Incompatible", PAL.gold   -- "warn": bad range or missing dependency
+-- A cart's pin is switched in the cart's own scope, never in the per-game
+-- flags, and only where the seal hands that switch over.  Loader.pinTogglable
+-- is the single authority on that, in the launcher as in the game.
+function RomImporter:_toggleCartMod(cartId, report, id, confirmed)
+  local CartManifest = require("src.carts.CartManifest")
+  local Loader = require("src.mods.Loader")
+  local SaveData = require("src.core.SaveData")
+  local title = (report and report.title) or cartId
+  local pin = report and report.pins and report.pins[id] or nil
+  if not pin then
+    self.modNotice = { ok = false, text = Strings(
+      "%s decides which mods run. A cart's mod set cannot be added to or taken from.",
+      title) }
+    return
+  end
+  local row
+  for _, m in ipairs(self.mods or {}) do
+    if m.id == id then row = m break end
+  end
+  if row and row.cartMissing then
+    self.modNotice = { ok = false, text = Strings(
+      "%s pins %s, but it is not installed.", title, id) }
+    return
+  end
+  if not Loader.pinTogglable(report, pin) then
+    self.modNotice = { ok = false, text = Strings(
+      "%s is sealed: its mods run exactly as pinned. Break the seal on the cart's own page to change that.",
+      title) }
+    return
+  end
+  local on = CartManifest.modEnabled(pin)
+  local chosen = SaveData.cartModEnabled(SaveData.loadOptions(), cartId, id)
+  if type(chosen) == "boolean" then on = chosen end
+  local want = not on
+  if want and row and row.experimental and not confirmed then
+    self._modConfirm = {
+      kind = "experimental", id = id, version = self.modScope,
+      title = "Experimental mod",
+      yesLabel = "Enable",
+      lines = {
+        "This mod is marked experimental.",
+        "It may be unfinished or unstable.",
+        "Enable it anyway?",
+      },
+    }
+    return
+  end
+  self._modConfirm = nil
+  SaveData.setCartModEnabled(cartId, id, want)
+  self:_refreshMods()
+  local name = (row and row.name) or id
+  self.modNotice = { ok = true, text = want
+    and Strings("Switched %s on for %s.", name, title)
+    or Strings("Switched %s off for %s.", name, title) }
 end
 
--- MODS panel.  Header ("Mods" + "N of M enabled" + "Import mod .zip"), an
--- install-result / drag-drop notice line, then a scrollable list of mod cards
--- (name + badge chip + description, a status chip, and a toggle switch).  An
--- empty install shows a friendly dashed hint box.
-function RomImporter:_drawModsPanel(x, y, w, h)
-  local s = self._s
-  self:_ensureMods()
-  local mods = self.mods or {}
-
-  -- header: "Mods" + "N of M enabled" (left) and "Import mod .zip" (right)
-  love.graphics.setFont(self.gameNameFont)
-  col(PAL.white)
-  printB("Mods", x, y)
-  local nameW = self.gameNameFont:getWidth("Mods")
-  local headerH = self.gameNameFont:getHeight()
-
-  local enabledCount = 0
-  for _, m in ipairs(mods) do if m.enabled then enabledCount = enabledCount + 1 end end
-  love.graphics.setFont(self.hintFont)
-  col(PAL.warning)
-  love.graphics.print(Strings("%d of %d enabled", enabledCount, #mods),
-    x + nameW + 14 * s, y + (headerH - self.hintFont:getHeight()) / 2)
-
-  local btnLabel = "Import mod .zip"
-  local btnH = math.max(38 * s, self.saveBtnFont:getHeight() + 20 * s)
-  local btnW = math.min(w * 0.5, self.saveBtnFont:getWidth(btnLabel) + 40 * s)
-  local btnX = x + w - btnW
-  local btnY = y + (headerH - btnH) / 2
-  self.modImportRect =
-    self:_glassyButton(btnX, btnY, btnW, btnH, btnLabel, self.saveBtnFont, true)
-
-  local top = y + headerH + 14 * s
-
-  -- notice line: the last install/delete result, else the platform hint
-  love.graphics.setFont(self.hintFont)
-  if self.modNotice then
-    col(self.modNotice.ok and PAL.green or PAL.red)
-    love.graphics.printf(self.modNotice.text, x, top, w, "left")
-  else
-    col(PAL.warning)
-    love.graphics.printf(self.android and "Or copy a mod .zip via USB."
-      or Strings("Or drop a mod .zip onto the window."), x, top, w, "left")
+-- Enable all / Disable all (#647).  One options write for the whole list
+-- (LauncherMods.setAllEnabled) and one relist afterwards, so the count, the
+-- switches and every status chip resolve together instead of per mod.
+-- Enabling routes through the same experimental confirm _toggleMod arms: that
+-- opt-in is the only warning an experimental mod ever gets, and a bulk button
+-- must not be the way around it.  Disabling needs no confirm -- it is the
+-- recovery action, and Delete is the only destructive one on this panel.
+-- An active cart owns its mod set, so the bulk buttons are refused there
+-- rather than becoming a way to add to it or empty it.
+function RomImporter:_setAllMods(want, confirmed)
+  if self.safeMode then
+    self.modNotice = { ok = false, text = "Safe mode is active. Turn it off in the Bug tab to change mods." }
+    return
   end
-  top = top + self.hintFont:getHeight() + 12 * s
+  local cartId, cartReport = self:modCartPlan()
+  if cartId then
+    self.modNotice = { ok = false, text = self:cartPinsNote(cartId, cartReport) }
+    return
+  end
+  local LauncherMods = require("src.mods.LauncherMods")
+  local ids, experimental = {}, false
+  for _, m in ipairs(self.mods or {}) do
+    local mismatched = m.enabled ~= want
+    if not self.modScope and type(m.enabledByVersion) == "table" then
+      mismatched = false
+      for _, game in ipairs(GameVersion.ORDER) do
+        if m.enabledByVersion[game] ~= want then
+          mismatched = true
+          break
+        end
+      end
+    end
+    if mismatched then
+      ids[#ids + 1] = m.id
+      if want and m.experimental then experimental = true end
+    end
+  end
+  if #ids == 0 then
+    self.modNotice = { ok = true, text = want
+      and Strings("Every mod is already enabled.")
+      or Strings("Every mod is already disabled.") }
+    return
+  end
+  if want and experimental and not confirmed then
+    self._modConfirm = {
+      kind = "enableAll",
+      title = "Experimental mods",
+      yesLabel = "Enable all",
+      lines = {
+        "Some of these mods are marked experimental.",
+        "They may be unfinished or unstable.",
+        "Enable everything anyway?",
+      },
+    }
+    return
+  end
+  self._modConfirm = nil
+  LauncherMods.setAllEnabled(ids, want, self.modScope)
+  self:_refreshMods()
+  self.modNotice = { ok = true, text = want
+    and Strings("Enabled %d mods.", #ids)
+    or Strings("Disabled %d mods.", #ids) }
+end
 
-  local listH = math.max(0, (y + h) - top)
+function RomImporter:_moveMod(id, delta)
+  if self.safeMode then
+    self.modNotice = { ok = false, text = "Safe mode is active. Turn it off in the Bug tab to change mods." }
+    return false
+  end
+  local cartId, cartReport = self:modCartPlan()
+  if cartId then
+    self.modNotice = { ok = false, text = self:cartPinsNote(cartId, cartReport) }
+    return false
+  end
+  local LauncherMods = require("src.mods.LauncherMods")
+  local visible, name = {}, id
+  for _, m in ipairs(self.mods or {}) do
+    visible[#visible + 1] = m.id
+    if m.id == id then name = m.name or id end
+  end
+  local ok, at = LauncherMods.moveMod(id, delta, visible)
+  if not ok then
+    self.modNotice = { ok = true, text = (tonumber(delta) or 0) < 0
+      and Strings("%s already loads first.", name)
+      or Strings("%s already loads last.", name) }
+    return false
+  end
+  self._modSortCache = nil
+  self:_refreshMods()
+  self.modNotice = { ok = true,
+    text = Strings("Moved %s to load position %d.", name, at or 0) }
+  return true
+end
 
-  -- empty state: a dashed box with a centred hint
-  if #mods == 0 then
-    local boxH = math.min(listH, 120 * s)
-    love.graphics.setLineWidth(math.max(1, 1 * s))
-    col(PAL.cardBorder, 0.45)
-    dashedRoundRect(x, top, w, boxH, 14 * s, 7 * s, 5 * s)
-    love.graphics.setFont(self.hintFont)
-    col(PAL.warning)
-    local emptyHint = self.android
-      and "No mods installed - tap Import mod .zip to add one."
-      or Strings("No mods installed - drop a mod .zip here to add one.")
-    love.graphics.printf(emptyHint,
-      x + 16 * s, top + boxH / 2 - self.hintFont:getHeight() / 2, w - 32 * s, "center")
-    self.modRects = {}
-    self.modDeleteRects = {}
-    self._modMax = 0
+function RomImporter:_resetModOrder()
+  if self.safeMode then
+    self.modNotice = { ok = false, text = "Safe mode is active. Turn it off in the Bug tab to change mods." }
+    return false
+  end
+  local LauncherMods = require("src.mods.LauncherMods")
+  local ok = LauncherMods.resetOrder()
+  self._modSortCache = nil
+  self:_refreshMods()
+  self.modNotice = { ok = true, text = ok
+    and Strings("Load order reset to each mod's own priority.")
+    or Strings("Load order already follows each mod's own priority.") }
+  return ok
+end
+
+-- GitHub Update / Check for updates / Versions. Soft-fails into modNotice.
+-- Update button: when a newer release is known, confirm then install; when
+-- already current, force-refresh the 6h cache and report / offer update.
+function RomImporter:_modGithubAction(id, action)
+  -- canFetchRemote, not networkValidated: the self-updater's gate used to
+  -- stand in for this one, which cost Xbox the whole mod catalog rather than
+  -- just the self-update it actually cannot do (#876).  Say what still works
+  -- while we are here, since the native picker is live on every platform that
+  -- lands in this branch.
+  if not Platform.canFetchRemote() then
+    self.modNotice = { ok = false,
+      text = "Remote mod download is unavailable on this platform. Install a mod .zip from storage instead." }
+    return
+  end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local row
+  for _, m in ipairs(self.mods or {}) do
+    if m.id == id then row = m; break end
+  end
+  if not row or not row.github then
+    self.modNotice = { ok = false, text = "This mod has no github field" }
     return
   end
 
-  -- card metrics (design: rounded 14, padding 14x16; toggle 56x28; Delete under)
-  local padH, padV = 16 * s, 14 * s
-  local cardGap, cardR = 10 * s, 14 * s
-  local tw, th = 52 * s, 28 * s
-  local innerW = w - 2 * padH
-  local chipH = self.hintFont:getHeight() + 8 * s
-  local delH = self.hintFont:getHeight()
-  local clusterH = chipH + 6 * s + th + 6 * s + delH
-
-  love.graphics.setFont(self.stateFont)
-  local nameH = self.stateFont:getHeight()
-
-  -- pre-pass: per-card layout + total height, so scroll can clamp to content
-  local layout, total = {}, 0
-  for i, m in ipairs(mods) do
-    local chipText = modStatusChip(m.status)
-    local chipW = self.hintFont:getWidth(chipText) + 20 * s
-    local delW = self.hintFont:getWidth("Delete")
-    local clusterW = math.max(chipW, tw, delW)
-    local leftW = math.max(40 * s, innerW - clusterW - 14 * s)
-    local descH = 0
-    if m.description ~= "" then
-      love.graphics.setFont(self.hintFont)
-      local _, dl = self.hintFont:getWrap(m.description, leftW)
-      descH = math.max(1, #dl) * self.hintFont:getHeight()
+  -- Update, when we already know a newer release exists, needs no network:
+  -- confirm straight away off the cached info.
+  if action ~= "versions" then
+    local info = self:_modUpdateInfo(id)
+    if info and info.status == "available" and info.best then
+      self._modConfirm = {
+        kind = "update", id = row.id, release = info.best,
+        title = "Update available",
+        yesLabel = "Update",
+        lines = {
+          "Update " .. row.name .. "?",
+          "Installed v" .. tostring(row.version),
+          "Latest v" .. tostring(info.best.version),
+        },
+      }
+      return
     end
-    local contentH = padV * 2 + nameH + (descH > 0 and (6 * s + descH) or 0)
-    local cardH = math.max(contentH, padV * 2 + clusterH)
-    layout[i] = { h = cardH, leftW = leftW, clusterW = clusterW,
-      chipText = chipText, chipW = chipW, delW = delW }
-    total = total + cardH
   end
-  total = total + (#mods - 1) * cardGap
 
-  local maxScroll = math.max(0, total - listH)
-  self._modMax = maxScroll
-  local scroll = clamp(self.modScroll or 0, 0, maxScroll)
-  self.modScroll = scroll
-  self.modRects = {}
-  self.modDeleteRects = {}
+  -- ASYNC (was a blocking fetch).  Both remaining paths -- listing versions
+  -- and a manual re-check -- hit the GitHub API, which is exactly the call
+  -- that used to freeze the launcher mid-click.  One job at a time.
+  if self._modCheck then return end
+  self._modCheck = {
+    id = row.id, name = row.name, github = row.github,
+    version = row.version, action = action,
+    h = ModUpdate.beginFetchReleases(row.github, row.id,
+      { force = action ~= "versions" }),
+  }
+  self:_setBusy(action == "versions" and Strings("Loading versions")
+    or Strings("Checking for updates"), row.name)
+end
 
-  love.graphics.setScissor(math.floor(x), math.floor(top),
-    math.ceil(w), math.ceil(listH))
-  local cy = top - scroll
-  for i, m in ipairs(mods) do
-    local L = layout[i]
-    local cardH = L.h
-    if cy + cardH >= top and cy <= top + listH then
-      roundedCard(x, cy, w, cardH, cardR)
-      local nx = x + padH
-      local ny = cy + padV
+-- Drive the in-flight per-mod release check.  Called from _pumpModInfoFetch's
+-- neighbourhood in update(); kept separate because this one IS behind the
+-- blocking overlay (the user pressed a button and is waiting on the answer).
+function RomImporter:_pumpModCheck()
+  local job = self._modCheck
+  if not job then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local ok, done, releases, err = pcall(ModUpdate.pumpFetchReleases, job.h)
+  if ok and not done then return end
+  self._modCheck = nil
+  self:_clearBusy()
+  if not ok then
+    self._modVersions = nil
+    self.modNotice = { ok = false, text = "Update failed: " .. tostring(done) }
+    return
+  end
+  if not releases then
+    self.modNotice = { ok = false, text = tostring(err) }
+    return
+  end
+  if #releases == 0 then
+    self.modNotice = { ok = false, text = "No .zip releases found" }
+    return
+  end
 
-      -- name (ellipsized to leave room for the badge chip) + badge chip
-      love.graphics.setFont(self.warningFont)
-      local badgeTW = self.warningFont:getWidth(m.badge)
-      local badgeW = badgeTW + 12 * s
-      local badgeH = self.warningFont:getHeight() + 6 * s
-      love.graphics.setFont(self.stateFont)
-      col(PAL.white)
-      local drawnName = ellipsize(self.stateFont, m.name, L.leftW - badgeW - 8 * s)
-      printB(drawnName, nx, ny)
-      local bxx = nx + self.stateFont:getWidth(drawnName) + 8 * s
-      local byy = ny + (nameH - badgeH) / 2
-      love.graphics.setLineWidth(1)
-      col(PAL.cardBorder, 0.5)
-      love.graphics.rectangle("line", bxx, byy, badgeW, badgeH, 5 * s, 5 * s)
-      love.graphics.setFont(self.warningFont)
-      col(PAL.warning)
-      love.graphics.print(m.badge, bxx + 6 * s,
-        byy + (badgeH - self.warningFont:getHeight()) / 2)
+  local status, best = ModUpdate.statusFor(job.version, releases)
+  self.modUpdateInfo = self.modUpdateInfo or {}
+  self.modUpdateInfo[job.id] = {
+    status = status, latest = best and best.version, best = best,
+    releases = releases, checkedAt = os.time(),
+    downloads = ModUpdate.totalDownloads(releases),
+    dates = ModUpdate.releaseDates(releases),
+  }
+  self._modUpdateRev = (self._modUpdateRev or 0) + 1
 
-      -- description under the name, wrapped in the left block
-      if m.description ~= "" then
-        love.graphics.setFont(self.hintFont)
-        col(PAL.detail)
-        love.graphics.printf(m.description, nx, ny + nameH + 6 * s, L.leftW, "left")
+  if job.action == "versions" then
+    self._modVersions = {
+      id = job.id, name = job.name, current = job.version,
+      releases = releases, page = 1,
+    }
+    self.modNotice = nil
+    return
+  end
+
+  if status == "available" and best then
+    self.modNotice = { ok = true,
+      text = job.name .. ": new version available (v" .. best.version .. ")" }
+    self._modConfirm = {
+      kind = "update", id = job.id, release = best,
+      title = "Update available",
+      yesLabel = "Update",
+      lines = {
+        "Update " .. job.name .. "?",
+        "Installed v" .. tostring(job.version),
+        "Latest v" .. tostring(best.version),
+      },
+    }
+  else
+    self.modNotice = { ok = true,
+      text = job.name .. " is up to date (v" .. tostring(job.version) .. ")" }
+  end
+end
+
+-- ------- mod install / update (async download, blocking unzip)
+--
+-- The download is the slow half and now runs on the fetch pool behind a
+-- non-dismissable loader; unzipping the finished archive is fast and stays
+-- on the main thread, where love.filesystem belongs.  All three entry points
+-- (update a mod, install a specific version, install from an index) funnel
+-- into one in-flight job, so two installs can never race for the same id.
+--
+-- `spec` = { modId, name, release, notice = "mod"|"find"|"cart", verb, entry,
+--            sha256, done }
+-- `sha256` gates the unzip; `done(ok, text)` fires on either outcome so a
+-- queue can drive one install at a time.
+function RomImporter:_beginModInstall(spec)
+  if self._modInstall or self._cartInstall then return end
+  local ModIndex = require("src.mods.ModIndex")
+  local release = spec.release
+  -- An index entry only tells us WHERE the zip is; resolving that is
+  -- ModIndex's job, exactly as in the synchronous path.
+  if not release and spec.entry then
+    local resolved, why = ModIndex.releaseFor(spec.entry)
+    if not resolved then
+      self:_modInstallFailed(spec, why or "this mod cannot be installed")
+      return
+    end
+    release = resolved
+  end
+  if type(release) ~= "table" or not release.zip or not release.zip.url then
+    self:_modInstallFailed(spec, "release has no downloadable .zip")
+    return
+  end
+  local tooLarge = require("src.mods.LauncherMods").nxReleaseTooLarge(
+    spec.name or spec.modId, release)
+  if tooLarge then
+    self:_modInstallFailed(spec, tooLarge)
+    return
+  end
+  local version = release.version or os.time()
+  local tmpName = ("mod_update_%s_%s.zip"):format(tostring(spec.modId),
+    tostring(version))
+  local ModUpdate = require("src.mods.ModUpdate")
+  self._modInstall = {
+    spec = spec, release = release, version = release.version,
+    h = ModUpdate.beginDownloadZip(release.zip.url, tmpName,
+      release.zip.size),
+  }
+  self:_setBusy(Strings("Downloading %s", tostring(spec.name or spec.modId)),
+    "v" .. tostring(release.version or "?"))
+end
+
+function RomImporter:_modInstallFailed(spec, msg)
+  if not spec.quiet then
+    local notice = { ok = false, text = tostring(msg) }
+    if spec.notice == "find" then self.findNotice = notice
+    elseif spec.notice ~= "cart" then self.modNotice = notice end
+  end
+  self:_clearBusy()
+  if spec.done then spec.done(false, tostring(msg)) end
+end
+
+local function sha256hex(data)
+  local digest = love.data.hash("sha256", data)
+  if type(digest) == "userdata" and digest.getString then
+    digest = digest:getString()
+  end
+  return love.data.encode("string", "hex", digest)
+end
+
+-- A cart pin records the sha256 of the archive it was built against.  A hash
+-- that does not match is a different build, so nothing is installed.
+function RomImporter.verifyArchiveSha256(path, want)
+  if type(want) ~= "string" or not want:lower():match("^%x+$")
+      or #want ~= 64 then
+    return false, "the cart records no usable sha256 for this mod"
+  end
+  local ok, data = pcall(love.filesystem.read, path)
+  if not ok or type(data) ~= "string" or data == "" then
+    return false, "the downloaded archive could not be read back"
+  end
+  local hashed, got = pcall(sha256hex, data)
+  if not hashed or type(got) ~= "string" then
+    return false, "this platform cannot hash the archive, so it was not installed"
+  end
+  if got:lower() ~= want:lower() then
+    return false, ("archive sha256 %s does not match the pinned %s")
+      :format(got:sub(1, 12), want:sub(1, 12))
+  end
+  return true
+end
+
+function RomImporter:_pumpModInstall()
+  local job = self._modInstall
+  if not job then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local ok, done, path, err, progress = pcall(ModUpdate.pumpDownloadZip, job.h)
+  if ok and not done then
+    -- Feed real download progress into the overlay when the size is known.
+    if progress and self._busy then self._busy.progress = progress end
+    return
+  end
+  self._modInstall = nil
+  local spec = job.spec
+  if not ok then
+    self:_modInstallFailed(spec, "download failed: " .. tostring(done))
+    return
+  end
+  if not path then
+    self:_modInstallFailed(spec, err or "download failed")
+    return
+  end
+  -- Hash gate before the unzip: a pinned archive that does not match the cart
+  -- is thrown away rather than installed.
+  if spec.sha256 then
+    local verified, why = RomImporter.verifyArchiveSha256(path, spec.sha256)
+    if not verified then
+      pcall(love.filesystem.remove, path)
+      self:_modInstallFailed(spec, why)
+      return
+    end
+  end
+  -- Unzip + manifest check.  Fast, and it must run here: love.filesystem
+  -- writes are main-thread only.
+  self:_setBusy(Strings("Installing %s", tostring(spec.name or spec.modId)))
+  local LauncherMods = require("src.mods.LauncherMods")
+  local ran, res, resErr = pcall(LauncherMods.installDownloadedZip,
+    spec.modId, path, job.version)
+  self:_clearBusy()
+  if not ran then
+    self:_modInstallFailed(spec, "install failed: " .. tostring(res))
+    return
+  end
+  if not res then
+    self:_modInstallFailed(spec, resErr or "install failed")
+    return
+  end
+  -- The installed list is what the Install / Installed labels read, so it has
+  -- to be re-derived before the next paint or the card lies.
+  pcall(self._refreshMods, self)
+  self:_rejudgeModUpdate(spec.modId, resErr or job.version)
+  local shown = tostring(resErr or job.version or "")
+  local text = ("%s %s %s"):format(spec.verb or "Installed",
+    tostring(spec.name or spec.modId), shown)
+  if spec.quiet then
+  elseif spec.notice == "find" then
+    self.findNotice = { ok = true, text = text }
+  elseif spec.notice ~= "cart" then
+    self.modNotice = { ok = true, text = text }
+  end
+  -- A cart pins its whole load order, so the dependency modal would only
+  -- interrupt the queue that is already installing the rest of it.
+  if spec.notice ~= "cart" and not spec.quiet then
+    local depCheck = LauncherMods.checkDependencies({ id = spec.modId })
+    if depCheck and depCheck.hasIssues then
+      self._modDepResolver = depCheck
+    end
+  end
+  if spec.done then spec.done(true, text) end
+end
+
+-- ------- cart install from an index listing
+--
+-- A cart is one .g1rcart file, so the bytes go whole to CartStore.install and
+-- never through the mod installer.  Shares the mod job's single-in-flight
+-- rule: either entry point refuses while the other is running.
+function RomImporter:_beginCartInstall(entry, spec)
+  if self._modInstall or self._cartInstall then return end
+  if self._updateAll and not (spec and spec.fromUpdateAll) then return end
+  local ModIndex = require("src.mods.ModIndex")
+  local release, why = ModIndex.releaseFor(entry)
+  if type(release) ~= "table" or not (release.zip and release.zip.url) then
+    local text = ("%s: %s"):format(tostring(entry.title or entry.id),
+      tostring(why or "this cart has no downloadable release"))
+    if not (spec and spec.quiet) then
+      self.findNotice = { ok = false, text = text }
+    end
+    if spec and spec.done then spec.done(false, text) end
+    return
+  end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local version = release.version or entry.version or os.time()
+  local tmpName = ("cart_install_%s_%s%s"):format(
+    tostring(entry.id):gsub("[^%w%-_]", "_"), tostring(version),
+    require("src.carts.CartStore").EXT)
+  self._cartInstall = {
+    entry = entry, version = release.version or entry.version,
+    quiet = spec and spec.quiet or nil, done = spec and spec.done or nil,
+    h = ModUpdate.beginDownloadZip(release.zip.url, tmpName, release.zip.size),
+  }
+  self:_setBusy(Strings("Downloading %s", tostring(entry.title or entry.id)),
+    "v" .. tostring(release.version or entry.version or "?"))
+end
+
+function RomImporter:_cartInstallFailed(msg, job)
+  job = job or self._cartInstall
+  self._cartInstall = nil
+  self:_clearBusy()
+  if not (job and job.quiet) then
+    self.findNotice = { ok = false, text = tostring(msg) }
+  end
+  if job and job.done then job.done(false, tostring(msg)) end
+end
+
+function RomImporter:_pumpCartInstall()
+  local job = self._cartInstall
+  if not job then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local ok, done, path, err, progress = pcall(ModUpdate.pumpDownloadZip, job.h)
+  if ok and not done then
+    if progress and self._busy then self._busy.progress = progress end
+    return
+  end
+  local entry = job.entry
+  local name = tostring(entry.title or entry.id)
+  if not ok then
+    return self:_cartInstallFailed(name .. ": download failed: " .. tostring(done))
+  end
+  if not path then
+    return self:_cartInstallFailed(name .. ": " .. tostring(err or "download failed"))
+  end
+  self._cartInstall = nil
+  local read, bytes = pcall(love.filesystem.read, path)
+  pcall(love.filesystem.remove, path)
+  if not read or type(bytes) ~= "string" or bytes == "" then
+    return self:_cartInstallFailed(name .. ": the download could not be read back",
+      job)
+  end
+  self:_setBusy(Strings("Installing %s", name))
+  local CartStore = require("src.carts.CartStore")
+  local ran, cart, installErr = pcall(CartStore.install, bytes)
+  self:_clearBusy()
+  if not ran then
+    return self:_cartInstallFailed(name .. ": install failed: " .. tostring(cart),
+      job)
+  end
+  if not cart then
+    return self:_cartInstallFailed(name .. ": " .. tostring(installErr), job)
+  end
+  -- _refreshCarts caches per version, so the Custom Carts list for the game
+  -- this cart plays as would keep its pre-install copy until a relaunch.
+  -- The label art is cached per cart too, and a reinstall can repaint it.
+  self:_refreshCarts(cart.base)
+  self._cartPlan = nil
+  self._cartridgeLabels = nil
+  self._gbaLabels = nil
+  if not job.quiet then
+    self.findNotice = { ok = true,
+      text = Strings("Installed %s v%s. It is in this game's cart list now.",
+        tostring(cart.title or cart.id), tostring(cart.version or "?")) }
+    self:_offerCartPins(cart)
+  end
+  if job.done then job.done(true, tostring(cart.version or "?")) end
+end
+
+-- The pins a cart is missing, answered without disturbing whichever cart the
+-- player currently has selected for that game.
+function RomImporter:_cartPinsMissing(version, id)
+  local wasCart = self.activeCart[version]
+  local wasPlan = self._cartPlan
+  self.activeCart[version] = id
+  self._cartPlan = nil
+  local ok, rows = pcall(self.cartFillRows, self, version)
+  self.activeCart[version] = wasCart
+  self._cartPlan = wasPlan
+  return (ok and type(rows) == "table") and rows or {}
+end
+
+-- A cart whose pins are missing will not start, so ask once rather than
+-- dead-end, and route a yes at the existing hash-verified fill queue.
+function RomImporter:_offerCartPins(cart)
+  local rows = self:_cartPinsMissing(cart.base, cart.id)
+  if #rows == 0 then return end
+  local info = GameVersion.info(cart.base)
+  local title = tostring(cart.title or cart.id)
+  self._modConfirm = {
+    kind = "cartPins", version = cart.base, id = cart.id,
+    title = "Install this cart's mods",
+    yesLabel = "Install",
+    lines = {
+      ("%s pins %d mod(s) you do not have."):format(title, #rows),
+      "Install them now? Each one is checked against the cart's own hash.",
+      ("This selects %s as the cart for %s."):format(title,
+        tostring((info and (info.launcherName or info.displayName))
+          or cart.base)),
+    },
+  }
+end
+
+-- The confirm's yes.  The cart being filled has to be the selected one, which
+-- is what cartFillRows and pressInstallCartMods both answer for.
+function RomImporter:_installCartPins(version, id)
+  self:_selectCart(version, id)
+  self:pressInstallCartMods(version)
+end
+
+-- ------- one-call cart install for the ONLINE tab
+function RomImporter:installCartForOnline(cartId, version, onDone)
+  if type(cartId) ~= "string" or cartId == "" then
+    if onDone then onDone(false, "no cart was named") end
+    return false
+  end
+  if self._onlineCart then return false end
+  self._onlineCart = { id = cartId, base = version, done = onDone,
+                       stage = "index" }
+  self:_ensureFind()
+  return true
+end
+
+function RomImporter:_finishOnlineCart(ok, text)
+  local job = self._onlineCart
+  self._onlineCart = nil
+  if job and job.done then pcall(job.done, ok, text) end
+end
+
+function RomImporter:pumpOnlineCartInstall()
+  local job = self._onlineCart
+  if not job then return end
+  local CartStore = require("src.carts.CartStore")
+
+  if job.stage == "index" then
+    if self._findFetch then return end
+    if not self.findLoaded then
+      self:_ensureFind()
+      return
+    end
+    local entry
+    for _, row in ipairs((self.findIndex and self.findIndex.carts) or {}) do
+      if row.id == job.id then
+        entry = row
+        break
       end
+    end
+    if not entry then
+      return self:_finishOnlineCart(false,
+        Strings("No mod index lists a cart called %s.", tostring(job.id)))
+    end
+    if self._modInstall or self._cartInstall then return end
+    self.findNotice = nil
+    self:_beginCartInstall(entry)
+    if not self._cartInstall then
+      return self:_finishOnlineCart(false,
+        tostring((self.findNotice and self.findNotice.text)
+          or "that cart has no download"))
+    end
+    job.stage = "download"
+    return
+  end
 
-      -- right cluster: status chip, toggle, Delete -- vertically centred
-      local clusterX = x + w - padH - L.clusterW
-      local clusterY = cy + (cardH - clusterH) / 2
-      local _, chipColor = modStatusChip(m.status)
-      local chipX = clusterX + (L.clusterW - L.chipW) / 2
-      col(chipColor, 0.1)
-      love.graphics.rectangle("fill", chipX, clusterY, L.chipW, chipH, chipH / 2, chipH / 2)
-      love.graphics.setLineWidth(1)
-      col(chipColor, 0.55)
-      love.graphics.rectangle("line", chipX, clusterY, L.chipW, chipH, chipH / 2, chipH / 2)
-      love.graphics.setFont(self.hintFont)
-      col(chipColor)
-      printfB(L.chipText, chipX,
-        clusterY + (chipH - self.hintFont:getHeight()) / 2, L.chipW, "center")
+  if job.stage == "download" then
+    if self._cartInstall then return end
+    local ok, cart = pcall(CartStore.get, job.id)
+    if not ok or type(cart) ~= "table" then
+      return self:_finishOnlineCart(false,
+        tostring((self.findNotice and self.findNotice.text)
+          or "that cart did not install"))
+    end
+    self._modConfirm = nil
+    job.base = cart.base
+    job.title = cart.title or cart.id
+    if #self:_cartPinsMissing(cart.base, job.id) == 0 then
+      return self:_finishOnlineCart(true,
+        Strings("%s is installed.", tostring(job.title)))
+    end
+    self:_installCartPins(cart.base, job.id)
+    job.stage = "pins"
+    return
+  end
 
-      -- toggle switch (ON = green gradient + glow, knob right; OFF = gray, left)
-      local tx = clusterX + (L.clusterW - tw) / 2
-      local ty = clusterY + chipH + 6 * s
-      local rr = th / 2
-      local trect = { x = tx - 6 * s, y = ty - 6 * s,
-        width = tw + 12 * s, height = th + 12 * s, id = m.id }
-      self:_hover(trect)
-      if m.enabled then
-        neonGlow(tx, ty, tw, th, rr, PAL.green, 0.45)
-        fillGradRounded(tx, ty, tw, th, rr, PAL.playTop, PAL.playBot, 1, 1)
+  if job.stage == "pins" then
+    if self._cartFill then return end
+    if #self:_cartPinsMissing(job.base, job.id) > 0 then
+      return self:_finishOnlineCart(false,
+        tostring((self.cartFillNotice and self.cartFillNotice.text)
+          or "some of this cart's mods could not be installed"))
+    end
+    return self:_finishOnlineCart(true,
+      Strings("%s and its mods are installed.", tostring(job.title or job.id)))
+  end
+end
+
+-- Start an async pull for a single dependency
+function RomImporter:_startDepPull(dep)
+  if not dep or not dep.github then return end
+  self._depPullState = self._depPullState or {}
+  local hFetch = require("src.mods.ModUpdate").beginFetchReleases(dep.github, dep.id, { force = true })
+  self._depPullState[dep.id] = {
+    dep = dep,
+    stage = "fetching",
+    fetchHandle = hFetch,
+  }
+end
+
+-- Pump all in-flight dependency pulls
+function RomImporter:_pumpDepPulls()
+  if not self._depPullState then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  local LauncherMods = require("src.mods.LauncherMods")
+
+  for depId, state in pairs(self._depPullState) do
+    if state.stage == "fetching" then
+      local done, releases, err = ModUpdate.pumpFetchReleases(state.fetchHandle)
+      if done then
+        if err or not releases or #releases == 0 then
+          state.stage = "error"
+          state.err = err or "No downloadable releases found on GitHub"
+        else
+          local rel = releases[1]
+          local tooLarge = rel and LauncherMods.nxReleaseTooLarge(depId, rel)
+          if not rel or not rel.zip or not rel.zip.url then
+            state.stage = "error"
+            state.err = "Latest release has no downloadable .zip asset"
+          elseif tooLarge then
+            state.stage = "error"
+            state.err = tooLarge
+          else
+            local tmpName = ("dep_%s_%s.zip"):format(depId, tostring(rel.version or os.time()))
+            state.dlHandle = ModUpdate.beginDownloadZip(rel.zip.url, tmpName, rel.zip.size)
+            state.stage = "downloading"
+            state.targetVersion = rel.version
+          end
+        end
+      end
+    elseif state.stage == "downloading" then
+      local done, localPath, err, progress = ModUpdate.pumpDownloadZip(state.dlHandle)
+      state.progress = progress
+      if done then
+        if err or not localPath then
+          state.stage = "error"
+          state.err = err or "Download failed"
+        else
+          state.stage = "installing"
+          local okInst, versionRes = LauncherMods.installDownloadedZip(depId, localPath, state.targetVersion)
+          if okInst then
+            state.stage = "done"
+            pcall(self._refreshMods, self)
+            if self._modDepResolver and self._modDepResolver.targetMod then
+              local updated = LauncherMods.checkDependencies(self._modDepResolver.targetMod)
+              self._modDepResolver = updated
+            end
+          else
+            state.stage = "error"
+            state.err = tostring(versionRes or "Installation failed")
+          end
+        end
+      end
+    end
+  end
+end
+
+function RomImporter:_confirmModUpdate(modId, release)
+  local row
+  for _, m in ipairs(self.mods or {}) do
+    if m.id == modId then row = m; break end
+  end
+  self:_beginModInstall({
+    modId = modId, name = row and row.name or modId,
+    release = release, verb = "Updated", notice = "mod",
+  })
+end
+
+function RomImporter:_installModVersion(modId, release)
+  self._modVersions = nil
+  self._modReleaseNotes = nil
+  self:_beginModInstall({
+    modId = modId, name = modId, release = release,
+    verb = "Installed", notice = "mod",
+  })
+end
+
+
+local function repoKey(...)
+  local Manifest = require("src.mods.Manifest")
+  for i = 1, select("#", ...) do
+    local value = select(i, ...)
+    if type(value) == "string" and value ~= "" then
+      local ok, key = pcall(Manifest.parseGithub, value)
+      if ok and type(key) == "string" then return key:lower() end
+    end
+  end
+  return nil
+end
+
+function RomImporter:_updateAllCartRows()
+  local feed = (self.findIndex and self.findIndex.carts) or nil
+  local seen = self:_findInstalledCarts()
+  local cache = self._cartUpdateCache
+  if cache and cache.feed == feed and cache.seen == seen then
+    return cache.rows
+  end
+  local rows = {}
+  local skipped = {}
+  self._cartUpdateCache = { feed = feed, seen = seen, rows = rows,
+                            skipped = skipped }
+  if type(feed) ~= "table" or #feed == 0 then return rows end
+  local listed = {}
+  for _, entry in ipairs(feed) do
+    if type(entry) == "table" and entry.id and seen[entry.id] then
+      listed[entry.id] = entry
+    end
+  end
+  if next(listed) == nil then return rows end
+  local ok, installed = pcall(function()
+    return require("src.carts.CartStore").list()
+  end)
+  if not ok or type(installed) ~= "table" then return rows end
+  local ModIndex = require("src.mods.ModIndex")
+  local ModUpdate = require("src.mods.ModUpdate")
+  for _, row in ipairs(installed) do
+    local entry = listed[row.id]
+    local mine = row.cart and repoKey(row.cart.repo)
+    local theirs = entry and repoKey(entry.github, entry.repo)
+    if entry
+        and ModUpdate.isNewer(row.version, ModIndex.displayVersion(entry)) then
+      if (mine == nil or mine == theirs) and ModIndex.canInstall(entry) then
+        rows[#rows + 1] = { kind = "cart", id = row.id, entry = entry,
+                            name = row.title or row.id, from = row.version,
+                            to = ModIndex.displayVersion(entry) }
+      elseif mine and theirs and mine ~= theirs then
+        skipped[#skipped + 1] = { id = row.id, name = row.title or row.id,
+                                  mine = mine, theirs = theirs }
+      end
+    end
+  end
+  return rows
+end
+
+function RomImporter:_updateAllRows()
+  local rows = {}
+  if not (self.modCartPlan and self:modCartPlan()) then
+    for _, m in ipairs(self.mods or {}) do
+      local info = self:_modUpdateInfo(m.id)
+      if info and info.status == "available" and info.best
+          and info.best.zip and info.best.zip.url then
+        rows[#rows + 1] = { kind = "mod", id = m.id, name = m.name,
+                            release = info.best, from = m.version }
+      end
+    end
+  end
+  for _, row in ipairs(self:_updateAllCartRows()) do rows[#rows + 1] = row end
+  return rows
+end
+
+function RomImporter:updateAllAvailable()
+  if self.safeMode then return false end
+  if self._updateAll or self._modInstall or self._cartInstall
+      or self._cartFill then return false end
+  return true
+end
+
+function RomImporter:pressUpdateAllMods(opts)
+  if not self:updateAllAvailable() then return false end
+  if not Platform.canFetchRemote() then
+    self.modNotice = { ok = false,
+      text = "Remote mod download is unavailable on this platform. Install a mod .zip from storage instead." }
+    return false
+  end
+  self._updateAll = { stage = "check", index = 0, updated = 0,
+                      updatedIds = {}, updatedCarts = {}, failures = {},
+                      auto = (opts and opts.auto) and true or nil }
+  self.modNotice = nil
+  self:_syncModUpdateInfo(not self._updateAll.auto)
+  self:_setBusy(Strings("Checking for updates"), nil,
+    function() self:_cancelUpdateAll() end)
+  self:_pumpUpdateAll()
+  return true
+end
+
+function RomImporter:_confirmUpdateAll()
+  local job = self._updateAll
+  if not job or job.stage ~= "confirm" then return false end
+  if self._modConfirm == job.confirm then self._modConfirm = nil end
+  job.confirm = nil
+  job.stage = "next"
+  self:_setBusy(Strings("Checking for updates"), nil,
+    function() self:_cancelUpdateAll() end)
+  self:_pumpUpdateAll()
+  return true
+end
+
+function RomImporter:_cancelUpdateAll()
+  local job = self._updateAll
+  if not job or job.cancelled then return end
+  job.cancelled = true
+  if self._modInstall or self._cartInstall then
+    self:_setBusy(Strings("Finishing the last download"))
+  else
+    self:_finishUpdateAll(true)
+  end
+end
+
+function RomImporter:_pumpUpdateAll()
+  local job = self._updateAll
+  if not job then return end
+
+  if job.stage == "check" then
+    if self._modInfoFetch or self._findFetch then return end
+    if not job.feedRefreshed then
+      job.feedRefreshed = true
+      if Platform.canFetchRemote() then
+        self:_refreshFindSources()
+        if #(self.findSources or {}) > 0 then
+          self:_refreshFind(true, { quiet = true })
+          if self._findFetch then
+            self:_setBusy(Strings("Checking for updates"), nil,
+              function() self:_cancelUpdateAll() end)
+            return
+          end
+        end
+      end
+    end
+    self._cartUpdateCache = nil
+    job.feedStale = job.feedStale
+      or (self.findIndex and self.findIndex.stale) == true
+    job.rows = self:_updateAllRows()
+    job.skippedCarts = (self._cartUpdateCache or {}).skipped
+    job.total = #job.rows
+    if job.cancelled or job.total == 0 then
+      return self:_finishUpdateAll(job.cancelled)
+    end
+    if job.auto then
+      job.stage = "next"
+    else
+      job.stage = "confirm"
+      local lines = { Strings("Update %d items?", job.total) }
+      for i = 1, math.min(3, job.total) do
+        local row = job.rows[i]
+        lines[#lines + 1] = tostring(row.name or row.id)
+      end
+      if job.total > 3 then
+        lines[#lines + 1] = Strings("and %d more", job.total - 3)
+      end
+      job.confirm = { kind = "updateAllRun", title = Strings("Update all"),
+        yesLabel = Strings("Update all"), lines = lines }
+      self._modConfirm = job.confirm
+      self:_clearBusy()
+      return
+    end
+  end
+
+  if job.stage == "confirm" then
+    if self._modConfirm ~= job.confirm then
+      self._updateAll = nil
+      self:_clearBusy()
+      pcall(self._refreshMods, self)
+    end
+    return
+  end
+
+  if job.stage ~= "next" then return end
+  if job.cancelled then return self:_finishUpdateAll(true) end
+  if self._modInstall or self._cartInstall then return end
+  job.index = job.index + 1
+  local row = job.rows[job.index]
+  if not row then return self:_finishUpdateAll() end
+  job.stage = "installing"
+  local function finished(ok, text)
+    if ok then
+      job.updated = job.updated + 1
+      if row.kind == "cart" then
+        job.updatedCarts[#job.updatedCarts + 1] =
+          { id = row.id, base = row.entry and row.entry.base,
+            name = row.name or row.id }
       else
-        col(PAL.disabled, 0.35)
-        love.graphics.rectangle("fill", tx, ty, tw, th, rr, rr)
+        job.updatedIds[#job.updatedIds + 1] = row.id
       end
-      local kd = th - 6 * s
-      local kcx = m.enabled and (tx + tw - 3 * s - kd / 2) or (tx + 3 * s + kd / 2)
-      col(PAL.white)
-      love.graphics.circle("fill", kcx, ty + th / 2, kd / 2)
+    else
+      job.failures[#job.failures + 1] =
+        ("%s: %s"):format(tostring(row.name or row.id), tostring(text))
+    end
+    job.stage = "next"
+  end
+  if row.kind == "cart" then
+    self:_beginCartInstall(row.entry,
+      { quiet = true, fromUpdateAll = true, done = finished })
+  else
+    self:_beginModInstall({
+      modId = row.id, name = row.name, release = row.release,
+      verb = "Updated", notice = "mod", quiet = true, done = finished,
+    })
+  end
+  if self._modInstall or self._cartInstall then
+    self:_setBusy(Strings("Updating %s (%d of %d)",
+      tostring(row.name or row.id), job.index, job.total),
+      "v" .. tostring(row.to or (row.release and row.release.version) or "?"),
+      function() self:_cancelUpdateAll() end)
+  elseif job.stage == "installing" then
+    job.stage = "next"
+  end
+end
 
-      -- Delete under the toggle
-      local delX = clusterX + (L.clusterW - L.delW) / 2
-      local delY = ty + th + 6 * s
-      local drect = { x = delX - 6 * s, y = delY - 2 * s,
-        width = L.delW + 12 * s, height = delH + 4 * s, id = m.id }
-      local dhot = self:_hover(drect)
-      love.graphics.setFont(self.hintFont)
-      col(dhot and PAL.red or PAL.warning)
-      love.graphics.print("Delete", delX, delY)
-
-      -- hit rects clipped to the visible list band
-      local vy = math.max(trect.y, top)
-      local vy2 = math.min(trect.y + trect.height, top + listH)
-      if vy2 > vy then
-        self.modRects[#self.modRects + 1] =
-          { x = trect.x, y = vy, width = trect.width, height = vy2 - vy, id = m.id }
-      end
-      local dvy = math.max(drect.y, top)
-      local dvy2 = math.min(drect.y + drect.height, top + listH)
-      if dvy2 > dvy then
-        self.modDeleteRects[#self.modDeleteRects + 1] =
-          { x = drect.x, y = dvy, width = drect.width, height = dvy2 - dvy, id = m.id }
+function RomImporter:_finishUpdateAll(cancelled)
+  local job = self._updateAll
+  self._updateAll = nil
+  self:_clearBusy()
+  pcall(self._refreshMods, self)
+  if not job then return end
+  if cancelled then
+    self.modNotice = { ok = true, failures = job.failures,
+      text = Strings("Stopped after updating %d items.", job.updated) }
+  elseif (job.total or 0) == 0 then
+    local skipped = #(job.skippedCarts or {})
+    local text
+    if job.feedStale then
+      text = Strings("Could not reach the mod index; compared against the cached listing.")
+    elseif skipped > 0 then
+      text = Strings("Nothing to update. %d cart(s) came from another repo:",
+        skipped)
+    else
+      text = Strings("Everything is up to date.")
+    end
+    self.modNotice = { ok = skipped == 0, text = text }
+  elseif #job.failures == 0 then
+    self.modNotice = { ok = true,
+      text = Strings("Updated %d items.", job.updated) }
+  else
+    self.modNotice = { ok = false, failures = job.failures,
+      text = Strings("Updated %d of %d. %d failed:", job.updated, job.total,
+        #job.failures) }
+  end
+  for _, cart in ipairs(job.skippedCarts or {}) do
+    local lines = self.modNotice.failures or {}
+    lines[#lines + 1] = Strings(
+      "%s is listed by %s but this copy came from %s; update it from Find if that is the same cart.",
+      tostring(cart.name), tostring(cart.theirs), tostring(cart.mine))
+    self.modNotice.failures = lines
+  end
+  for _, cart in ipairs(job.updatedCarts or {}) do
+    if cart.base then
+      local missing = #self:_cartPinsMissing(cart.base, cart.id)
+      if missing > 0 then
+        local lines = self.modNotice.failures or {}
+        lines[#lines + 1] = Strings(
+          "%s now pins %d mod(s) you do not have. Open it in Custom Carts to install them.",
+          tostring(cart.name), missing)
+        self.modNotice.failures = lines
+        job.pinsMissing = true
       end
     end
-    cy = cy + cardH + cardGap
   end
-  love.graphics.setScissor()
+  local LauncherMods = require("src.mods.LauncherMods")
+  for _, id in ipairs(job.updatedIds or {}) do
+    local ok, depCheck = pcall(LauncherMods.checkDependencies, { id = id })
+    if ok and depCheck and depCheck.hasIssues then
+      self._modDepResolver = depCheck
+      break
+    end
+  end
+  if job.auto and self._autoUpdateAll then
+    self._autoUpdateAll.result = {
+      ok = not cancelled and #job.failures == 0 and not job.pinsMissing
+        and self._modDepResolver == nil,
+      cancelled = cancelled and true or false,
+      updated = job.updated,
+      total = job.total or 0,
+      failures = job.failures,
+    }
+  end
+end
 
-  -- thin scrollbar thumb when the list overflows
-  if maxScroll > 0 then
-    local thumbH = math.max(24 * s, listH * (listH / total))
-    local thumbY = top + (listH - thumbH) * (scroll / maxScroll)
-    col(PAL.cardBorder, 0.35)
-    love.graphics.rectangle("fill", x + w - 3 * s, thumbY, 3 * s, thumbH, 1.5 * s, 1.5 * s)
+function RomImporter:autoUpdateAll(onDone, opts)
+  if self._autoUpdateAll then return false end
+  self._autoUpdateAll = { onDone = onDone }
+  local tab = opts and opts.tab
+  if tab and self.tab ~= tab then self:_switchTab(tab) end
+  self:_ensureMods()
+  if self:pressUpdateAllMods({ auto = true }) then return true end
+  if self.safeMode and not self.modNotice then
+    self.modNotice = { ok = false,
+      text = Strings("Safe mode is on, so mods were not updated.") }
   end
+  if self._autoUpdateAll then
+    self._autoUpdateAll.result = { ok = false, skipped = true, updated = 0,
+                                   total = 0, failures = {} }
+  end
+  return false
+end
+
+function RomImporter:_fireAutoUpdateAll()
+  local auto = self._autoUpdateAll
+  if not (auto and auto.result) then return false end
+  self._autoUpdateAll = nil
+  local notice = self.modNotice
+  print("update-mods: " .. tostring(notice and notice.text
+    or (auto.result.skipped and "skipped" or "done")))
+  for _, line in ipairs(notice and notice.failures or {}) do
+    print("update-mods:   " .. tostring(line))
+  end
+  if type(auto.onDone) == "function" then auto.onDone(auto.result) end
+  return true
+end
+
+
+-- NX / desktop / Android labels and inbox hints for the FlexLove view.
+function RomImporter:_modsImportButtonLabel()
+  if self:modScanBusy() then return Strings("Installing...") end
+  if self:_inboxImport() then return Strings("Scan again") end
+  return Strings("Import mod .zip")
+end
+
+function RomImporter:_modsDefaultHint()
+  if self:_inboxImport() then
+    local saveDir = love.filesystem.getSaveDirectory()
+    local rel = RomImporter.mtpHintPath(saveDir)
+    if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+    if Platform.inboxTransfer() == "ftp" then
+      return Strings("Copy a .zip via FTP (GoldHEN, port 2121) into %s/imports/mods/", saveDir)
+    end
+    return Strings("Copy a .zip via MTP into %s/imports/mods/\n"
+      .. "DBI MTP → 1: SD Card/%simports/mods/", saveDir, rel)
+  end
+  if self.android then return Strings("Or copy a mod .zip via USB.") end
+  return Strings("Or drop a mod .zip onto the window.")
+end
+
+function RomImporter:_savesDefaultHint(version)
+  if self:_inboxImport() then
+    version = self:_resolveSaveVersion(version)
+    local inbox = savesInboxDir(version)
+    local saveDir = love.filesystem.getSaveDirectory()
+    local rel = RomImporter.mtpHintPath(saveDir)
+    if rel ~= "" and rel:sub(-1) ~= "/" then rel = rel .. "/" end
+    local game = GameVersion.info(version).displayName
+    if Platform.inboxTransfer() == "ftp" then
+      return Strings("Copy a %s .sav via FTP (GoldHEN, port 2121) into %s/%s/",
+        game, saveDir, inbox)
+    end
+    return Strings("Copy a %s .sav via MTP into %s/%s/\n"
+      .. "DBI MTP → 1: SD Card/%s%s/", game, saveDir, inbox, rel, inbox)
+  end
+  if self.android then
+    return Strings("Import or export a .sav with the system file picker.")
+  end
+  return Strings("Import a .sav to a new slot, or export the active slot.")
+end
+
+function RomImporter:_modsEmptyHint()
+  if self:_inboxImport() then
+    return Strings("No mods installed - copy a .zip into imports/mods/ "
+      .. "and tap Scan again.")
+  end
+  if self.android then
+    return "No mods installed - tap Import mod .zip to add one."
+  end
+  return Strings("No mods installed - drop a mod .zip here to add one.")
+end
+
+-- ------- FIND MODS: browsing a community mod index -------------------------
+--
+-- The index is metadata only (src/mods/ModIndex.lua): it says where a mod's
+-- zip lives, and the install runs through exactly the same path "Import mod
+-- .zip" does.  The main index is included by default; players can add other
+-- indexes alongside it.  Installing a listed mod remains an explicit action.
+--
+-- Fetching is the same synchronous curl the update checks already use, cached
+-- in options for a day, so the first open of the tab costs one round trip and
+-- every later one is free until the player hits Refresh.
+
+-- The sources list, reloaded from options.  Cheap; called whenever the panel
+-- has reason to think the list changed.
+function RomImporter:_refreshFindSources()
+  local ModIndex = require("src.mods.ModIndex")
+  local ok, rows = pcall(ModIndex.sources)
+  self.findSources = ok and rows or {}
+end
+
+-- Fetch every source and merge into one listing.  First source wins on a
+-- duplicate id, matching how the mod loader resolves two mods with one id --
+-- there is one "nuzlocke" as far as the installer is concerned, so the panel
+-- must not offer two.  Per-source failures are collected rather than fatal: an
+-- index that is down should cost its own rows, not everybody else's.
+-- ASYNC (was synchronous).  Every source used to be fetched with a blocking
+-- curl call inside the draw path, so opening Find Mods froze the window for
+-- as long as the slowest index took -- measured at over two minutes on a
+-- cold open, with no spinner, because the frame that would have drawn one
+-- never ran.  The fetch now starts here and completes across later frames in
+-- _pumpFindFetch.  Only an explicit Refresh is blocking; boot prewarm and the
+-- first visit keep the launcher interactive while the listing arrives.
+function RomImporter:_refreshFind(force, opts)
+  -- The notice is the fix, not the gate (#876).  This branch used to return an
+  -- empty listing silently, and because the player had by then added a source,
+  -- the panel skipped its "No mod index added" card and rendered the merged
+  -- listing empty state instead: a valid feed reported as "This index lists no
+  -- mods yet."  Every other failure on this panel surfaces through findNotice,
+  -- and this one has to as well, or adding an index looks like it worked and
+  -- the index looks empty.
+  if not Platform.canFetchRemote() then
+    self.findLoaded = true
+    self.findIndex = { mods = {}, carts = {}, categories = {}, baseGames = {} }
+    self.findNotice = { ok = false,
+      text = "Mod indexes cannot be fetched on this platform. Install a mod .zip from storage instead." }
+    return
+  end
+  local ModIndex = require("src.mods.ModIndex")
+  self:_refreshFindSources()
+  local sources = self.findSources or {}
+  if #sources == 0 then
+    self.findIndex = { mods = {}, carts = {}, categories = {}, baseGames = {} }
+    self.findLoaded = true
+    return
+  end
+  -- One in-flight refresh at a time: a second Refresh press while the first
+  -- is running would double-count every row into the merge.
+  if self._findFetch then return end
+  local handles = {}
+  for i, source in ipairs(sources) do
+    handles[i] = { source = source,
+      h = ModIndex.beginFetch(source, { force = force == true }) }
+  end
+  local quiet = (opts and opts.quiet) == true
+  self._findFetch = {
+    handles = handles, force = force == true, quiet = quiet,
+    mods = {}, seen = {}, cats = {}, catSeen = {}, errs = {},
+    carts = {}, cartSeen = {}, bases = {}, baseSeen = {},
+    stale = false, oldest = nil, at = 1,
+  }
+  if force == true and not quiet then
+    self:_setBusy(Strings("Fetching mod index"),
+      #sources == 1 and (sources[1].label or sources[1].feed)
+        or Strings("%d indexes", #sources))
+  end
+end
+
+-- Drive the in-flight index fetch one frame at a time.  Called from update().
+function RomImporter:_pumpFindFetch()
+  local f = self._findFetch
+  if not f then return end
+  local ModIndex = require("src.mods.ModIndex")
+
+  -- Pump every handle each frame; they run concurrently on the fetch pool.
+  local allDone = true
+  for _, item in ipairs(f.handles) do
+    if not item.done then
+      local ok, done, index, err, meta = pcall(ModIndex.pumpFetch, item.h)
+      if not ok then
+        item.done = true
+        f.errs[#f.errs + 1] = (item.source.label or item.source.feed)
+          .. ": " .. tostring(done)
+      elseif done then
+        item.done = true
+        if not index then
+          f.errs[#f.errs + 1] = (item.source.label or item.source.feed)
+            .. ": " .. tostring(err)
+        else
+          item.index, item.meta = index, meta
+        end
+      else
+        allDone = false
+      end
+    end
+  end
+  self._busyCount = nil
+  if not allDone then return end
+
+  -- Merge in SOURCE ORDER, not completion order: first source wins on a
+  -- duplicate id, matching how the mod loader resolves two mods with one id,
+  -- and that rule has to be stable regardless of which index answered first.
+  for _, item in ipairs(f.handles) do
+    local index, meta, source = item.index, item.meta, item.source
+    if index then
+      if meta and meta.stale then f.stale = true end
+      if meta and meta.checkedAt then
+        f.oldest = math.min(f.oldest or meta.checkedAt, meta.checkedAt)
+      end
+      for _, entry in ipairs(index.mods or {}) do
+        if not f.seen[entry.id] then
+          f.seen[entry.id] = true
+          entry._source = source.label or source.feed
+          entry._base = source.base
+          f.mods[#f.mods + 1] = entry
+        end
+      end
+      -- Carts merge on the same first-source-wins rule, in their own id
+      -- space: a cart and a mod may share an id without shadowing each other.
+      for _, entry in ipairs(index.carts or {}) do
+        if not f.cartSeen[entry.id] then
+          f.cartSeen[entry.id] = true
+          entry._source = source.label or source.feed
+          entry._base = source.base
+          f.carts[#f.carts + 1] = entry
+        end
+      end
+      for _, c in ipairs(ModIndex.categoriesIn(index)) do
+        if not f.catSeen[c] then
+          f.catSeen[c] = true
+          f.cats[#f.cats + 1] = c
+        end
+      end
+      for _, b in ipairs(ModIndex.baseGamesIn(index)) do
+        if not f.baseSeen[b] then
+          f.baseSeen[b] = true
+          f.bases[#f.bases + 1] = b
+        end
+      end
+    end
+  end
+
+  self.findIndex = { mods = f.mods, carts = f.carts, categories = f.cats,
+                     baseGames = f.bases, stale = f.stale,
+                     checkedAt = f.oldest }
+  self.findLoaded = true
+  if #f.errs > 0 and f.quiet then
+    if self._updateAll then self._updateAll.feedStale = true end
+  elseif #f.errs > 0 then
+    self.findNotice = { ok = false, text = table.concat(f.errs, "  -  ") }
+  elseif f.force and not f.quiet then
+    self.findNotice = { ok = true,
+      text = (#f.carts > 0)
+        and Strings("Refreshed - %d mods and %d carts listed", #f.mods, #f.carts)
+        or Strings("Refreshed - %d mods listed", #f.mods) }
+  end
+  -- A category that no longer exists after a refresh would filter everything
+  -- away with no way back except guessing.  Same for a base game.
+  if self.findCategory and not f.catSeen[self.findCategory] then
+    self.findCategory = nil
+  end
+  if self.findBase and not f.baseSeen[self.findBase] then
+    self.findBase = nil
+  end
+  self.findPage = 1
+  self._findFetch = nil
+  self:_clearBusy()
+end
+
+-- Clearing rebinds used to live here, behind a button on the game panel.  It
+-- is now the RESET REBINDS row of the settings model
+-- (src/import/LauncherSettings.lua), which edits the same options table the
+-- rest of that panel does and saves through the same save() -- one control
+-- for a setting that was never per-game in the first place.
+
+-- ------- busy state (drives the non-dismissable loader overlay)
+-- Anything that makes the user wait sets this; LauncherView renders it as a
+-- blocking overlay so no operation can ever run invisibly.
+function RomImporter:_setBusy(title, detail, cancel)
+  self._busy = { title = title, detail = detail, cancel = cancel }
+end
+
+function RomImporter:_clearBusy()
+  self._busy = nil
+end
+
+function RomImporter:_ensureFind()
+  if not self.findLoaded then
+    self:_refreshFindSources()
+    if #(self.findSources or {}) == 0 then
+      -- Nothing to fetch, but the panel is loaded: the empty state is the
+      -- answer, not a pending request.
+      self.findIndex = { mods = {}, carts = {}, categories = {}, baseGames = {} }
+      self.findLoaded = true
+    else
+      self:_refreshFind(false)
+    end
+  end
+end
+
+-- Whether the FIND panel is browsing carts rather than mods.
+function RomImporter:findingCarts()
+  return self.findKind == "carts"
+end
+
+-- The switch itself.  Query survives the flip; the category / base filter
+-- does not, because neither vocabulary applies to the other list.
+function RomImporter:_setFindKind(kind)
+  kind = (kind == "carts") and "carts" or "mods"
+  if self.findKind == kind then return end
+  self.findKind = kind
+  self._findRowsCache = nil
+  self._findSortCache = nil
+  if self._pages then self._pages["find"] = 1 end
+  self.findPage = 1
+end
+
+-- The rows the filters leave, and the installed-mod context the compatibility
+-- warnings are judged against.
+function RomImporter:_findRows()
+  local carts = self:findingCarts()
+  local all = (self.findIndex
+    and (carts and self.findIndex.carts or self.findIndex.mods)) or {}
+  -- The view asks every frame (immediate mode); only re-filter when the
+  -- index, query, or filter actually changed.
+  local c = self._findRowsCache
+  if c and c.src == all and c.query == self.findQuery
+      and c.category == self.findCategory and c.base == self.findBase
+      and c.game == self.findGame then
+    return c.rows
+  end
+  local ModIndex = require("src.mods.ModIndex")
+  local rows = ModIndex.filter(all, {
+    query = self.findQuery,
+    category = (not carts) and self.findCategory or nil,
+    base = carts and self.findBase or nil,
+    game = self.findGame,
+  })
+  self._findRowsCache = { src = all, query = self.findQuery,
+    category = self.findCategory, base = self.findBase,
+    game = self.findGame, rows = rows }
+  return rows
+end
+
+function RomImporter:_setFindGame(token)
+  if token == "all" then token = nil end
+  if self.findGame == token then return end
+  self.findGame = token
+  self._findRowsCache = nil
+  self._findSortCache = nil
+  if self._pages then self._pages["find"] = 1 end
+  self.findPage = 1
+end
+
+function RomImporter:_findInstalledMap()
+  if self:findingCarts() then return self:_findInstalledCarts() end
+  if self.findInstalled then return self.findInstalled end
+  local LauncherMods = require("src.mods.LauncherMods")
+  if self.mods then
+    self.findInstalled = {}
+    for _, m in ipairs(self.mods) do
+      self.findInstalled[m.id] = m.version or true
+    end
+  else
+    self.findInstalled = LauncherMods.installedVersions() or {}
+  end
+  return self.findInstalled
+end
+
+-- id -> installed version for every cart on disk, whatever game it plays as.
+-- Cached because the row loop asks once per frame.
+function RomImporter:_findInstalledCarts()
+  if self._findCartMap then return self._findCartMap end
+  local map = {}
+  local ok, rows = pcall(function()
+    return require("src.carts.CartStore").index()
+  end)
+  if ok and type(rows) == "table" then
+    for _, row in ipairs(rows) do map[row.id] = row.version or true end
+  end
+  self._findCartMap = map
+  return map
+end
+
+-- Read the cached thumbnail for a card.  Starting a download is deliberately
+-- separate: immediate-mode draw may call this for every visible row, but it
+-- must not mutate the fetch queue or perform network work.
+function RomImporter:_findThumb(entry)
+  self._findThumbs = self._findThumbs or {}
+  local cached = self._findThumbs[entry.id]
+  if cached ~= nil then return cached or nil end
+  local ModIndex = require("src.mods.ModIndex")
+  local url = ModIndex.joinUrl(entry._base, entry.thumbnail)
+  if not url then
+    self._findThumbs[entry.id] = false
+    return nil
+  end
+  return nil
+end
+
+-- Queue one thumbnail after draw has recorded the visible rows.  The fetch
+-- pool runs off-thread; only the finished image decode stays in update().
+function RomImporter:_startFindThumb(entry)
+  self._findThumbs = self._findThumbs or {}
+  if self._findThumbs[entry.id] ~= nil then return end
+  local ModIndex = require("src.mods.ModIndex")
+  local url = ModIndex.joinUrl(entry._base, entry.thumbnail)
+  if not url then
+    self._findThumbs[entry.id] = false
+    return
+  end
+  -- ASYNC (was one blocking download per frame).  Only rows on the current
+  -- page ever ask, so pagination already bounds this to a page's worth of
+  -- requests; the fetch pool runs them off-thread and the card shows its
+  -- placeholder until the image lands.
+  self._findThumbFetch = self._findThumbFetch or {}
+  if not self._findThumbFetch[entry.id] then
+    local ext = url:match("%.(%a%a%a?%a?)$") or "png"
+    local name = ("mod_thumb_%s.%s")
+      :format(tostring(entry.id):gsub("[^%w%-_]", "_"), ext)
+    local Fetch = require("src.net.Fetch")
+    self._findThumbFetch[entry.id] = {
+      -- A short ceiling on purpose: a page of these is queued at once, and
+      -- each one's ceiling is part of the worst case for closing the window
+      -- (Fetch.shutdown).  A thumbnail that has not arrived in 15s is not
+      -- worth holding the process open for -- the card shows its placeholder.
+      job = Fetch.download(url, name,
+        { userAgent = "gen1recomp-mod-index", maxSeconds = 15 }),
+    }
+  end
+  return nil
+end
+
+-- Turn finished thumbnail downloads into images.  Called from update(), so
+-- love.graphics.newImage runs on the render thread where it belongs.
+-- love.graphics.newImage decodes the PNG and uploads it, both on the render
+-- thread.  A page's worth of thumbnails landing in the same frame did that
+-- many times back to back and dropped the frame, so only this many are
+-- decoded per pass; the rest keep their spinner one frame longer.
+local THUMB_DECODES_PER_FRAME = 2
+
+function RomImporter:_pumpFindThumbs()
+  local pending = self._findThumbFetch
+  if not pending then return end
+  local Fetch = require("src.net.Fetch")
+  local decoded = 0
+  for id, item in pairs(pending) do
+    if decoded >= THUMB_DECODES_PER_FRAME then break end
+    local st = Fetch.poll(item.job)
+    if st.status ~= "pending" then
+      Fetch.release(item.job)
+      pending[id] = nil
+      local image
+      if st.status == "ok" and st.path then
+        local ok, img = pcall(love.graphics.newImage, st.path)
+        image = ok and img or nil
+        decoded = decoded + 1
+      end
+      self._findThumbs = self._findThumbs or {}
+      self._findThumbs[id] = image or false
+    end
+  end
+  if next(pending) == nil then self._findThumbFetch = nil end
+end
+
+-- Release stats for a FIND MODS row, resolved the same way the MODS tab
+-- does it: the mod's own GitHub releases through ModUpdate's cached fetch,
+-- so an installed mod's repo is instant and every result lands in
+-- mod_update_cache.lua for six hours.  A feed that publishes stats wins
+-- outright (fresher, zero network); otherwise the repo is fetched, one
+-- entry per frame so opening the tab cannot stall for the whole listing.
+-- The result is memoized per id for the session; a repo with no releases
+-- or a failed fetch resolves to an empty table so it is tried once.
+-- PURE read: whatever is already known for a row, or nil.  Resolving a
+-- feed-published stat or a repo-less entry is memoization, not network, so it
+-- stays here; nothing in this function can start a fetch.  That matters
+-- because the sort comparator calls it for EVERY entry -- when queueing lived
+-- in here, sorting a 500-mod index by Popularity queued 500 GitHub requests
+-- on the first frame, blew the hourly rate limit, and the failures then
+-- re-queued together every 60s for as long as the tab was open.
+function RomImporter:_findStatsCached(entry)
+  self._findStatsCache = self._findStatsCache or {}
+  local cached = self._findStatsCache[entry.id]
+  if cached then
+    if cached.done or (cached.retryAt and os.time() < cached.retryAt) then
+      return cached
+    end
+    return nil   -- retry window open; _requestFindStats decides what to do
+  end
+  local ModIndex = require("src.mods.ModIndex")
+  local dl = ModIndex.downloadStats(entry)
+  local dates = ModIndex.releaseDates(entry)
+  if dl or dates then
+    cached = { total = dl and dl.total, recent = dl and dl.recent,
+               windowDays = dl and dl.window_days, asOf = dl and dl.as_of,
+               first = dates and dates.first, latest = dates and dates.latest,
+               done = true }
+    self._findStatsCache[entry.id] = cached
+    return cached
+  end
+  if not entry.github or entry.github == "" then
+    cached = { done = true }
+    self._findStatsCache[entry.id] = cached
+    return cached
+  end
+  return nil
+end
+
+-- Queue one row's release fetch.  Only rows actually on the page call this --
+-- the rule _findThumb already follows -- so the fan-out is a page, not the
+-- whole index.
+function RomImporter:_requestFindStats(entry)
+  if self:_findStatsCached(entry) then return end
+  if not entry.github or entry.github == "" then return end
+  local cached = self._findStatsCache[entry.id]
+  if cached then
+    if cached.retryAt and os.time() >= cached.retryAt then
+      self._findStatsCache[entry.id] = nil   -- retry window open, refetch
+    else
+      return
+    end
+  end
+  self._findStatsPending = self._findStatsPending or {}
+  if self._findStatsPending[entry.id] then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  self._findStatsPending[entry.id] = {
+    id = entry.id,
+    h = ModUpdate.beginFetchReleases(entry.github, entry.id, {}),
+  }
+end
+
+-- Read-only accessor for a row being drawn or shown in the detail modal.
+-- Network work is scheduled by _queueFindEnrichment from update().
+function RomImporter:_findStats(entry)
+  return self:_findStatsCached(entry)
+end
+
+-- How many rows are still waiting on a release check, for the panel's
+-- progress line.
+function RomImporter:_findStatsPendingCount()
+  local n = 0
+  for _ in pairs(self._findStatsPending or {}) do n = n + 1 end
+  return n
+end
+
+function RomImporter:_findStatsPendingFor(id)
+  return (self._findStatsPending and self._findStatsPending[id]) ~= nil
+end
+
+function RomImporter:_findThumbPending(id)
+  return (self._findThumbFetch and self._findThumbFetch[id]) ~= nil
+end
+
+-- Draw records the visible page in _findVisibleEntries.  Queue only a small
+-- batch from that snapshot during update(), keeping network scheduling out of
+-- the immediate-mode render path and preventing a large index from creating a
+-- burst of thumbnail/GitHub work in one frame.
+local FIND_ENRICH_PER_FRAME = 2
+
+function RomImporter:_queueFindEnrichment()
+  if self.tab ~= "find" or not self.findLoaded then return end
+  local visible = self._findVisibleEntries
+  if not visible then return end
+  local thumbnails, stats = 0, 0
+  for _, entry in ipairs(visible) do
+    -- A row already resolved to "failed" (or with no thumbnail at all) must not
+    -- spend this frame's allowance: _startFindThumb ignores it, so counting it
+    -- let two dead rows above a card starve it of a download forever.
+    if thumbnails < FIND_ENRICH_PER_FRAME
+        and self:_findThumb(entry) == nil
+        and not (self._findThumbs and self._findThumbs[entry.id] ~= nil)
+        and not self:_findThumbPending(entry.id) then
+      self:_startFindThumb(entry)
+      thumbnails = thumbnails + 1
+    end
+    if stats < FIND_ENRICH_PER_FRAME
+        and self:_findStatsCached(entry) == nil
+        and entry.github and entry.github ~= ""
+        and not self:_findStatsPendingFor(entry.id) then
+      self:_requestFindStats(entry)
+      stats = stats + 1
+    end
+    if thumbnails >= FIND_ENRICH_PER_FRAME
+        and stats >= FIND_ENRICH_PER_FRAME then
+      break
+    end
+  end
+end
+
+-- Drive in-flight FIND MODS stats lookups.  Called from update().
+function RomImporter:_pumpFindStats()
+  local pending = self._findStatsPending
+  if not pending then return end
+  local ModUpdate = require("src.mods.ModUpdate")
+  for id, item in pairs(pending) do
+    local ok, done, releases, err = pcall(ModUpdate.pumpFetchReleases, item.h)
+    if not ok or done then
+      pending[id] = nil
+      local stats = (ok and releases) and ModUpdate.statsForReleases(releases) or nil
+      local cached
+      if stats then
+        cached = { total = stats.total, first = stats.first,
+                   latest = stats.latest, done = true }
+      else
+        -- A repo that does not exist is permanent; every other failure (the
+        -- hourly API rate limit, a hiccup) is retried in a minute so rows can
+        -- recover without restarting the launcher.
+        local permanent = tostring(ok and err or done)
+          :find("Not Found", 1, true) ~= nil
+        cached = { done = permanent, retryAt = os.time() + 60 }
+      end
+      self._findStatsCache = self._findStatsCache or {}
+      self._findStatsCache[id] = cached
+      -- The FIND list's sort cache is keyed on this revision; without the
+      -- bump a Popularity/date sort stays frozen in the order of the first
+      -- frame (no stats yet = name order) even after every fetch lands.
+      self._findStatsRev = (self._findStatsRev or 0) + 1
+    end
+  end
+  if next(pending) == nil then self._findStatsPending = nil end
+end
+
+-- Open the text prompt for an additional index URL.
+function RomImporter:_promptAddIndex()
+  self._indexPrompt = { text = "" }
+  self:_armTextInput()
+end
+
+function RomImporter:_commitAddIndex()
+  local prompt = self._indexPrompt
+  self._indexPrompt = nil
+  self:_disarmTextInput()
+  if not prompt then return end
+  local ModIndex = require("src.mods.ModIndex")
+  local row, err = ModIndex.addSource(prompt.text or "")
+  if not row then
+    self.findNotice = { ok = false, text = tostring(err) }
+    return
+  end
+  self.findNotice = { ok = true, text = Strings("Added %s", row.label or row.feed) }
+  self.findLoaded = false
+  self:_ensureFind()
+end
+
+function RomImporter:_removeIndex(feed)
+  local ModIndex = require("src.mods.ModIndex")
+  local ok, err = ModIndex.removeSource(feed)
+  if not ok then
+    self.findNotice = { ok = false, text = tostring(err) }
+    return
+  end
+  self.findNotice = { ok = true, text = Strings("Index removed") }
+  self.findLoaded = false
+  self:_ensureFind()
+end
+
+-- Fetch and show an entry's description markdown.  Loaded on demand, never
+-- with the listing: a feed of any size would otherwise be one request per mod.
+function RomImporter:_findShowDetails(entry)
+  local ModIndex = require("src.mods.ModIndex")
+  local url = ModIndex.joinUrl(entry._base, entry.description_url)
+  self:_cancelFindDetails()
+  self._findDetails = {
+    title = entry.title or entry.id,
+    body = entry.summary or "",
+    loading = url ~= nil,
+    scroll = 0,
+  }
+  if url then
+    self._findDetailsFetch = ModIndex.beginFetchText(url)
+  end
+end
+
+function RomImporter:_cancelFindDetails()
+  local h = self._findDetailsFetch
+  if not h then return end
+  self._findDetailsFetch = nil
+  pcall(require("src.mods.ModIndex").cancelFetchText, h)
+end
+
+function RomImporter:_pumpFindDetails()
+  local h = self._findDetailsFetch
+  if not h then return end
+  if not self._findDetails then
+    self:_cancelFindDetails()
+    return
+  end
+  local ok, done, text = pcall(require("src.mods.ModIndex").pumpFetchText, h)
+  if ok and not done then return end
+  self._findDetailsFetch = nil
+  local d = self._findDetails
+  if not d then return end
+  d.loading = false
+  if ok and type(text) == "string" and text ~= "" then d.body = text end
+end
+
+-- Arm the install confirm.  The compatibility list is the whole point of the
+-- dialog: the panel deliberately does not hide an incompatible mod (an index
+-- entry can be months stale, and a hidden mod looks like a missing one), so
+-- this is where the player is told what the author declared before anything
+-- is downloaded.
+function RomImporter:_findConfirmInstall(entry)
+  local ModIndex = require("src.mods.ModIndex")
+  local Version = require("src.core.Version")
+  local url, why = ModIndex.installUrl(entry)
+  if not url then
+    self.findNotice = { ok = false,
+      text = (entry.title or entry.id) .. ": " .. tostring(why) }
+    return
+  end
+  if ModIndex.isCart(entry) then
+    return self:_findConfirmCartInstall(entry)
+  end
+  local installed = self:_findInstalledMap()
+  local issues = ModIndex.compatIssues(entry, {
+    modApi = Version.modApi,
+    engineVersion = Version.engine,
+    installed = installed,
+  })
+  local version = ModIndex.displayVersion(entry)
+  local lines = { (entry.title or entry.id) .. " v" .. tostring(version) }
+  if entry.author then lines[#lines + 1] = "by " .. entry.author end
+  local have = installed[entry.id]
+  if have then
+    lines[#lines + 1] = "Replaces installed v" .. tostring(have)
+  end
+  for _, issue in ipairs(issues) do
+    lines[#lines + 1] = "! " .. issue.text
+  end
+  lines[#lines + 1] = "Mods are not reviewed - trust the author."
+  self._modConfirm = {
+    kind = (#issues > 0) and "warn" or "update",
+    indexEntry = entry,
+    title = have and "Reinstall mod" or "Install mod",
+    yesLabel = have and "Reinstall" or "Install",
+    lines = lines,
+  }
+end
+
+-- The cart twin of the confirm above.  The pinned list is what the player is
+-- agreeing to; installing the cart installs none of it.
+function RomImporter:_findConfirmCartInstall(entry)
+  local ModIndex = require("src.mods.ModIndex")
+  local Version = require("src.core.Version")
+  local issues = ModIndex.compatIssues(entry, {
+    modApi = Version.modApi,
+    engineVersion = Version.engine,
+    installed = self:_findInstalledMap(),
+  })
+  local version = ModIndex.displayVersion(entry)
+  local info = GameVersion.info(entry.base)
+  local lines = { (entry.title or entry.id) .. " v" .. tostring(version) }
+  if entry.author then lines[#lines + 1] = "by " .. entry.author end
+  lines[#lines + 1] = "Plays as "
+    .. tostring((info and (info.launcherName or info.displayName)) or entry.base)
+    .. " - " .. tostring(entry.seal)
+  lines[#lines + 1] = ("Pins %d mod(s), installed separately from its page")
+    :format(#(entry.mods or {}))
+  local have = self:_findInstalledCarts()[entry.id]
+  if have then
+    lines[#lines + 1] = "Replaces installed v" .. tostring(have)
+  end
+  for _, issue in ipairs(issues) do
+    lines[#lines + 1] = "! " .. issue.text
+  end
+  lines[#lines + 1] = "Carts are not reviewed - trust the author."
+  self._modConfirm = {
+    kind = (#issues > 0) and "warn" or "update",
+    indexEntry = entry,
+    title = have and "Reinstall cart" or "Install cart",
+    yesLabel = have and "Reinstall" or "Install",
+    lines = lines,
+  }
+end
+
+function RomImporter:_findInstall(entry)
+  local ModIndex = require("src.mods.ModIndex")
+  if ModIndex.isCart(entry) then return self:_beginCartInstall(entry) end
+  self:_beginModInstall({
+    modId = entry.id, name = entry.title or entry.id, entry = entry,
+    verb = "Installed", notice = "find",
+  })
 end
 
 return RomImporter

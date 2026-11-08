@@ -12,6 +12,12 @@ Registry.__index = Registry
 -- exposed to mods as mod.DELETE: a patch value that unsets a field
 Registry.DELETE = Merge.DELETE
 
+local function assertWritable(self, id)
+  if self.spec.reservedIds and self.spec.reservedIds[id] then
+    error(("%s id is reserved engine metadata: %s"):format(self.name, id))
+  end
+end
+
 -- spec comes from Schemas.REGISTRIES[name]; bare Registry.new(name) keeps
 -- the v1 record behavior for standalone use in tests and tools
 function Registry.new(name, spec)
@@ -28,11 +34,12 @@ function Registry.new(name, spec)
   }, Registry)
 end
 
-local function append(self, id, op, value, owner)
+local function append(self, id, op, value, owner, transform)
   if self.frozen then
     error(self.name .. ": content is frozen after load")
   end
   assert(type(id) == "string" and id ~= "", self.name .. " id is required")
+  assertWritable(self, id)
   local list = self.ops[id]
   if not list then
     list = {}
@@ -44,7 +51,7 @@ local function append(self, id, op, value, owner)
     self.seen[id] = true
     self.order[#self.order + 1] = id
   end
-  list[#list + 1] = { op = op, value = value, owner = owner }
+  list[#list + 1] = { op = op, value = value, owner = owner, transform = transform }
   self.owners[id] = owner
   self.cache[id] = nil
   return value
@@ -69,6 +76,8 @@ local function fold(self, value, opList)
     -- without this the bare DELETE table would leak into Data as a record
     if entry.value == Merge.DELETE then
       value = nil
+    elseif op == "transform" then
+      value = entry.transform(Merge.deepCopy(value), Merge.deepCopy(entry.value))
     elseif op == "override" or (op == "register" and not deep) then
       value = entry.value
     elseif op == "register" or op == "patch" then
@@ -109,6 +118,15 @@ function Registry:patch(id, partial, owner)
     error(self.name .. ": patch is not supported on compose registries")
   end
   return append(self, id, "patch", partial, owner)
+end
+
+function Registry:patchTransformed(id, partial, owner, transform)
+  if self.frozen then error(self.name .. ": content is frozen after load") end
+  assert(self.spec.semantics ~= "compose", self.name .. ": transformed patch is record-only")
+  assert(partial ~= nil and type(transform) == "function", "invalid transformed patch")
+  local value = transform(Merge.deepCopy(self:get(id)), Merge.deepCopy(partial))
+  append(self, id, "transform", Merge.deepCopy(partial), owner, transform)
+  return value
 end
 
 -- tombstone: consumers treat the id as absent after the merge

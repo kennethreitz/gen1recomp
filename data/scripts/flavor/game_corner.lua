@@ -10,10 +10,10 @@
 local function coinGiver(opts)
   return function(game, ow, npc, done)
     local TextBox = require("src.render.TextBox")
-    local Sound = require("src.core.Sound")
     local t = game.data.text
-    local function push(label, fallback, onDone)
-      game.stack:push(TextBox.new(game, t[label] or fallback, onDone or done))
+    local function push(label, fallback, onDone, popts)
+      game.stack:push(TextBox.new(game, t[label] or fallback, onDone or done,
+                                  popts))
     end
     if game.save.flags[opts.event] then
       push(opts.alreadyGotLabel, opts.alreadyGotFallback)
@@ -24,15 +24,18 @@ local function coinGiver(opts)
         push("_GameCornerOopsForgotCoinCaseText", "Oops! Forgot the\nCOIN CASE!")
         return
       end
-      if (game.save.coins or 0) >= 9990 then
+      local coins = game.save.coins or 0
+      if (opts.exact9990 and coins == 9990)
+          or (not opts.exact9990 and coins >= 9990) then
         push(opts.coinCaseFullLabel, opts.coinCaseFullFallback)
         return
       end
       game.save.coins = math.min(9999, (game.save.coins or 0) + opts.amount)
       game.save.flags[opts.event] = true
-      Sound.play(game.data, "Get_Item1")
+      -- the ReceivedNCoinsText strings carry sound_get_item_1
       push(opts.receivedLabel,
-        ("{PLAYER} received\n%d coins!"):format(opts.amount))
+        ("{PLAYER} received\n%d coins!"):format(opts.amount), nil,
+        TextBox.soundOpts(game, "Get_Item1"))
     end)
   end
 end
@@ -68,21 +71,60 @@ return {
         alreadyGotFallback = "Darn! I need more\ncoins for the\vPOKéMON I want!",
       }),
 
-      -- GameCornerGentlemanText (pokered/scripts/GameCorner.asm): gives 20
-      -- coins once (EVENT_GOT_20_COINS). Note the original ASM uses
-      -- Has9990Coins' `jr z` (only the exact-9990 case) here rather than
-      -- Clerk1/Clerk2's `jr nc` (>=9990); ported as >=9990 to match their
-      -- "coin case is basically full" intent and avoid a coin-count
-      -- edge case where 9991-9999 would otherwise slip past the check.
+      -- pokered/scripts/GameCorner.asm:378
       TEXT_GAMECORNER_GENTLEMAN = coinGiver({
         event = "EVENT_GOT_20_COINS",
         amount = 20,
+        exact9990 = true,
         askLabel = "_GameCornerGentlemanThrowingMeOffText",
         askFallback = "Hey, what? You're\nthrowing me off!\vHere are some\vcoins, shoo!",
         receivedLabel = "_GameCornerGentlemanReceived20CoinsText",
         coinCaseFullLabel = "_GameCornerGentlemanYouGotYourOwnCoinsText",
         coinCaseFullFallback = "You've got your\nown coins!",
         alreadyGotLabel = "_GameCornerGentlemanCloselyWatchTheReelsText",
+        alreadyGotFallback = "The trick is to\nwatch the reels\vclosely!",
+      }),
+
+      -- Yellow keeps all three giveaways with the same events and amounts
+      -- but renames the objects and their text labels: FISHING_GURU ->
+      -- FISHING_GURU1, CLERK2 -> MIDDLE_AGED_MAN2, GENTLEMAN ->
+      -- FISHING_GURU2 (pokeyellow/scripts/GameCorner.asm).  The Red/Blue
+      -- keys above never match there, so Yellow needs its own three (#552).
+      TEXT_GAMECORNER_FISHING_GURU1 = coinGiver({
+        event = "EVENT_GOT_10_COINS",
+        amount = 10,
+        askLabel = "_GameCornerFishingGuru1WantToPlayText",
+        askFallback = "Kid, do you want\nto play?",
+        receivedLabel = "_GameCornerFishingGuru1Received10CoinsText",
+        coinCaseFullLabel = "_GameCornerFishingGuru1DontNeedMyCoinsText",
+        coinCaseFullFallback = "You don't need my\ncoins!",
+        alreadyGotLabel = "_GameCornerFishingGuru1WinsComeAndGoText",
+        alreadyGotFallback = "Wins seem to come\nand go.",
+      }),
+
+      TEXT_GAMECORNER_MIDDLE_AGED_MAN2 = coinGiver({
+        event = "EVENT_GOT_20_COINS_2",
+        amount = 20,
+        askLabel = "_GameCornerMiddleAgedMan2WantSomeCoinsText",
+        askFallback = "What's up? Want\nsome coins?",
+        receivedLabel = "_GameCornerMiddleAgedMan2Received20CoinsText",
+        coinCaseFullLabel = "_GameCornerMiddleAgedMan2YouHaveLotsOfCoinsText",
+        coinCaseFullFallback = "You have lots of\ncoins!",
+        alreadyGotLabel = "_GameCornerMiddleAgedMan2INeedMoreCoinsText",
+        alreadyGotFallback = "Darn! I need more\ncoins for the\vPOKéMON I want!",
+      }),
+
+      -- pokeyellow/scripts/GameCorner.asm:382
+      TEXT_GAMECORNER_FISHING_GURU2 = coinGiver({
+        event = "EVENT_GOT_20_COINS",
+        amount = 20,
+        exact9990 = true,
+        askLabel = "_GameCornerFishingGuru2ThrowingMeOffText",
+        askFallback = "Hey, what? You're\nthrowing me off!\vHere are some\vcoins, shoo!",
+        receivedLabel = "_GameCornerFishingGuru2Received20CoinsText",
+        coinCaseFullLabel = "_GameCornerFishingGuru2YouGotYourOwnCoinsText",
+        coinCaseFullFallback = "You've got your\nown coins!",
+        alreadyGotLabel = "_GameCornerFishingGuru2CloselyWatchTheReelsText",
         alreadyGotFallback = "The trick is to\nwatch the reels\vclosely!",
       }),
     },

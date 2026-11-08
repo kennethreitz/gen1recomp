@@ -26,14 +26,10 @@ local WideBattle = {
   FIELD_BOTTOM = 104,
 }
 
--- The forced-mono display modes re-threshold the whole finished frame
--- through the shade shader, and picImage hands them raw DMG grays for that
--- (#207).  The wide layout has to know: it exposes a matching whole-surface
--- zone and leaves the HP bar fill gray, exactly like the zone pass does in
--- the classic layout (#229).  Keep in sync with picImage / ensureZones.
 local function monoMode()
   local m = PaletteFX.mode
   return m == "og" or m == "og_inv" or m == "classic"
+      or PaletteFX.forcesRawGrays()
 end
 
 local function shownHP(battler)
@@ -92,6 +88,39 @@ local function levelAt(battle, battler, x, y)
   end
 end
 
+local function battleIsTopState(battle)
+  local stack = battle.game and battle.game.stack
+  return not (stack and stack.top) or stack:top() == battle
+end
+
+-- engine/menus/party_menu.asm:4
+local function coveredByOpaqueState(battle)
+  local stack = battle.game and battle.game.stack
+  local states = stack and stack.states
+  if not states then return false end
+  local above = false
+  for i = 1, #states do
+    if above and states[i] and states[i].isOpaque then return true end
+    if states[i] == battle then above = true end
+  end
+  return false
+end
+
+local function anchorHUD(battle, x, y, w, h, anchor)
+  if not battle:extendedHUD() or not battleIsTopState(battle) then return end
+  local renderer = battle.game and battle.game.renderer
+  if not (renderer and renderer.setBattleUIAnchor) then return end
+  x = x + (battle.extendedHUDOffsetX or 0)
+  y = y + (battle.extendedHUDOffsetY or 0)
+  local x2 = math.min(WideBattle.WIDTH, x + w)
+  local y2 = math.min(WideBattle.HEIGHT, y + h)
+  x, y = math.max(0, x), math.max(0, y)
+  w, h = x2 - x, y2 - y
+  if w > 0 and h > 0 then
+    renderer:setBattleUIAnchor(x, y, w, h, anchor)
+  end
+end
+
 -- One side's status box: name and level on the first line, a long HP bar
 -- under it, and the numeric HP on the player's box only (the foe's exact
 -- HP is never shown, like the original).
@@ -108,18 +137,19 @@ local function drawStatusPanel(battle, battler, x, y, player)
   HudTiles.drawHPBar(battle.data, tx + 1, ty + 2, {
     hp = shownHP(battler),
     stats = battler.mon.stats,
-  }, nil, monoMode(), tw - 5)
+  }, nil, monoMode(), tw - 5, battler.shownPx)
 
   if player then
     Font.draw(("%3d/%3d"):format(shownHP(battler), battler.mon.stats.hp),
       x + tw * 8 - 64, y + 24)
   end
+  anchorHUD(battle, x, y, tw * 8, th * 8, player and "bottom" or "top")
 end
 
 -- the party ball rows DrawAllPokeballs puts up with the intro text, moved
 -- out to the wide screen's own corners
 local function drawIntroBalls(battle)
-  if not battle.introBalls then return end
+  if battle.introBalls ~= true then return end
   if battle.enemyParty and
       (battle.kind == "trainer" or battle.kind == "link") then
     battle:drawBallRow(battle.enemyParty, 88, 40, -8)
@@ -128,36 +158,41 @@ local function drawIntroBalls(battle)
 end
 
 local function drawHUDs(battle, slide)
-  if battle.enemy and not battle.showEnemyTrainer
+  -- engine/menus/pokedex.asm:581-582
+  if battle.fieldCleared then return end
+  local showStatus = battle:statusHUDVisible()
+  if showStatus and battle.enemy and not battle.showEnemyTrainer
       and not battle.enemySendingOut and not battle:growInScale(battle.enemy)
       and slide == 0 and not battle.introBalls and not battle.enemy.fainted then
     drawStatusPanel(battle, battle.enemy, 0, 0, false)
   end
 
-  if battle.safari then
-    Font.drawBox(23, 7, 15, 4)
-    love.graphics.setColor(0, 0, 0, 1)
-    Font.draw(("BALLx%2d"):format(battle.safari.balls), 200, 72)
-  elseif battle.player and not battle.demo and not battle.showPlayerBack
-      and slide == 0 then
+  -- No player status panel in a safari / old-man battle: no mon of the
+  -- player's is out.  Nothing replaces it either -- the ball count is a menu
+  -- item, not a HUD element (DisplayBattleMenu prints wNumSafariBalls inside
+  -- the battle menu box, engine/battle/core.asm:2074-2079), so it rides in
+  -- drawCommandMenu below like the classic layout's (#540).
+  -- RemoveFaintedPlayerMon clears the player HUD (core.asm:1024-1026) (#1721)
+  if showStatus and not battle.safari and battle.player and not battle.demo
+      and not battle.showPlayerBack and slide == 0
+      and not battle.player.fainted then
     drawStatusPanel(battle, battle.player, 184, 56, true)
   end
-  drawIntroBalls(battle)
 end
 
 local function drawMessageBox(battle)
   Font.drawBox(0, 13, 38, 5)
   love.graphics.setColor(0, 0, 0, 1)
-  if battle.scrollPx and battle.scrollPx > 0 then
-    battle.scrollPx = battle.scrollPx - 2
-    if battle.scrollPx <= 0 then battle.scrollPx = nil end
-  end
+  -- scrollPx counts down in BattleState:tickTextScroll (logic step), not
+  -- here, so the scroll speed does not follow the display refresh rate
   local off = battle.scrollPx or 0
   local ys = { 112, 128 }
   for li, line in ipairs(battle.shown or {}) do
     local y = (ys[li] or 128) + off
+    local pen = 8
     for i = 1, #line do
-      Font.drawCode(line[i], 8 + (i - 1) * 8, y)
+      Font.drawCode(line[i], pen, y)
+      pen = pen + Font.advanceOf(line[i])
     end
   end
   if (battle.msgWaiting or battle.msgPrompt) and battle.frame % 60 < 30 then
@@ -171,7 +206,10 @@ local function drawCommandMenu(battle)
   if battle.safari then
     Font.drawBox(0, 13, 38, 5)
     love.graphics.setColor(0, 0, 0, 1)
-    Font.draw(Strings("BALLx"), 16, 112)
+    Font.draw(Strings("BALL") .. "\xc3\x97", 16, 112) -- data/text_boxes.asm:73
+    -- wNumSafariBalls immediately after the label, as at hlcoord 7,14
+    -- (engine/battle/core.asm:2074-2079) (#540)
+    Font.draw(("%2d"):format(battle.safari.balls), 56, 112)
     Font.draw(Strings("BAIT"), 168, 112)
     Font.draw(Strings("THROW ROCK"), 16, 128)
     Font.draw(Strings("RUN"), 168, 128)
@@ -183,6 +221,20 @@ local function drawCommandMenu(battle)
   Font.drawBox(0, 13, 20, 5)
   Font.drawBox(20, 13, 18, 5)
   love.graphics.setColor(0, 0, 0, 1)
+  -- The old-man / PROF.OAK catch demo has no party, so makeOldManDemo parks
+  -- the WILD mon in battle.player as a placeholder (BattleState:1209).  The
+  -- classic layout's demo branch never names anyone (DisplayBattleMenu,
+  -- core.asm:2038-2049, just draws the menu), so naming it here printed
+  -- "What will PIKACHU do?" over Oak's scripted throw (#557).  Leave the
+  -- prompt side blank and run the same scripted hand the classic does.
+  if battle.demo then
+    Font.draw(Strings("FIGHT"), 176, 112)
+    Font.drawCode(0xE1, 240, 112); Font.drawCode(0xE2, 248, 112)
+    Font.draw(Strings("ITEM"), 176, 128)
+    Font.draw(Strings("RUN"), 240, 128)
+    Font.drawCode(0xED, 168, (battle.demoTimer or 0) <= battle:demoDelays() and 112 or 128)
+    return
+  end
   Font.draw(Strings("What will"), 8, 112)
   local who = battle.player and battle.player.name or ""
   Font.draw(fitName(who, 112) .. Strings(" do?"), 8, 128)
@@ -199,10 +251,15 @@ local function drawMoveDetails(battle, move)
   if not move then return end
   local def = battle.data.moves[move.id]
   if not def then return end
-  local maxPP = def.pp + (move.ppUps or 0) * math.floor(def.pp / 5)
+  local maxPP = require("src.pokemon.Pokemon").maxPP(def.pp, move.ppUps)
   love.graphics.setColor(0, 0, 0, 1)
   Font.draw(("PP %2d/%2d"):format(move.pp or 0, maxPP), 232, 112)
-  Font.draw(fitName(TypeChart.displayName(def.type), 64), 232, 128)
+  -- battle.data is game.data by reference (BattleState:startBattle sets it
+  -- before TypeChart.load(game.data)), so this resolves through the exact
+  -- same merged table TypeChart's own cache already has -- a no-op today,
+  -- kept only for the same call convention as the pre-battle screens
+  -- (SummaryMenu, HallOfFame) that genuinely need the explicit data.
+  Font.draw(fitName(TypeChart.displayName(def.type, battle.data), 64), 232, 128)
 end
 
 local function drawMoveGrid(battle, moves, selected)
@@ -225,7 +282,10 @@ end
 
 local function drawMoveMenu(battle)
   drawMoveGrid(battle, battle.player.curMoves, battle.moveIndex)
-  if battle.moveSwapIndex then
+  -- The filled cursor replaces the hollow swap marker when they share a row
+  -- (PlaceMenuCursor's tilemap write, home/window.asm:184-185); drawCode blits
+  -- black-on-transparent, so skip the 0xEC instead of stacking glyphs (#814).
+  if battle.moveSwapIndex and battle.moveSwapIndex ~= battle.moveIndex then
     local col = (battle.moveSwapIndex - 1) % 2
     local row = math.floor((battle.moveSwapIndex - 1) / 2)
     Font.drawCode(0xEC, col == 0 and 8 or 112, 112 + row * 16)
@@ -233,6 +293,7 @@ local function drawMoveMenu(battle)
 end
 
 local function drawTextArea(battle)
+  if not battle:bottomUIVisible() then return end
   if battle.phase == "messages" and (battle.current or battle.animPlaying) then
     drawMessageBox(battle)
   elseif battle.phase == "menu" then
@@ -244,6 +305,8 @@ local function drawTextArea(battle)
   else
     Font.drawBox(0, 13, 38, 5)
   end
+  anchorHUD(battle, 0, WideBattle.FIELD_BOTTOM,
+    WideBattle.WIDTH, WideBattle.HEIGHT - WideBattle.FIELD_BOTTOM, "bottom")
 end
 
 -- Battle animations are authored in the original 160px coordinate space.
@@ -285,19 +348,25 @@ end
 -- The whole 304x144 composition for one frame.
 function WideBattle.draw(battle)
   local g = love.graphics
+  local renderer = battle.game and battle.game.renderer
+  local extendedHUD = battle:extendedHUD() and renderer
+                      and renderer.beginBattleHUDPass
+                      and renderer.endBattleHUDPass
   -- The field is the display mode's paper.  Under a forced-mono mode the
   -- whole surface is remapped downstream (WideBattle.zones), so the field
   -- goes down as DMG white and comes out of that pass as the mode's paper;
   -- painting the resolved shade there would run it through the remap twice
   -- and land a shade off the letterbox the renderer fills around it.
-  if monoMode() then
-    g.setColor(1, 1, 1, 1)
-  else
-    g.setColor(PaletteFX.paperShade(battle.data))
+  if not (extendedHUD and battle:extendedWorldHUD()) then
+    if monoMode() then
+      g.setColor(1, 1, 1, 1)
+    else
+      g.setColor(PaletteFX.paperShade(battle.data))
+    end
+    g.rectangle("fill", 0, 0, WideBattle.WIDTH, WideBattle.HEIGHT)
   end
-  g.rectangle("fill", 0, 0, WideBattle.WIDTH, WideBattle.HEIGHT)
   -- AskName clears the field the same way the classic layout does
-  if battle.blankForAskName then return end
+  if battle.blankForAskName or battle.blackoutBlank or coveredByOpaqueState(battle) then return end
 
   local fx = battle.fx
   local sx = (fx and fx.shakeX) or 0
@@ -305,22 +374,57 @@ function WideBattle.draw(battle)
   if sx == 0 and sy == 0 and fx and fx.shake and fx.shake > 0 then
     sx = battle.frame % 4 < 2 and 2 or -2
   end
-  local slide = (battle.introSlide or 0) * 4
+  -- same 2 px/frame silhouette slide the 160px layout uses
+  local slide = (battle.introSlide or 0)
+                * require("src.core.Timing").BATTLE_SLIDE_PX_PER_FRAME
 
   -- Each side keeps its original sprite pixels and placement math: the two
   -- 160x144 OAM regions are translated apart and clipped into the wider
   -- battlefield rather than either monster being scaled.  wideRegion tells
-  -- drawBattlerPic its own side window is already the clip.
+  -- drawBattlerPic its own side window is already the clip.  A shake moves
+  -- each region's clip with its contents, so a pic pushed toward a region
+  -- edge is not sheared off it (a vertical shake used to clip the player's
+  -- feet at FIELD_BOTTOM).
   battle.wideRegion = true
-  inRegion(0, 32, 160, WideBattle.FIELD_BOTTOM - 32, 20 + sx, 8 + sy,
+  inRegion(sx, 32 + sy, 160, WideBattle.FIELD_BOTTOM - 32, 20 + sx, 8 + sy,
     function() battle:drawPicsLayer(slide, 0, 0, "player", true) end)
-  inRegion(160, 0, 144, WideBattle.FIELD_BOTTOM, 136 + sx, sy,
+  inRegion(160 + sx, sy, 144, WideBattle.FIELD_BOTTOM, 136 + sx, sy,
     function() battle:drawPicsLayer(slide, 0, 0, "enemy", true) end)
   battle.wideRegion = nil
+  drawIntroBalls(battle)
 
-  drawHUDs(battle, slide)
+  -- A battle sets rWY to 0 (engine/battle/core.asm), so the window the
+  -- shakes move IS the whole screen: PredefShakeScreenHorizontally,
+  -- PredefShakeScreenVertically and AnimationShakeScreenHorizontallySlow
+  -- displace the HUDs and the message window along with the pics, exactly as
+  -- drawClassic offsets its whole BG canvas.  Shaking only the two pic
+  -- regions left the foe gliding sideways across a nailed-down screen on
+  -- every applying-attack shake -- TAIL WHIP and every other status move
+  -- (#562).  The OAM anim layer stays put, as it does in drawClassic.
+  local function shaken(fn)
+    if sx == 0 and sy == 0 then return fn() end
+    g.push()
+    g.translate(sx, sy)
+    battle.extendedHUDOffsetX, battle.extendedHUDOffsetY = sx, sy
+    fn()
+    battle.extendedHUDOffsetX, battle.extendedHUDOffsetY = nil, nil
+    g.pop()
+  end
   drawAnimationLayer(battle)
-  drawTextArea(battle)
+
+  if extendedHUD then
+    local previous = renderer:beginBattleHUDPass()
+    shaken(function() drawHUDs(battle, slide) end)
+    shaken(function() drawTextArea(battle) end)
+    if fx and fx.flash and fx.flash > 0 and battle.frame % 4 < 2 then
+      g.setColor(1, 1, 1, 0.85)
+      g.rectangle("fill", 0, 0, WideBattle.WIDTH, WideBattle.HEIGHT)
+    end
+    renderer:endBattleHUDPass(previous)
+  else
+    shaken(function() drawHUDs(battle, slide) end)
+    shaken(function() drawTextArea(battle) end)
+  end
 
   if fx and fx.flash and fx.flash > 0 and battle.frame % 4 < 2 then
     g.setColor(1, 1, 1, 0.85)

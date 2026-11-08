@@ -8,14 +8,48 @@
 local MoveEffects = require("src.battle.MoveEffects")
 local Runtime = require("src.mods.Runtime")
 local StatusRegistry = require("src.battle.StatusRegistry")
+local romText = require("src.core.RomText")
 local Strings = require("src.core.Strings")
+local Timing = require("src.core.Timing")
 
 local EffectRegistry = {}
+
+-- PlayApplyingAttackSound's three hit sounds with their frequency modifier
+-- (see the damage-sound comment in runDamaging).  Shared with BattleState's
+-- battle-start prewarm, which must ask for exactly what a hit plays; each hit
+-- gets its own copy (records and mods see it as ctx.hitSfx).
+EffectRegistry.HIT_SOUNDS = {
+  superEffective = { sound = "Super_Effective", pitch = 0xe0 },
+  notVeryEffective = { sound = "Not_Very_Effective", pitch = 0x50 },
+  neutral = { sound = "Damage", pitch = 0x20 },
+}
+
+local function hitSound(kind)
+  local spec = EffectRegistry.HIT_SOUNDS[kind]
+  return { sound = spec.sound, pitch = spec.pitch }
+end
+
+-- A move that misses -- or that registers as missed, which in Gen 1 includes
+-- a type immunity and damage floored to zero -- skips its animation and
+-- falls into PlayerCheckIfFlyOrChargeEffect's `ld c, 30 / call DelayFrames`
+-- (engine/battle/core.asm:3155-3158 and :3185; enemy twin at :5588) before
+-- anything is printed.  EXPLODE_EFFECT is the exception: core.asm:3157
+-- branches it to PlayPlayerMoveAnimation instead, so it pays the animation
+-- rather than the hold -- the same condition that gates cancelMoveAnim.
+local function missBeat(battle, record)
+  if record and record.explode then return end
+  battle:waitNext(Timing.MOVE_STATUS_OR_MISS)
+end
+
+-- engine/battle/core.asm:3224
+local function explodeMissRage(battle, record, target)
+  if record and record.explode then battle:handleBuildingRage(target) end
+end
 
 -- pokered's <USER>/<TARGET> text macros print "Enemy " before the enemy
 -- mon's nickname (home/text.asm PlaceMoveUsersName)
 local function displayName(b)
-  return b.isPlayer and b.name or ("Enemy " .. b.name)
+  return b.isPlayer and b.name or Strings("Enemy %s", b.name)  -- #779
 end
 EffectRegistry.displayName = displayName
 
@@ -78,21 +112,47 @@ local function hitCount(ctx, record)
   return dist[r + 1]
 end
 
+-- engine/battle/effects.asm:119-151 (poison), :194-255 (burn/freeze/paralyze)
+local FBP_SIDE_STATUS = { BRN = true, FRZ = true, PAR = true }
+
+local function secondaryStatusFx(battle, user, status)
+  if status == "PSN" then
+    local row = battle:animNext(user.isPlayer and "ENEMY_HUD_SHAKE_ANIM"
+                                or "SHAKE_SCREEN_ANIM", user.isPlayer)
+    row.animDelayed = true
+    row.hit = { animType = user.isPlayer and 6 or 3 }
+  elseif FBP_SIDE_STATUS[status] and user.isPlayer then
+    battle:animNext("ENEMY_HUD_SHAKE_ANIM", true).animDelayed = true
+  end
+end
+
 -- The damaging pipeline, extracted from the performMove monolith: every
 -- stage keeps the original's exact check order and rng consumption
--- (invulnerability -> gate -> hit count -> pre-accuracy -> accuracy ->
+-- (pre-accuracy -> invulnerability -> gate -> hit count -> accuracy ->
 -- damage choice -> hits -> messages -> after-damage -> secondary run).
 function EffectRegistry.runDamaging(battle, ctx, record)
   local user, target = ctx.user, ctx.target
   local move, moveInst = ctx.move, ctx.moveInst
   local neverMiss = record and record.neverMiss
 
+  -- SpecialEffectsCont's JumpMoveEffect (core.asm:3129-3133) runs before
+  -- MoveHitTest's INVULNERABLE test (:3150), mid-Fly/Dig included (#1565)
+  if record and record.beforeAccuracy then record.beforeAccuracy(ctx) end
+
   -- Swift ignores semi-invulnerability (MoveHitTest returns hit for
   -- SWIFT_EFFECT before the INVULNERABLE check)
   if target.invulnerable and not neverMiss then
     -- Explosion/Selfdestruct still animate on a miss (HandleIfPlayerMoveMissed)
     if not (record and record.explode) then battle:cancelMoveAnim() end
-    battle:sayNext(Strings("%s's\nattack missed!", displayName(user)))
+    missBeat(battle, record)
+    battle:sayNext(romText(battle.data, "_AttackMissedText", "%s's\nattack missed!", displayName(user)))
+    -- MoveHitTest's INVULNERABLE branch sets the same wMoveMissed as a
+    -- failed accuracy roll (core.asm:5260), and the miss handler still
+    -- runs the explode effect ("even if Explosion or Selfdestruct
+    -- missed, its effect still needs to be activated", core.asm:3223),
+    -- so the user faints against a mid-Fly/Dig target too (#528)
+    explodeMissRage(battle, record, target)
+    if record and record.onMiss then record.onMiss(ctx, "invulnerable") end
     return
   end
 
@@ -108,13 +168,13 @@ function EffectRegistry.runDamaging(battle, ctx, record)
 
   local hits = hitCount(ctx, record)
 
-  if record and record.beforeAccuracy then record.beforeAccuracy(ctx) end
-
   if not neverMiss then
     if not battle:accuracyRoll(move, user, target) then
       -- Explosion/Selfdestruct still animate on a miss (HandleIfPlayerMoveMissed)
       if not (record and record.explode) then battle:cancelMoveAnim() end
-      battle:sayNext(Strings("%s's\nattack missed!", displayName(user)))
+      missBeat(battle, record)
+      battle:sayNext(romText(battle.data, "_AttackMissedText", "%s's\nattack missed!", displayName(user)))
+      explodeMissRage(battle, record, target)
       -- Jump Kick crash, Explode self-destruct
       if record and record.onMiss then record.onMiss(ctx, "accuracy") end
       user.trappingTurns = nil
@@ -141,7 +201,8 @@ function EffectRegistry.runDamaging(battle, ctx, record)
     end
     if not counterable or (battle.lastDamage or 0) == 0 then
       battle:cancelMoveAnim()
-      battle:sayNext(Strings("%s's\nattack missed!", displayName(user)))
+      missBeat(battle, record)
+      battle:sayNext(romText(battle.data, "_AttackMissedText", "%s's\nattack missed!", displayName(user)))
       return
     end
     dmg = math.min(65535, battle.lastDamage * 2)
@@ -164,14 +225,18 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   if info.typeMult == 0 then
     -- type immunity zeros damage and sets wMoveMissed in Gen 1, so no anim
     if not (record and record.explode) then battle:cancelMoveAnim() end
-    battle:sayNext(Strings("It doesn't affect\n%s!", displayName(target)))
+    missBeat(battle, record)
+    battle:sayNext(romText(battle.data, "_DoesntAffectMonText", "It doesn't affect\n%s!", displayName(target)))
+    explodeMissRage(battle, record, target)
     if record and record.onMiss then record.onMiss(ctx, "immune") end
     return
   end
   if info.missed then
     -- 0.25x floored the damage to zero: the original registers a miss
     if not (record and record.explode) then battle:cancelMoveAnim() end
-    battle:sayNext(Strings("%s's\nattack missed!", displayName(user)))
+    missBeat(battle, record)
+    battle:sayNext(romText(battle.data, "_AttackMissedText", "%s's\nattack missed!", displayName(user)))
+    explodeMissRage(battle, record, target)
     if record and record.onMiss then record.onMiss(ctx, "floored") end
     return
   end
@@ -182,15 +247,47 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   -- replay PlayMoveAnimation per strike (pokered: GetPlayerAnimationType
   -- / GetEnemyAnimationType loop on wNumAttacksLeft); hit 1 reuses the
   -- announcement-time moveAnimRow, later hits queue fresh anim rows.
-  -- Thrash/rage continuations have no announcement anim -- a bare
+  -- Mimic queues no announcement anim (announceAnim = false) -- a bare
   -- hitRow carries the blink instead.
-  local hitSfx = info.typeMult > 10 and "Super_Effective"
-                 or info.typeMult < 10 and "Not_Very_Effective" or "Damage"
+  -- PlayApplyingAttackSound (engine/battle/animations.asm, the routine after
+  -- PlayApplyingAttackAnimation) picks the sound off wDamageMultipliers -- 10
+  -- is neutral, above it super effective, below it not very -- and sets
+  -- wFrequencyModifier/wTempoModifier alongside it: $20/$30 damage, $e0/$ff
+  -- super effective, $50/$01 not very.  All three programs live on the noise
+  -- channel (audio/sfx/{damage,super_effective,not_very_effective}.asm,
+  -- `channel 8`), where the frequency modifier is added to the polynomial
+  -- counter and so IS the pitch of the hit, while the tempo modifier is
+  -- skipped outright (audio/engine_2.asm Audio2_note_length: `cp CHAN8 /
+  -- jr z, .skip` keeps the noise channel at the default $100).  Playing them
+  -- bare made the super effective hit a dull thud and the not very effective
+  -- one a bright crack, which is why they sounded swapped (#826); the tempo
+  -- byte is deliberately not carried, since applying it would stretch notes
+  -- the hardware never stretches.
+  local hitSfx
+  if info.typeMult > 10 then
+    hitSfx = hitSound("superEffective")
+  elseif info.typeMult < 10 then
+    hitSfx = hitSound("notVeryEffective")
+  else
+    hitSfx = hitSound("neutral")
+  end
+  -- GetPlayerAnimationType / GetEnemyAnimationType (engine/battle/core.asm
+  -- :3159 / :5555): 4 blinks the enemy pic, 1 shakes vertically, 5 / 2 once
+  -- the move has an added effect (#354)
+  local added = move.effect ~= nil and move.effect ~= "NO_ADDITIONAL_EFFECT"
+  -- engine/battle/core.asm:3577
+  if moveInst and user.rageMove == moveInst then added = false end
+  -- PlayApplyingAttackAnimation runs on both arms of the wOptions check
+  -- (engine/battle/animations.asm:424-437), so the blink is not gated (#1384)
   local hitFx = { sfx = hitSfx,
-                  blink = battle:animationsOn() and target or nil }
+                  animType = user.isPlayer and (added and 5 or 4)
+                             or (added and 2 or 1),
+                  blink = target }
 
   local totalDealt = 0
   local landed, brokeSub = 0, false
+  local critPending, ohkoPending = info.crit, info.ohko
+  local multi = hits > 1
   for h = 1, hits do
     if target.mon.hp <= 0 then break end
     local hitRow
@@ -206,21 +303,47 @@ function EffectRegistry.runDamaging(battle, ctx, record)
       hitRow = { anim = move.id, attackerIsPlayer = user.isPlayer }
       table.insert(battle.queue, battle.nextInsert, hitRow)
     end
+    if h == 1 and record and record.explode then
+      local at
+      for i, item in ipairs(battle.queue) do
+        if item == hitRow then at = i break end
+      end
+      if at then
+        -- engine/battle/core.asm:6602
+        table.insert(battle.queue, at + 1, { anim = "MEGA_PUNCH",
+          attackerIsPlayer = user.isPlayer, hit = { sfx = hitSfx, animType = 5 } })
+        if (battle.nextInsert or 0) >= at then
+          battle.nextInsert = (battle.nextInsert or 0) + 1
+        end
+      end
+    end
     local hadSub = target.substituteHP ~= nil
     local dealt = battle:applyDamage(target, dmg)
     totalDealt = totalDealt + dealt
     landed = h
     if dealt > 0 then hitRow.hit = hitFx end
-    -- PrintCriticalOHKOText + DisplayEffectiveness run inside the
-    -- multi-hit loop (core.asm .moveDidNotMiss before the jump back
-    -- to GetPlayerAnimationType), so crit/effectiveness reprint on
-    -- every strike -- damage was only rolled once
-    if info.crit then battle:sayNext(Strings("Critical hit!")) end
-    if info.ohko then battle:sayNext(Strings("One-hit KO!")) end
+    -- PrintCriticalOHKOText zeroes wCriticalHitOrOHKO after printing
+    -- (core.asm:3809-3811); DisplayEffectiveness re-reads its own flag (#1720)
+    if critPending then
+      battle:sayNext(romText(battle.data, "_CriticalHitText", "Critical hit!"))
+      critPending = false
+    end
+    if ohkoPending then
+      battle:sayNext(romText(battle.data, "_OHKOText", "One-hit KO!"))
+      ohkoPending = false
+    end
+    -- PrintCriticalOHKOText closes with `ld c, 20 / jp DelayFrames` at its
+    -- .done label (core.asm:3812-3814) -- and the no-crit path jumps to that
+    -- same label (:3799), so this hold is paid on EVERY landed hit, not just
+    -- critical ones.  It sits between the crit text and DisplayEffectiveness
+    -- (:3228-3229), which is where the beat before "It's super effective!"
+    -- comes from.
+    battle:waitNext(Timing.CRIT_OHKO_TEXT)
+    -- engine/battle/display_effectiveness.asm:1
     if info.typeMult > 10 then
-      battle:sayNext(Strings("It's super\neffective!"))
+      battle:sayNext(romText(battle.data, "_SuperEffectiveText", "It's super\neffective!"))
     elseif info.typeMult < 10 then
-      battle:sayNext(Strings("It's not very\neffective..."))
+      battle:sayNext(romText(battle.data, "_NotVeryEffectiveText", "It's not very\neffective..."))
     end
     if Runtime.wants("battle.damage_dealt") then
       Runtime.emit("battle.damage_dealt", {
@@ -228,6 +351,8 @@ function EffectRegistry.runDamaging(battle, ctx, record)
         damage = dealt, crit = info.crit, typeMult = info.typeMult,
       })
     end
+    -- engine/battle/core.asm:3243
+    if multi then battle:handleBuildingRage(target) end
     if hadSub and not target.substituteHP then
       -- AttackSubstitute: breaking the substitute ends a multi-hit move
       brokeSub = true
@@ -235,31 +360,39 @@ function EffectRegistry.runDamaging(battle, ctx, record)
     end
   end
   hits = landed > 0 and landed or hits
-  if hits > 1 then
+  -- engine/battle/core.asm:3242
+  if hits > 1 and target.mon.hp > 0 then
     -- player: _MultiHitText; enemy: _HitXTimesText (always plural)
     if user.isPlayer then
-      battle:sayNext(Strings("Hit the enemy\n%d times!", hits))
+      battle:sayNext(romText(battle.data, "_MultiHitText", "Hit the enemy\n%d times!", hits))
     else
-      battle:sayNext(Strings("Hit %d times!", hits))
+      battle:sayNext(romText(battle.data, "_HitXTimesText", "Hit %d times!", hits))
     end
   end
 
   -- post-damage effect bookkeeping (recoil/drain/trap/thrash/...)
   ctx.rawDamage, ctx.totalDealt = dmg, totalDealt
   ctx.brokeSub, ctx.hits = brokeSub, hits
+  ctx.hitSfx = hitSfx
+  local explode = record and record.explode
+  if not multi and explode then battle:handleBuildingRage(target) end
   if record and record.afterDamage then
     record.afterDamage(ctx, totalDealt)
-  elseif moveInst.struggle then
-    -- struggle recoils even when its effect id resolves to no record
-    local recoil = math.max(1, math.floor(dmg / 2))
-    battle:sayNext(Strings("%s's\nhit with recoil!", displayName(user)))
-    battle:applyDamage(user, recoil)
+  elseif moveInst.struggle and not brokeSub then
+    battle:applyRecoil(user, math.max(1, math.floor(totalDealt / 2)))
   end
+  -- engine/battle/core.asm:3243
+  if not multi and not explode then battle:handleBuildingRage(target) end
 
   -- secondary side effects (blocked by fainting)
   if record and record.run and record.kind ~= "primary"
      and target.mon.hp > 0 and totalDealt > 0 then
-    for _, m in ipairs(record.run(ctx)) do
+    local hadStatus = target.mon.status
+    local msgs = record.run(ctx)
+    if target.mon.status and target.mon.status ~= hadStatus then
+      secondaryStatusFx(battle, user, target.mon.status)
+    end
+    for _, m in ipairs(msgs) do
       battle:sayNext(m)
     end
   end

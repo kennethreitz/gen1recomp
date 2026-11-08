@@ -6,6 +6,13 @@
 local M = {}
 
 M.MR_FUJIS_HOUSE = {
+  -- data/events/hidden_events.asm:515-517
+  onInteract = function(game, ow, fx, fy)
+    if fy ~= 1 or not (fx == 0 or fx == 1 or fx == 7) then return false end
+    game.stack:push(require("src.render.TextBox").new(game,
+      game.data.text._MagazinesText))
+    return true
+  end,
   talk = {
     -- scripts/MrFujisHouse.asm MrFujisHouseSuperNerdText: CheckEvent
     -- EVENT_RESCUED_MR_FUJI branches between "he's not here" and
@@ -13,9 +20,9 @@ M.MR_FUJIS_HOUSE = {
     TEXT_MRFUJISHOUSE_SUPER_NERD = {
       { "face_player" },                                                    -- 1
       { "check_flag", "EVENT_RESCUED_MR_FUJI" },                            -- 2
-      { "jump_if_true", 5 },                                                -- 3
+      { "jump_if_true", 6 },                                                -- 3
       { "show_text", "_MrFujisHouseSuperNerdMrFujiIsntHereText" },          -- 4
-      { "jump", 6 },                                                        -- 5
+      { "jump", "end" },                                                    -- 5
       { "show_text", "_MrFujisHouseSuperNerdMrFujiHadBeenPrayingText" },    -- 6
     },
 
@@ -25,22 +32,21 @@ M.MR_FUJIS_HOUSE = {
     TEXT_MRFUJISHOUSE_LITTLE_GIRL = {
       { "face_player" },                                                    -- 1
       { "check_flag", "EVENT_RESCUED_MR_FUJI" },                            -- 2
-      { "jump_if_true", 5 },                                                -- 3
+      { "jump_if_true", 6 },                                                -- 3
       { "show_text", "_MrFujisHouseLittleGirlThisIsMrFujisHouseText" },     -- 4
-      { "jump", 6 },                                                        -- 5
+      { "jump", "end" },                                                    -- 5
       { "show_text", "_MrFujisHouseLittleGirlPokemonAreNiceToHugText" },    -- 6
     },
 
-    -- scripts/MrFujisHouse.asm MrFujisHousePsyduckText: text_far then
-    -- PlayCry(PSYDUCK). Cry playback isn't modeled by Commands, so just
-    -- show the flavor text.
+    -- scripts/MrFujisHouse.asm:56
     TEXT_MRFUJISHOUSE_PSYDUCK = {
+      { "play_cry", "PSYDUCK", true },
       { "show_text", "_MrFujisHousePsyduckText" },
     },
 
-    -- scripts/MrFujisHouse.asm MrFujisHouseNidorinoText: text_far then
-    -- PlayCry(NIDORINO).
+    -- scripts/MrFujisHouse.asm:63
     TEXT_MRFUJISHOUSE_NIDORINO = {
+      { "play_cry", "NIDORINO", true },
       { "show_text", "_MrFujisHouseNidorinoText" },
     },
   },

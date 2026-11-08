@@ -25,7 +25,8 @@ local PALETTES = {
   },
   -- Pokemon Tower / Agatha, then the caves
   byTileset = { CEMETERY = "GRAYMON", CAVERN = "CAVE" },
-  byPrefix = { { prefix = "ROUTE_", palette = "ROUTE" } },
+  -- engine/gfx/palettes.asm:147-149
+  byPrefix = { { pattern = "^ROUTE_%d+$", palette = "ROUTE" } },
   default = "ROUTE",
 }
 
@@ -69,7 +70,8 @@ local SAFARI = {
     "SAFARI_ZONE_NORTH_REST_HOUSE", "SAFARI_ZONE_WEST_REST_HOUSE",
     "SAFARI_ZONE_SECRET_HOUSE",
   },
-  exitWarp = { map = "SAFARI_ZONE_GATE", x = 4, y = 3, facing = "down" },
+  -- wDestinationWarpID $3 = warp_event 4,0 (data/maps/objects/SafariZoneGate.asm:12)
+  exitWarp = { map = "SAFARI_ZONE_GATE", x = 4, y = 0, facing = "down" },
 }
 
 -- home/overworld.asm LoadPlayerSpriteGraphics / LoadSurfingPlayerSprite-
@@ -77,6 +79,12 @@ local SAFARI = {
 local PLAYER_SPRITES = {
   walk = "SPRITE_RED", surf = "SPRITE_SEEL",
   bike = "SPRITE_RED_BIKE", fly = "SPRITE_BIRD",
+  -- Yellow's IsSurfingPikachuInParty: when the SURF-mon is a Pikachu,
+  -- the player rides this sheet.  GFX loads via
+  -- LoadSurfingPlayerSpriteGraphics2, not SpriteSheetPointerTable, so
+  -- it needs a manifest extract (RFC 0001).  Guarded in Player.new so
+  -- before extraction lands the ride keeps the Seel.
+  surfPikachu = "SPRITE_SURFING_PIKACHU",
 }
 
 -- The player's own trainer art: RedPicBack (the battle back pic, up until
@@ -89,6 +97,11 @@ local PLAYER_SPRITES = {
 local PLAYER_PICS = {
   back = "assets/generated/battle/redb.png",
   demoBack = "assets/generated/battle/oldmanb.png",
+  -- LoadPlayerBackPic keys the demo pic off wBattleType, not off "is a
+  -- demo": BATTLE_TYPE_PIKACHU (Yellow's Pallet catch scene) puts PROF.OAK
+  -- in the player's place with his own back pic, not the old man's (#557).
+  -- Red/Blue never reach it -- only the Yellow script names that thrower.
+  oakBack = "assets/generated/battle/profoakb.png",
   front = "assets/generated/trainer_card/red.png",
 }
 
@@ -123,11 +136,42 @@ FieldDefaults.FIELD = {
   lastMapRewrites = LAST_MAP_REWRITES,
   -- CheckIfInOutsideMap: what counts as "outside" for the wLastMap memory
   outsideTilesets = { "OVERWORLD", "PLATEAU" },
+  -- PlayMapChangeSound (home/overworld.asm:689-703)
+  -- of the cell being left; pokeyellow home/overworld.asm:667-671
+  mapChangeSound = {
+    doorTile = 0x0B,
+    exemptTilesets = { "FACILITY", "CEMETERY" },
+  },
   -- the Route 16/18 gate scripts `res BIT_ALWAYS_ON_BIKE` every frame
   forcedMovement = { clearMaps = { "ROUTE_16_GATE_1F", "ROUTE_18_GATE_1F" } },
   -- the one-shot flag the gate's pass text is gated on; a gate a mod adds
   -- gets "PASSED_<mapId>" instead of this pre-v2 spelling
   badgeGates = { ROUTE_22_GATE = { passedFlag = "PASSED_ROUTE22_GATE" } },
+  -- the Rocket Hideout lift gates the floor callbacks stamp shut
+  -- (scripts/RocketHideoutB1F.asm / RocketHideoutB4F.asm
+  -- ...DoorCallbackScript); seeds caches imported before the manifest
+  -- carried them, which left both gates standing open (#372)
+  cardKeyDoors = {
+    closedDoors = {
+      ROCKET_HIDEOUT_B1F = {
+        { block = 0x54, bx = 12, by = 8, open = 0x0e,
+          event = "EVENT_BEAT_ROCKET_HIDEOUT_1_TRAINER_4" },
+      },
+      ROCKET_HIDEOUT_B4F = {
+        { block = 0x2d, bx = 12, by = 5, open = 0x0e,
+          events = { "EVENT_BEAT_ROCKET_HIDEOUT_4_TRAINER_0",
+                     "EVENT_BEAT_ROCKET_HIDEOUT_4_TRAINER_1" } },
+      },
+    },
+    -- Floors whose door callback a version does not have.  Yellow dropped
+    -- RocketHideoutB4FDoorCallbackScript entirely (pokeyellow
+    -- scripts/RocketHideoutB4F.asm goes straight to EnableAutoTextBoxDrawing)
+    -- and its .blk ships the same open $0e doorway, so B4F's lift gate is
+    -- never barred there.  Every manifest still carries the row above, so
+    -- this is what stops a Yellow cache walling Giovanni off behind two
+    -- guard flags Jessie & James never set (#650).
+    skipMaps = { yellow = { ROCKET_HIDEOUT_B4F = true } },
+  },
   -- VermilionGymSetDoorTile opens the motorized door once both locks are hit
   hiddenExtras = {
     -- PrintTrashText bins (#188); seeds stale caches missing the key
@@ -168,7 +212,7 @@ FieldDefaults.CONSTANTS = {
     neighborHops = 2,         -- connection hops drawn around the current map
     stepFrames = 16,          -- 1px per frame, 16 frames per tile
     bikeStepFrames = 8,       -- the bicycle doubles walking speed
-    turnFrames = 2,           -- the extra OverworldLoop pass after a turn
+    turnFrames = 4,           -- tap window before a turn commits to a step
   },
   -- cumulative slot thresholds out of 256 (engine/battle/wild_encounters.asm)
   encounterBuckets = { 51, 102, 141, 166, 191, 216, 229, 242, 253, 256 },

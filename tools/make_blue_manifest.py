@@ -78,7 +78,10 @@ def derive(red, pokered, symbols_path):
     util.ASM_DEFINES = {"_BLUE"}
     try:
         blue["field"]["presetNames"] = field.parse_preset_names(pokered)
+        the_end = blue["field"]["credits"].get("theEnd")
         blue["field"]["credits"] = field.parse_credits(pokered)
+        if the_end:
+            blue["field"]["credits"]["theEnd"] = the_end
     finally:
         util.ASM_DEFINES = saved
 
@@ -113,7 +116,7 @@ def main():
 
     blue = derive(red, pokered, os.path.abspath(args.symbols))
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(blue, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(blue, f, ensure_ascii=True, indent=2, sort_keys=True)
         f.write("\n")
     print(f"wrote {args.out}")
 

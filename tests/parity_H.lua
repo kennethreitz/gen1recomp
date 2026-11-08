@@ -40,9 +40,12 @@ end
 check(sf.SEAFOAM_ISLANDS_B3F and #sf.SEAFOAM_ISLANDS_B3F.holes == 2,
       "SEAFOAM_ISLANDS_B3F still has its own 2 holes (B3F->B4F, unrelated to this change)")
 
--- data/scripts/seafoam.lua no longer force-shows the B2F boulders on entry
+-- data/scripts/seafoam.lua no longer force-shows the B2F boulders on entry.
+-- The map DOES own an onStep now (the player's hole falls, #599), so the
+-- assertion is about onEnter specifically, not about the map table.
 local seafoamScripts = require("data.scripts.seafoam")
-check(seafoamScripts.SEAFOAM_ISLANDS_B2F == nil,
+check(seafoamScripts.SEAFOAM_ISLANDS_B2F == nil
+        or seafoamScripts.SEAFOAM_ISLANDS_B2F.onEnter == nil,
       "data/scripts/seafoam.lua no longer hardcodes a SEAFOAM_ISLANDS_B2F onEnter hook")
 
 -- === (2) functional 1F -> B1F -> B2F -> B3F -> B4F cascade ===
@@ -152,6 +155,8 @@ local pushes = {
     checkDst = true },
 }
 
+local Sound = require("src.core.Sound")
+local realSoundPlay = Sound.play
 for i, p in ipairs(pushes) do
   if ow.map.id ~= p.curMap then
     ow:setMap(p.curMap, 1, 1, "down")
@@ -159,8 +164,15 @@ for i, p in ipairs(pushes) do
   local npc = { cellX = p.hx, cellY = p.hy, def = { name = p.srcName } }
   table.insert(ow.npcs, npc)
   table.insert(ow.entities, npc)
+  local played = {}
+  Sound.play = function(_, name, ...) played[#played + 1] = name end
   local ok = ow:boulderIntoHole(npc)
+  Sound.play = realSoundPlay
   check(ok, ("push %d: boulderIntoHole(%s) returns true"):format(i, p.srcName))
+  check(Game.stack:top() == ow,
+        ("push %d: no text box after the boulder falls"):format(i))
+  eq(#played, 0, ("push %d: boulder falling plays no sound"):format(i))
+  while Game.stack:top() and Game.stack:top() ~= ow do Game.stack:pop() end
   check(Game.save.flags[p.event] == true,
         ("push %d: %s is set"):format(i, p.event))
   check(not OW.objectVisible(Game.save, p.srcMap, objOf(p.srcMap, p.srcName)),

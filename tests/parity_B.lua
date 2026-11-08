@@ -60,6 +60,17 @@ for _, r in ipairs(rows) do
 end
 check(not hasRecord, "CHAMPIONS_ROOM rival script no longer calls record_hall_of_fame")
 
+-- The post-battle walk takes the left-hand detour before heading north, so
+-- the player does not visibly pass through the rival at (4,2).
+local route = {}
+for _, r in ipairs(rows) do
+  if r[1] == "move_player" then route[#route + 1] = r end
+end
+eq(route[#route - 1] and route[#route - 1][2], "left",
+   "walk-out route first moves left around the rival")
+eq(route[#route] and route[#route][2], "up",
+   "walk-out route then heads north to Hall of Fame")
+
 -- (3) Commands.face_player_dir sets the player's facing
 local Commands = require("src.script.Commands")
 check(type(Commands.face_player_dir) == "function", "Commands.face_player_dir is a function")
@@ -127,10 +138,10 @@ local champGame = { save = { flags = {} } }
 champ.onEnter(champGame, champOw)
 eq(#champQueued, 2, "CHAMPIONS_ROOM.onEnter queues entrance walk + rival script")
 local walk = champQueued[1] and champQueued[1].script
-check(walk and walk[1][1] == "move_player" and walk[1][2] == "up" and walk[1][3] == 1
+check(walk and walk[1][1] == "move_player" and walk[1][2] == "up" and walk[1][3] == 3
         and walk[2][1] == "move_player" and walk[2][2] == "right" and walk[2][3] == 1
-        and walk[3][1] == "move_player" and walk[3][2] == "up" and walk[3][3] == 3,
-      "entrance walk is RivalEntrance_RLEMovement (up 1, right 1, up 3)")
+        and walk[3][1] == "move_player" and walk[3][2] == "up" and walk[3][3] == 1,
+      "entrance walk is RivalEntrance_RLEMovement (up 3, right 1, up 1)")
 check(champQueued[2] and champQueued[2].script == rows,
       "second queue is TEXT_CHAMPIONSROOM_RIVAL script rows")
 check(champQueued[2] and champQueued[2].extra

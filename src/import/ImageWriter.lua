@@ -7,6 +7,25 @@ local SHADES = {
   { 0, 0, 0, 1 },
 }
 
+ImageWriter.SHADES = SHADES
+
+-- engine/movie/title.asm:76
+function ImageWriter.applyTitleObp0(image)
+  local light = SHADES[2][1]
+  local w, h = image:getWidth(), image:getHeight()
+  for y = 0, h - 1 do
+    for x = 0, w - 1 do
+      local r, g, b, a = image:getPixel(x, y)
+      if a ~= 0 then
+        if math.abs(r - light) < 0.02 then
+          image:setPixel(x, y, 1, 1, 1, 1)
+        end
+      end
+    end
+  end
+  return image
+end
+
 local function assertDimensions(raw, width, height, bits)
   assert(width % 8 == 0 and height % 8 == 0,
     ("%dbpp dimensions must be tile-aligned: %dx%d")
@@ -120,6 +139,26 @@ function ImageWriter.columnsToRows(raw, tilesWide, tilesHigh, bytesPerTile)
       for offset = 1, bytesPerTile do
         out[target + offset] = raw[source + offset]
       end
+    end
+  end
+  return out
+end
+
+-- Inverse of pret tools/gfx --interleave (pokecrystal tools/gfx.c).
+-- Build-time interleave stores each vertical 8x16 pair as consecutive 8x8
+-- tiles for OBJ mode; this restores row-major sheet order for PNGs.
+function ImageWriter.deinterleave(raw, width, bytesPerTile)
+  bytesPerTile = bytesPerTile or 16
+  local widthTiles = width / 8
+  local numTiles = #raw / bytesPerTile
+  local out = {}
+  for i = 0, numTiles - 1 do
+    local row = math.floor(i / widthTiles)
+    local src = i * 2 - (row % 2 == 1
+      and widthTiles * (row + 1) - 1
+      or widthTiles * row)
+    for offset = 1, bytesPerTile do
+      out[i * bytesPerTile + offset] = raw[src * bytesPerTile + offset]
     end
   end
   return out

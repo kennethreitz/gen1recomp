@@ -15,9 +15,11 @@ end
 
 -- entities: array of anything with cellX/cellY (and optional targetX/targetY
 -- while mid-step, so nobody walks into a cell being entered).
+-- e.passable entities never block (Yellow's companion Pikachu: the player
+-- walks straight through and it re-trails, pikachu_follow.asm).
 function Collision.occupied(entities, cx, cy, ignore)
   for _, e in ipairs(entities) do
-    if e ~= ignore then
+    if e ~= ignore and not e.passable then
       if (e.cellX == cx and e.cellY == cy) or
          (e.targetX == cx and e.targetY == cy) then
         return e
@@ -50,6 +52,7 @@ local function pairBlocked(map, mover, sx, sy, tx, ty)
   end
   return false
 end
+Collision.pairBlocked = pairBlocked
 
 local function verdict(map, entities, mover, dir, tx, ty)
   if not map:inBounds(tx, ty) then

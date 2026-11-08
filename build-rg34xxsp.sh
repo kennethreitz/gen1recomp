@@ -11,6 +11,13 @@
 # Usage:
 #   ./build-rg34xxsp.sh [--version X.Y.Z]
 #
+# LuaJIT: the zip ships a pinned LuaJIT, compiled during the build, so building
+# needs an aarch64 host with docker or podman. Alternatively set
+# GEN1RECOMP_LUAJIT_LIB=/path/libluajit-5.1.so.2 with its COPYRIGHT beside it
+# (or GEN1RECOMP_LUAJIT_COPYRIGHT=/path/to/COPYRIGHT).
+# The ogg/vorbis/theora/mpg123 libraries liblove links are built the same way
+# (scripts/luajit/build_codecs.sh), or taken from GEN1RECOMP_CODEC_DIR.
+#
 # Output:
 #   dist/rg34xxsp/gen1recomp-rg34xxsp-stockos64-mod.zip
 #
@@ -41,9 +48,6 @@ LAUNCHER_NAME="Gen1recomp.sh"
 LOVE_VERSION="11.5"
 VERSION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo dev)"
 
-# Official PortMaster LÖVE 11.5 aarch64 runtime (small love stub + liblove).
-PM_RUNTIME_BASE="https://raw.githubusercontent.com/PortsMaster/PortMaster-GUI/main/PortMaster/runtimes/love_${LOVE_VERSION}"
-
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -52,7 +56,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift ;;
     -h|--help)
-      sed -n '2,24p' "$0"
+      sed -n '2,31p' "$0"
       exit 0
       ;;
     *) fail "unknown argument: $1" ;;
@@ -66,16 +70,9 @@ command -v unzip >/dev/null || fail "unzip is required"
 
 mkdir -p "$CACHE" "$WORK" "$DIST"
 
-download() {
-  local url="$1" dest="$2"
-  if [ -f "$dest" ] && [ -s "$dest" ]; then
-    return 0
-  fi
-  say "downloading $(basename "$dest")"
-  curl -fL --progress-bar "$url" -o "$dest.tmp" \
-    || fail "download failed: $url"
-  mv "$dest.tmp" "$dest"
-}
+# PortMaster pins + LuaJIT pin (LUAJIT_COMMIT, ...) + download/verify helpers.
+# shellcheck source=scripts/luajit/portmaster_runtime.sh
+. "$ROOT/scripts/luajit/portmaster_runtime.sh"
 
 # --------------------------------------------------------------- game tree
 # Unpacked directory (not a .love zip) so the player can drop a .gb next to
@@ -88,14 +85,27 @@ mkdir -p "$GAME_SRC"
 # Same payload as scripts/build.sh's game.love — never ship ROM-derived cache.
 # tools/save-editor is part of that payload: the launcher's Edit button on a
 # save row opens it in-process (main.lua).
+rm -f "$WORK/game-payload.zip"
 (cd "$ROOT" && zip -q -9 -r "$WORK/game-payload.zip" \
-  main.lua conf.lua src data assets tools/save-editor \
+  main.lua conf.lua src libs data assets tools/save-editor \
   tools/rom_manifest.json tools/rom_manifest_blue.json \
+  tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
+  tools/rom_manifest_silver.json tools/rom_manifest_crystal.json \
+  tools/rom_manifest_firered.json tools/rom_manifest_leafgreen.json tools/rom_manifest_emerald.json tools/rom_manifest_ruby.json tools/rom_manifest_sapphire.json \
   -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
-if unzip -Z1 "$WORK/game-payload.zip" \
-    | grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/'; then
+if [ -f "$ROOT/PATCH_NOTES.md" ]; then
+  (cd "$ROOT" && zip -q "$WORK/game-payload.zip" PATCH_NOTES.md)
+fi
+unzip -Z1 "$WORK/game-payload.zip" > "$WORK/payload-listing.txt"
+if grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/' "$WORK/payload-listing.txt"; then
   fail "payload unexpectedly contains generated ROM data"
 fi
+for manifest in rom_manifest.json rom_manifest_blue.json rom_manifest_yellow.json \
+                rom_manifest_gold.json rom_manifest_silver.json rom_manifest_crystal.json \
+                rom_manifest_firered.json rom_manifest_leafgreen.json rom_manifest_emerald.json rom_manifest_ruby.json rom_manifest_sapphire.json; do
+  grep -qxF "tools/$manifest" "$WORK/payload-listing.txt" \
+    || fail "payload is missing tools/$manifest"
+done
 unzip -q "$WORK/game-payload.zip" -d "$GAME_SRC"
 rm -f "$WORK/game-payload.zip"
 
@@ -119,15 +129,12 @@ fi
 say "fetching LÖVE $LOVE_VERSION aarch64 runtime"
 LOVE_BIN="$CACHE/love.aarch64"
 LOVE_LIB="$CACHE/liblove-11.5.so"
-LUAJIT_LIB="$CACHE/libluajit-5.1.so.2"
 MODPLUG_LIB="$CACHE/libmodplug.so.1"
-OGG_LIB="$CACHE/libogg.so.0"
 
-download "$PM_RUNTIME_BASE/love.aarch64" "$LOVE_BIN"
-download "$PM_RUNTIME_BASE/libs.aarch64/liblove-11.5.so" "$LOVE_LIB"
-download "$PM_RUNTIME_BASE/libs.aarch64/libluajit-5.1.so.2" "$LUAJIT_LIB"
-download "$PM_RUNTIME_BASE/libs.aarch64/libmodplug.so.1" "$MODPLUG_LIB"
-download "$PM_RUNTIME_BASE/libs.aarch64/libogg.so.0" "$OGG_LIB"
+pm_fetch_runtime "$CACHE"
+
+pm_select_luajit
+pm_select_codecs
 
 # Sanity: love stub must be an aarch64 ELF.
 file "$LOVE_BIN" | grep -qi 'aarch64\|ARM aarch64' \
@@ -145,14 +152,38 @@ mkdir -p "$PORT_ROOT/$PORT_DIR_NAME/bin" \
 cp -R "$GAME_SRC" "$PORT_ROOT/$PORT_DIR_NAME/lovegame"
 cp "$LOVE_BIN" "$PORT_ROOT/$PORT_DIR_NAME/bin/love.aarch64"
 chmod +x "$PORT_ROOT/$PORT_DIR_NAME/bin/love.aarch64"
-cp "$LOVE_LIB" "$LUAJIT_LIB" "$MODPLUG_LIB" "$OGG_LIB" \
+cp "$LOVE_LIB" "$MODPLUG_LIB" \
   "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/"
+pm_stage_luajit "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64" "$PORT_ROOT/$PORT_DIR_NAME/licenses"
+pm_stage_codecs "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64" "$PORT_ROOT/$PORT_DIR_NAME/licenses"
+
+BRIDGE_LIB="liblibrashader_bridge.so"
+BRIDGE_SRC="${SHADERFX_BRIDGE_LINUX_ARM64:-}"
+if [ -z "$BRIDGE_SRC" ] && [ -f "$ROOT/dist/native/linux-arm64/$BRIDGE_LIB" ]; then
+  BRIDGE_SRC="$ROOT/dist/native/linux-arm64/$BRIDGE_LIB"
+fi
+if [ -n "$BRIDGE_SRC" ] && [ -f "$BRIDGE_SRC" ]; then
+  cp "$BRIDGE_SRC" "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/$BRIDGE_LIB"
+  say "bundled $BRIDGE_LIB for SHADER FX preset conversion"
+elif [ "${SHADERFX_BRIDGE_REQUIRED:-}" = "1" ]; then
+  fail "$BRIDGE_LIB not found: set SHADERFX_BRIDGE_LINUX_ARM64 or stage it at dist/native/linux-arm64/$BRIDGE_LIB"
+else
+  warn "$BRIDGE_LIB not found: this port can run converted presets but not CONVERT new ones"
+fi
 
 # Drop a short license pointer for the bundled LÖVE bits.
-cat > "$PORT_ROOT/$PORT_DIR_NAME/licenses/LICENSE.love2d.txt" <<'EOF'
+cat > "$PORT_ROOT/$PORT_DIR_NAME/licenses/LICENSE.love2d.txt" <<EOF
 This port bundles the LÖVE 11.5 aarch64 runtime from PortMaster
-(https://github.com/PortsMaster/PortMaster-GUI). LÖVE is zlib-licensed;
-see https://love2d.org/ for full terms.
+(https://github.com/PortsMaster/PortMaster-GUI, commit $PM_RUNTIME_COMMIT),
+except for LuaJIT. LÖVE is zlib-licensed; see https://love2d.org/ for full terms.
+
+libs.aarch64/libluajit-5.1.so.2 is LuaJIT, built from source at LuaJIT commit
+$LUAJIT_COMMIT (https://github.com/LuaJIT/LuaJIT, MIT license; see
+LuaJIT-COPYRIGHT). It replaces PortMaster's LuaJIT 2.1.0-beta3.
+
+libs.aarch64/libogg.so.0, libvorbis.so.0, libvorbisfile.so.3, libtheoradec.so.1
+and libmpg123.so.0 are built from upstream ogg, vorbis, theora and mpg123
+releases (BSD-style x3 and LGPL-2.1; see codecs-SOURCE.txt and *-COPYING).
 EOF
 
 # --------------------------------------------------------------- launcher
@@ -190,6 +221,26 @@ get_controls
 [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
 
 GAMEDIR="$SHDIR/gen1recomp"
+# Anbernic stock keeps the launcher and the game folder side by side, so the
+# SHDIR-relative path above is correct there and is tried first.
+#
+# Other firmwares (muOS, and PortMaster's layout on several devices) keep
+# launcher scripts and port data in SEPARATE trees -- scripts under roms/ports,
+# data under ports -- so the sibling folder holds no game.
+#
+# Probe for the BINARY, not the directory: on a split layout this script has
+# usually already created "$SHDIR/gen1recomp/conf" and log.txt on an earlier
+# failed run (see mkdir/tee below), so an existence test matches a decoy of our
+# own making. Stock is unaffected -- its sibling holds the real binary and wins
+# on the first test.
+if [ ! -f "$GAMEDIR/bin/love.aarch64" ]; then
+  for candidate in "/$directory/ports/gen1recomp" \
+                   "/mnt/sdcard/ports/gen1recomp" \
+                   "/mnt/mmc/ports/gen1recomp" \
+                   "/roms/ports/gen1recomp"; do
+    if [ -f "$candidate/bin/love.aarch64" ]; then GAMEDIR="$candidate"; break; fi
+  done
+fi
 CONFDIR="$GAMEDIR/conf"
 mkdir -p "$CONFDIR"
 
@@ -198,15 +249,13 @@ cd "$GAMEDIR" || exit 1
 
 export XDG_DATA_HOME="$CONFDIR"
 export XDG_CONFIG_HOME="$CONFDIR"
+# Release-target marker for the self-updater: a full-package fallback here must
+# offer gen1recomp-<v>-rg34xxsp-stockos64-mod.zip, never a desktop package.
+export POKEPORT_RG34XXSP=1
 export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:${LD_LIBRARY_PATH:-}"
 export SDL_GAMECONTROLLERCONFIG="${sdl_controllerconfig:-}"
 # Mali / H700: prefer GLES where available
 export LOVE_GRAPHICS_USE_OPENGLES="${LOVE_GRAPHICS_USE_OPENGLES:-1}"
-# Same GPU class as a phone, but getOS() here says "Linux", so the Android
-# gate (issue #136) would not fire on its own: refuse GBC FX explicitly.
-# Hides the OPTIONS row, pins the level to OFF, and heals a level already
-# persisted in options.lua.
-export POKEPORT_GBCFX="${POKEPORT_GBCFX:-0}"
 
 $ESUDO chmod a+x ./bin/love.aarch64 2>/dev/null || chmod a+x ./bin/love.aarch64
 $ESUDO chmod 666 /dev/uinput 2>/dev/null || true
@@ -297,13 +346,6 @@ Native LÖVE 11.5 port of gen1recomp for Anbernic RG34XXSP on
 
 In-game controls use the normal PortMaster / SDL pad map (rebind under OPTIONS → CONTROLS).
 
-### Display options
-
-GBC FX is disabled on this device (the H700's Mali GPU compiles that present
-pass and then shows a black frame), so the OPTIONS row is hidden. COLORS,
-TILT, ZOOM, VOID FILL and MAX FPS all work. To try it anyway, launch with
-`POKEPORT_GBCFX=1`.
-
 ### First run
 
 Stock OS has no zenity file picker. Put the `.gb` in `lovegame/`, then press
@@ -320,6 +362,10 @@ Canonical SHA-1 (1 MiB US carts only):
 LÖVE runtime binaries from [PortMaster](https://portmaster.games/).
 Stock OS 64-bit MOD: [cbepx-me](https://github.com/cbepx-me/Anbernic-H700-RG-xx-StockOS-Modification).
 EOF
+cat >> "$PORT_ROOT/README.md" <<EOF
+
+LuaJIT (MIT license) is built from source at LuaJIT commit \`$LUAJIT_COMMIT\` instead of using PortMaster's older LuaJIT 2.1.0-beta3. The JIT stays off by default on this build.
+EOF
 
 # --------------------------------------------------------------- zip
 ZIP_OUT="$DIST/$APP_NAME-$ARTIFACT_SUFFIX.zip"
@@ -327,6 +373,8 @@ rm -f "$ZIP_OUT" "$DIST/$APP_NAME-rg34xxsp.zip"
 say "packing $ZIP_OUT"
 (cd "$PORT_ROOT" && zip -q -9 -r "$ZIP_OUT" \
   "$LAUNCHER_NAME" "$PORT_DIR_NAME" port.json gameinfo.xml README.md)
+
+pm_verify_zip "$ZIP_OUT" "$PORT_DIR_NAME" "$WORK"
 
 say "done."
 say "artifact: $ZIP_OUT ($(du -h "$ZIP_OUT" | cut -f1))"

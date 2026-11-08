@@ -1,0 +1,119 @@
+-- Trainer front / player back pics (cache only).
+
+local Extract = require("src.import.gba.extract_island1")
+
+local TrainerPic = {}
+
+TrainerPic._front = {}
+TrainerPic._back = {}
+TrainerPic._cache = nil
+
+local function cache_root()
+  return (Extract.CACHE_ROOT or "data/generated/gba") .. "/trainers"
+end
+
+local function resolve_cache(cache)
+  if cache and cache.read then return cache end
+  local okD, Dataset = pcall(require, "src.core.game3.dataset")
+  if okD and Dataset and Dataset.cache then
+    return Dataset.cache()
+  end
+  return {
+    read = function(_, rel)
+      local ok, CacheFs = pcall(require, "src.import.CacheFs")
+      if ok and CacheFs and CacheFs.readActive then
+        return CacheFs.readActive(rel)
+      end
+      return nil
+    end,
+    write = function(_, rel, bytes)
+      local ok, CacheFs = pcall(require, "src.import.CacheFs")
+      if ok and CacheFs and CacheFs.writeActive then
+        return CacheFs.writeActive(rel, bytes)
+      end
+    end,
+  }
+end
+
+local function image_from_rgba(rgba, w, h)
+  if not (love and love.image and love.graphics) then return nil end
+  if not rgba or #rgba < w * h * 4 then return nil end
+  local ok, imageData = pcall(love.image.newImageData, w, h, "rgba8", rgba)
+  if not ok or not imageData then return nil end
+  local image = love.graphics.newImage(imageData)
+  if image.setFilter then image:setFilter("nearest", "nearest") end
+  return image
+end
+
+local function read_pic_rgba(cacheRel, frames)
+  local cache = TrainerPic._cache
+  if not (cache and cache.read) then return nil end
+  local d = cache:read(cacheRel)
+  if d and #d >= 64 * 64 * frames * 4 then return d end
+  return nil
+end
+
+function TrainerPic.install(cache)
+  TrainerPic._cache = resolve_cache(cache)
+  TrainerPic._front = {}
+  TrainerPic._back = {}
+  TrainerPic._anims = nil
+end
+
+--- Opponent trainer front pic (64×64). Returns nil if unavailable (no placeholder).
+function TrainerPic.front(picId)
+  if type(picId) == "string" and tonumber(picId) == nil then
+    return require("src.mods.Gen3Compat").centredSprite(picId)
+  end
+  picId = tonumber(picId)
+  if not picId or picId < 0 then return nil end
+  if TrainerPic._front[picId] then return TrainerPic._front[picId] end
+  if not TrainerPic._cache then TrainerPic.install(nil) end
+  local rel = cache_root() .. "/front/" .. picId .. ".rgba"
+  local rgba = read_pic_rgba(rel, 1)
+  local image = image_from_rgba(rgba, 64, 64)
+  if not image then return nil end
+  local entry = { image = image, w = 64, h = 64 }
+  TrainerPic._front[picId] = entry
+  return entry
+end
+
+--- Player back pic strip (64×320, 5 frames). gender 0=boy, 1=girl.
+function TrainerPic.back(gender)
+  gender = tonumber(gender) or 0
+  if gender < 0 then return nil end
+  -- pokefirered/src/data/trainer_graphics/back_pic_tables.h:2
+  if gender > 5 and require("src.core.game3.profile").family() ~= "rse" then gender = 0 end
+  if TrainerPic._back[gender] then return TrainerPic._back[gender] end
+  if not TrainerPic._cache then TrainerPic.install(nil) end
+  local rel = cache_root() .. "/back_" .. gender .. ".rgba"
+  local rgba = read_pic_rgba(rel, 1)
+  if not rgba then return nil end
+  local actualFrames = math.floor(#rgba / (64 * 64 * 4))
+  if actualFrames <= 0 then return nil end
+  local image = image_from_rgba(rgba, 64, 64 * actualFrames)
+  if not image then return nil end
+  local entry = { image = image, w = 64, h = 64 * actualFrames, frames = actualFrames }
+  TrainerPic._back[gender] = entry
+  return entry
+end
+
+-- pokeemerald/src/data/trainer_graphics/back_pic_anims.h:119
+function TrainerPic.backAnims(gender)
+  gender = tonumber(gender) or 0
+  if gender > 5 and require("src.core.game3.profile").family() ~= "rse" then gender = 0 end
+  if not TrainerPic._anims then
+    if not TrainerPic._cache then TrainerPic.install(nil) end
+    local rel = cache_root() .. "/back_anims.lua"
+    local src = assert(TrainerPic._cache:read(rel), "trainer back pic anims missing from the cache")
+    TrainerPic._anims = assert(load(src, "@" .. rel, "t", {}))()
+  end
+  return assert(TrainerPic._anims[gender], "no back pic anims for " .. gender)
+end
+
+-- pokeemerald/src/data.c:121
+function TrainerPic.backIdleFrame(gender)
+  return TrainerPic.backAnims(gender).idle[1][1]
+end
+
+return TrainerPic

@@ -4,9 +4,11 @@
 -- its own file without editing a single record, and one flush() drops
 -- every downstream cache for dev-mode hot reload.
 --
--- No loader installed means resolve() is the identity, which is what
--- keeps a mod-free boot (and every headless test) loading exactly the
--- paths it always did.
+-- No loader installed means resolve() is the identity.  The NX Blue/Yellow
+-- versioned-cache fallback lives in src/core/NxAssetOverlay.lua (installed
+-- once at boot on NX only), not here, so this module stays platform-free.
+
+local AtlasPrefetch = require("src.render.AtlasPrefetch")
 
 local Assets = {}
 
@@ -14,6 +16,8 @@ local Assets = {}
 local cache = {}
 -- downstream caches that must empty when the search path changes
 local invalidators = {}
+-- optional GPU release hooks for session end (never run on hot reload flush)
+local releasers = {}
 
 -- The loader bridge: overrideOrder() yields mods highest-priority-first
 -- and derivedPath(rel) yields an existing save/mod-derived/<id>/<rel>.
@@ -29,38 +33,141 @@ local function exists(path)
 end
 Assets.exists = exists
 
--- an override dir shadows the generated cache; a transform's derived
--- output is the fallback under it, so hand-authored art beats generated
+-- Mod overrides win; on NX, Blue/Yellow then use the prefixed save-dir file;
+-- otherwise the caller's unprefixed path (Red / mounted overlay).
 function Assets.resolve(path)
-  local loader = Assets.loader
-  if not loader or type(path) ~= "string" then return path end
+  if type(path) ~= "string" then return path end
   if path:sub(1, #GENERATED) ~= GENERATED then return path end
+
   local rel = path:sub(#GENERATED + 1)
-  for _, mod in ipairs(loader:overrideOrder()) do
-    local candidate = mod.path .. "/overrides/" .. rel
-    if exists(candidate) then return candidate end
+  local loader = Assets.loader
+  if loader then
+    for _, mod in ipairs(loader:overrideOrder()) do
+      local candidate = mod.path .. "/overrides/" .. rel
+      if exists(candidate) then return candidate end
+    end
+    local derived = loader:derivedPath(rel)
+    if derived then return derived end
   end
-  return loader:derivedPath(rel) or path
+
+  -- NX Blue/Yellow: no rewrite here -- NxAssetOverlay (installed once at
+  -- boot on NX only) covers every loader globally, so this module stays
+  -- the mod-override choke point it always was.
+  return path
+end
+
+local composed = {}
+
+function Assets.compose(path, build)
+  composed[path] = build
+  cache[path] = nil
+end
+
+-- true when `path` is built by an Assets.compose callback (never read from a
+-- file, so a background decode / bake must not open it)
+function Assets.isComposed(path) return composed[path] ~= nil end
+
+-- Only plain PNG paths use a background decode: newImage(path) derives a
+-- dpiscale from an "@2x" style suffix and handles compressed formats, neither
+-- of which newImage(ImageData) reproduces.
+local function prefetchable(resolved)
+  return type(resolved) == "string"
+     and resolved:lower():sub(-4) == ".png"
+     and not resolved:find("@%d+%.?%d*x")
+end
+Assets.prefetchable = prefetchable
+
+-- Queue the file decode of an asset path on the worker (fire and forget; a
+-- no-op without a worker or for a non-PNG / "@2x" name).  The path is resolved
+-- when the request is sent.
+function Assets.prefetchImage(path, front)
+  if Assets.isComposed(path) or not prefetchable(path) then return false end
+  return AtlasPrefetch.requestDecode(path, front)
+end
+
+function Assets.decodeReady(path)
+  if Assets.isComposed(path) then return true end
+  local resolved = Assets.resolve(path)
+  if not prefetchable(resolved) or not AtlasPrefetch.available() then
+    return true
+  end
+  return AtlasPrefetch.peekDecoded(resolved) ~= nil
+end
+
+AtlasPrefetch.resolveDecodable = function(path)
+  local resolved = Assets.resolve(path)
+  return prefetchable(resolved) and resolved or nil
+end
+
+-- The path a background worker must open for a resolved path.  The NX asset
+-- overlay wraps the MAIN thread's loaders only; a worker is a fresh Lua state,
+-- so it gets the overlay's mapped (versioned) path instead.
+function Assets.workerPath(resolved)
+  local overlay = package.loaded["src.core.NxAssetOverlay"]
+  if overlay and overlay.isInstalled() then return overlay.mapPath(resolved) end
+  return resolved
+end
+AtlasPrefetch.workerPath = Assets.workerPath
+
+-- Pixel size of a PNG file from its 24-byte header (no decode), or nil when
+-- the file is unreadable / not a PNG.  Lets a background bake size its work
+-- without decoding the image on the main thread.
+function Assets.pngSize(resolved)
+  local fs = love and love.filesystem
+  if not (fs and fs.read) then return nil end
+  local ok, head = pcall(fs.read, resolved, 24)
+  if not ok or type(head) ~= "string" or #head < 24 or head:sub(2, 4) ~= "PNG" then
+    return nil
+  end
+  local function be32(i)
+    local a, b, c, d = head:byte(i, i + 3)
+    return ((a * 256 + b) * 256 + c) * 256 + d
+  end
+  return be32(17), be32(21)
 end
 
 function Assets.image(path)
-  local resolved = Assets.resolve(path)
+  local build = composed[path]
+  local resolved = build and path or Assets.resolve(path)
   local image = cache[resolved]
   if not image then
-    image = love.graphics.newImage(resolved)
+    -- decoded off-thread: only the GPU upload is left (fills an empty slot)
+    local decoded = not build and prefetchable(resolved)
+      and AtlasPrefetch.peekDecoded(resolved)
+    image = love.graphics.newImage(build and build() or decoded or resolved)
     cache[resolved] = image
+    -- The stored decode STAYS (bounded LRU in AtlasPrefetch): the sprite OBJ
+    -- palette bakes (SpriteRenderer.getObpImage, every COLORS mode) and the
+    -- RED++ atlas recolour re-read the sheet's pixels through imageData.
   end
   return image
 end
 
 -- pixel-level reads (tile-shift variants, the spinner strip blit) resolve
--- the same way but stay uncached: the caller keeps the derived product
+-- the same way but stay uncached: the caller keeps the derived product.
+-- A prefetched decode is handed out as a CLONE -- callers mutate what they
+-- get (mapPixel), and the stored copy is shared with Assets.image.
 function Assets.imageData(path)
-  return love.image.newImageData(Assets.resolve(path))
+  local build = composed[path]
+  if build then return build() end
+  local resolved = Assets.resolve(path)
+  local decoded = prefetchable(resolved) and AtlasPrefetch.peekDecoded(resolved)
+  if decoded then return decoded:clone() end
+  return love.image.newImageData(resolved)
 end
 
-function Assets.register(invalidate)
-  invalidators[#invalidators + 1] = invalidate
+-- Register a cache invalidator, or { invalidate = fn, release = fn } when a
+-- module caches LOVE Images/Canvases and can eagerly free them at session end.
+-- release is optional and is NOT run on flush/invalidate (HotReload safe).
+-- MapLoader is the canonical split-hook example: invalidateAll clears tables
+-- without GPU release; releaseAll evicts every resident map renderer.
+function Assets.register(hooks)
+  if type(hooks) == "function" then
+    invalidators[#invalidators + 1] = hooks
+    return
+  end
+  if hooks.invalidate then invalidators[#invalidators + 1] = hooks.invalidate end
+  if hooks.release then releasers[#releasers + 1] = hooks.release end
 end
 
 -- hot reload's single entry point (20-developer-tooling): drop the central
@@ -68,10 +175,23 @@ end
 -- invalidator throws must not strand the ones behind it in the list.
 function Assets.invalidate()
   cache = {}
+  AtlasPrefetch.bump() -- the search path / mod set may resolve differently
   for _, fn in ipairs(invalidators) do pcall(fn) end
 end
 
 Assets.flush = Assets.invalidate
+
+-- In-process return-to-launcher / editor close: release central Images and
+-- run release hooks only.  Does not call invalidate hooks (MapLoader must
+-- keep invalidateAll separate from releaseAll).
+function Assets.releaseSession()
+  for _, img in pairs(cache) do
+    if img and img.release then pcall(img.release, img) end
+  end
+  cache = {}
+  AtlasPrefetch.bump()
+  for _, fn in ipairs(releasers) do pcall(fn) end
+end
 
 -- Loader:load hands over the live mod set once the merge is done.  Load
 -- order is priority ascending, so the search walks it backwards: the mod

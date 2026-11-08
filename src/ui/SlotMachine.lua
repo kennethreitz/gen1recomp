@@ -46,6 +46,7 @@
 local Font = require("src.render.Font")
 local Sound = require("src.core.Sound")
 local Strings = require("src.core.Strings")
+local romText = require("src.core.RomText")
 
 local SlotMachine = {}
 SlotMachine.__index = SlotMachine
@@ -191,9 +192,9 @@ function SlotMachine.new(game, lucky)
   local self = setmetatable({}, SlotMachine)
   self.game = game
   self.wheels = game.data.field.slotWheels
-  -- intro | bet | spinup | spin | reroll | flash | message | payout | onemore
-  -- PromptUserToPlaySlots asks "Want to play?" before the session starts.
-  self.stage = "intro"
+  -- bet | spinup | spin | reroll | flash | message | payout | onemore
+  -- PromptUserToPlaySlots: engine/slots/slot_machine.asm:9-23
+  self.stage = "bet"
   self.yesno = 1        -- YES/NO cursor (1 = YES); wCurrentMenuItem
   -- CoinMultiplierSlotMachineText lists ×3/×2/×1 with the cursor defaulting to
   -- the top (wCurrentMenuItem 0), i.e. bet = 3 - menuItem.
@@ -357,7 +358,11 @@ function SlotMachine:resolveWin(win)
   -- SlotReward300Func prints "Yeah!" (text_pause) before the flash; the port
   -- shows it in the box while the screen flashes.  LinedUpText follows.
   self.yeah = (sym == "7")
-  self.message = Strings("%s lined up!\nScored %d coins!", sym, pay)
+  -- engine/slots/slot_machine.asm:479-489
+  self.winSymbol = sym
+  self.message = require("src.render.TextBox").strip(
+    romText(self.game.data, "_LinedUpText",
+      " lined up!\nScored %d coins!", pay))
   -- .flashScreenLoop: flip rBGP, wait 5 frames, b times.  The coins are not
   -- credited until the player dismisses the "lined up" text (see startPayout).
   self.stage = "flash"
@@ -368,6 +373,7 @@ end
 
 function SlotMachine:resolveLose()
   -- NotThisTimeText, then MainSlotMachineLoop asks "One more go?"
+  self.winSymbol = nil
   self.message = "Not this time!"
   self.stage = "message"
   self.afterMessage = "onemore"
@@ -380,6 +386,8 @@ function SlotMachine:enterBet()
   self.betIndex = 0
   self.bet = 3
   self.message = nil
+  self.winSymbol = nil
+  self.betPrompt = nil
   self.payoutDisplay = 0
 end
 
@@ -395,6 +403,7 @@ end
 -- delay then CloseTextDisplay), otherwise ask "One more go?".
 function SlotMachine:afterSpin()
   if coins(self) == 0 then
+    self.winSymbol = nil
     self.message = Strings("Darn!\nRan out of coins!")
     self.stage = "message"
     self.afterMessage = nil
@@ -415,7 +424,7 @@ function SlotMachine:startPayout()
   self.flash = false
 end
 
--- YES/NO prompt shared by the intro ("Want to play?") and "One more go?".
+-- the "One more go?" YES/NO prompt.
 function SlotMachine:updateYesNo(onYes)
   local input = self.game.input
   if input:wasPressed("up") or input:wasPressed("down") then
@@ -433,12 +442,6 @@ function SlotMachine:update(dt)
   local input = self.game.input
   local save = self.game.save
 
-  if self.stage == "intro" then
-    -- PromptUserToPlaySlots: "A slot machine! Want to play?"
-    self:updateYesNo(function() self:enterBet() end)
-    return
-  end
-
   if self.stage == "message" then
     if self.exitTimer then
       -- OutOfCoinsSlotMachineText: DelayFrames 60, then leave
@@ -446,6 +449,7 @@ function SlotMachine:update(dt)
       if self.exitTimer <= 0 then self.game.stack:pop() end
       return
     end
+    if self.arrowTimer then self.arrowTimer = self.arrowTimer + 1 end
     if input:wasPressed("a") or input:wasPressed("b") then
       Sound.play(self.game.data, "Press_AB")
       local after = self.afterMessage
@@ -455,7 +459,10 @@ function SlotMachine:update(dt)
       elseif after == "onemore" then
         self:afterSpin()
       else
+        -- engine/slots/slot_machine.asm:106-108
+        local prompt = self.message
         self:enterBet()             -- NotEnoughCoinsSlotMachineText -> menu
+        self.betPrompt = prompt
       end
     end
     return
@@ -477,6 +484,7 @@ function SlotMachine:update(dt)
         self.flash = false
         self.stage = "message"
         self.afterMessage = "payout"
+        self.arrowTimer = 0 -- engine/slots/slot_machine.asm:631-632
       end
     end
     return
@@ -636,8 +644,11 @@ end
 -- menu on the right (like MainSlotMachineLoop's TextBoxBorder + menus).
 function SlotMachine:drawBottom()
   local lines
-  if self.stage == "intro" then
-    lines = { "A slot machine!", "Want to play?" }
+  if self.stage == "bet" and self.betPrompt then
+    lines = {}
+    for line in (self.betPrompt .. "\n"):gmatch("(.-)\n") do
+      if line ~= "" then lines[#lines + 1] = line end
+    end
   elseif self.stage == "bet" then
     lines = { "Bet how many", "coins?" }
   elseif self.stage == "onemore" then
@@ -655,26 +666,44 @@ function SlotMachine:drawBottom()
   end
   if not lines then return end
   Font.drawBox(0, 12, 20, 6)
+  local firstX = 8
+  local art = self.winSymbol and self.message and self.symbolImg
+              and self:loadArt()
+  local rect = art and art.symbols and art.symbols[self.winSymbol]
+  if rect and self.stage ~= "flash" then
+    love.graphics.setColor(1, 1, 1, 1)
+    self.winQuad = self.winQuad or love.graphics.newQuad(0, 0, 16, 16,
+      self.symbolImg:getDimensions())
+    self.winQuad:setViewport(rect.x, rect.y, rect.w, rect.h,
+      self.symbolImg:getDimensions())
+    love.graphics.draw(self.symbolImg, self.winQuad, 2 * 8, 13 * 8)
+    firstX = 5 * 8
+  end
   love.graphics.setColor(0, 0, 0, 1)
-  Font.draw(lines[1] or "", 8, 14 * 8)
+  Font.draw(lines[1] or "", firstX, 14 * 8)
   Font.draw(lines[2] or "", 8, 16 * 8)
+  -- engine/slots/slot_machine.asm:631-632
+  if self.winSymbol and self.stage == "message"
+     and (self.arrowTimer or 0) % 60 < 30 then
+    Font.drawCode(0xEE, 18 * 8, 16 * 8)
+  end
   if self.stage == "bet" then
-    Font.drawBox(14, 11, 6, 5)
+    -- hlcoord 14,11 with b=5 c=4 -- engine/slots/slot_machine.asm:83-86
+    Font.drawBox(14, 11, 6, 7)
     love.graphics.setColor(0, 0, 0, 1)
+    -- engine/slots/slot_machine.asm:150-153
     Font.draw("×3", 16 * 8, 12 * 8)
-    Font.draw("×2", 16 * 8, 13 * 8)
-    Font.draw("×1", 16 * 8, 14 * 8)
-    Font.drawCode(0xED, 15 * 8, (12 + self.betIndex) * 8)
-  elseif self.stage == "intro" or self.stage == "onemore" then
-    -- "One more go?" sits at the right of the box (hlcoord 14,12); the longer
-    -- "A slot machine!" prompt would clip against it, so the intro's YES/NO
-    -- floats above the reels instead.
-    local by = self.stage == "intro" and 6 or 11
-    Font.drawBox(13, by, 6, 5)
+    Font.draw("×2", 16 * 8, 14 * 8)
+    Font.draw("×1", 16 * 8, 16 * 8)
+    Font.drawCode(0xED, 15 * 8, (12 + 2 * self.betIndex) * 8)
+  elseif self.stage == "onemore" then
+    -- hlcoord 14,12 with the YES_NO_MENU 4x3 body
+    -- engine/slots/slot_machine.asm:136-138, data/yes_no_menu_strings.asm:10
+    Font.drawBox(14, 12, 6, 5)
     love.graphics.setColor(0, 0, 0, 1)
-    Font.draw(Strings("YES"), 15 * 8, (by + 1) * 8)
-    Font.draw(Strings("NO"), 15 * 8, (by + 2) * 8)
-    Font.drawCode(0xED, 14 * 8, (by + 1 + (self.yesno == 1 and 0 or 1)) * 8)
+    Font.draw(Strings("YES"), 16 * 8, 13 * 8)
+    Font.draw(Strings("NO"), 16 * 8, 15 * 8)
+    Font.drawCode(0xED, 15 * 8, (13 + (self.yesno == 1 and 0 or 2)) * 8)
   end
   love.graphics.setColor(1, 1, 1, 1)
 end
@@ -712,7 +741,8 @@ function SlotMachine:draw()
   love.graphics.rectangle("fill", 40, 8, 32, 8)
   love.graphics.rectangle("fill", 88, 8, 32, 8)
   love.graphics.setColor(0, 0, 0, 1)
-  Font.draw(("%4d"):format(math.min(9999, coins(self))), 40, 8)
+  -- engine/slots/slot_machine.asm:645-649
+  Font.draw(("%04d"):format(math.min(9999, coins(self))), 40, 8)
   Font.draw(("%04d"):format(self.payoutDisplay or 0), 88, 8)
   love.graphics.setColor(1, 1, 1, 1)
 

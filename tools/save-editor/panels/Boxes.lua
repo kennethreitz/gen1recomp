@@ -1,179 +1,247 @@
--- Boxes panel: the 12 PC boxes as a real grid rather than the old 20-row
--- text list.  Three columns:
---   box strip   which boxes have room, so you can see where a deposit lands
---   the grid    5 x 4 = Boxes.CAPACITY, empty cells are dashed and clickable
---   party dock  the deposit source and withdraw target, both in one place
---
--- Selecting a slot points S.editingMon at it, so switching to the Party tab
--- keeps inspecting the same mon.
-
-local BoxesMod = require("src.pokemon.Boxes")
-local PartyMod = require("src.pokemon.Party")
-local Theme = require("Theme")
 local Ops = require("Ops")
-local PAL = Theme.PAL
-
+local Gen = require("Gen")
+local PAL = require("Theme").PAL
 local M = {}
-
-local COLS = 5
-local ROWS = math.ceil(BoxesMod.CAPACITY / COLS)
-
-function M.draw(S, Kit, x, y, w, h)
-  local s = Kit.scale
-  local gap = 20 * s
-  local pad = 16 * s
-
-  S.selectedBox = Ops.clamp(S.selectedBox or 1, 1, BoxesMod.COUNT)
-  S.save.currentBox = S.selectedBox
+local Motion = require("Motion")
+local Chooser = require("Chooser")
+local BoxSort = require("BoxSort")
+local function sortWidth(Kit, row)
+  return Kit.buttonWidth("Sort", { font = "small", icon = "sliders-horizontal", trailingIcon = "chevron-down" }, row)
+end
+local function sortMenu(S, Kit, x, y, w, row)
+  local options = {}
+  for _, mode in ipairs(BoxSort.MODES) do
+    options[#options + 1] = {
+      id = mode.id,
+      label = mode.label,
+      icon = mode.icon,
+      fn = function(state)
+        Ops.setBoxOrder(state, mode.id)
+      end,
+    }
+  end
+  Chooser.actions(S, Kit, "boxSort", "Sort", options, x, y, w, row)
+end
+local function drawView(S, Kit, x, y, w, h)
+  local s, pad, gap, row = Kit.scale, 12 * Kit.scale, 8 * Kit.scale, Kit.controlH()
+  Kit.card(x, y, w, h)
+  local cx, cy, inner = x + pad, y + pad, w - 2 * pad
+  S.boxView = S.boxView or "storage"
+  local compact = h < 300 * s
   local boxes = Ops.boxes(S)
+  S.selectedBox = Ops.clamp(S.selectedBox or 1, 1, Ops.boxCount(S))
   local box = boxes[S.selectedBox]
-
-  local stripW = math.max(150 * s, math.min(200 * s, w * 0.16))
-  local dockW = math.max(220 * s, math.min(300 * s, w * 0.22))
-  local gridX = x + stripW + gap
-  local gridW = w - stripW - dockW - 2 * gap
-
-  -- ------------------------------------------------------------ box strip
-  Kit.card(x, y, stripW, h)
-  Kit.caption(x + pad, y + pad, ("BOXES . %d"):format(BoxesMod.COUNT))
-  local stripTop = y + pad + Kit.textHeight("caption") + 10 * s
-  local stripInner = stripW - 2 * pad
-  local bRowH = math.min(30 * s, math.max(22 * s,
-    (h - (stripTop - y) - pad - (BoxesMod.COUNT - 1) * 6 * s) / BoxesMod.COUNT))
-  for i = 1, BoxesMod.COUNT do
-    local ry = stripTop + (i - 1) * (bRowH + 6 * s)
-    if ry + bRowH > y + h - pad then break end
-    if Kit.row(x + pad, ry, stripInner, bRowH, i == S.selectedBox, PAL.blue, 9 * s) then
-      Ops.selectBox(S, i)
+  local views = { { "storage", "Boxes" }, { "party", "Deposit" } }
+  local sortW = sortWidth(Kit, row)
+  local modeW = math.max(row, inner * 0.28)
+  local labelRoom = inner - modeW - sortW - 2 * row - 4 * gap
+  if compact and labelRoom >= Kit.textWidth("small", "Box 00/00") then
+    Chooser.navigation(S, Kit, "boxView", "Storage view", views, cx, cy, modeW, row)
+    sortMenu(S, Kit, cx + modeW + gap, cy, sortW, row)
+    local left = cx + modeW + sortW + 2 * gap
+    if Kit.stepper(left, cy, row, row, "previous") then
+      Ops.stepBox(S, -1)
     end
-    local fill = #boxes[i]
-    Kit.text("mono", ("Box %d"):format(i), x + pad + 10 * s,
-      ry + (bRowH - Kit.textHeight("mono")) / 2, PAL.text)
-    local countW = Kit.textWidth("tiny", tostring(fill))
-    Kit.textRight("tiny", tostring(fill), x + pad + stripInner - 10 * s,
-      ry + (bRowH - Kit.textHeight("tiny")) / 2, PAL.caption)
-    local mx = x + pad + stripInner - 10 * s - countW - 8 * s - 44 * s
-    Kit.meter(mx, ry + (bRowH - 5 * s) / 2, 44 * s, 5 * s,
-      fill / BoxesMod.CAPACITY * 100, fill >= BoxesMod.CAPACITY and PAL.yellow or PAL.blue)
+    if Kit.stepper(cx + inner - row, cy, row, row, "next") then
+      Ops.stepBox(S, 1)
+    end
+    Kit.textCenter(
+      "small",
+      "Box " .. S.selectedBox .. "/" .. Ops.boxCount(S),
+      left + row + gap,
+      cy + (row - Kit.textHeight("small")) / 2,
+      labelRoom,
+      PAL.text
+    )
+    cy = cy + row + gap
+  else
+    Chooser.navigation(
+      S,
+      Kit,
+      "boxView",
+      "Storage view",
+      views,
+      cx,
+      cy,
+      math.min(inner - sortW - gap, 360 * s),
+      row
+    )
+    sortMenu(S, Kit, cx + inner - sortW, cy, sortW, row)
+    cy = cy + row + gap
+    if Kit.stepper(cx, cy, row, row, "previous") then
+      Ops.stepBox(S, -1)
+    end
+    if Kit.stepper(cx + inner - row, cy, row, row, "next") then
+      Ops.stepBox(S, 1)
+    end
+    Kit.textCenter(
+      "small",
+      ("Box %d / %d (%d/%d)"):format(
+        S.selectedBox,
+        Ops.boxCount(S),
+        Ops.boxSize(S, box),
+        Ops.boxCapacity(S)
+      ),
+      cx + row + gap,
+      cy + (row - Kit.textHeight("small")) / 2,
+      inner - 2 * (row + gap),
+      PAL.text
+    )
+    cy = cy + row + gap
   end
-
-  -- ------------------------------------------------------------- the grid
-  Kit.card(gridX, y, gridW, h)
-  local gpad = 18 * s
-  local gx = gridX + gpad
-  local ginner = gridW - 2 * gpad
-  local headH = 30 * s
-  Kit.text("tab", ("Box %d"):format(S.selectedBox), gx,
-    y + gpad + (headH - Kit.textHeight("tab")) / 2, PAL.heading)
-  local titleW = Kit.textWidth("tab", ("Box %d"):format(S.selectedBox))
-  Kit.text("mono", ("%d/%d"):format(#box, BoxesMod.CAPACITY),
-    gx + titleW + 14 * s, y + gpad + (headH - Kit.textHeight("mono")) / 2, PAL.caption)
-  local navW = 34 * s
-  if Kit.stepper(gx + ginner - 2 * navW - 8 * s, y + gpad, navW, headH, "<",
-      { radius = 8 * s }) then
-    Ops.stepBox(S, -1)
+  local actions
+  if S.boxView == "party" then
+    actions = {
+      {
+        "Deposit selected",
+        function()
+          Ops.deposit(S)
+        end,
+        "accent",
+      },
+      {
+        "Inspect",
+        function()
+          Motion.change(S, "tab", "party", -1)
+          S.mobileInspector = true
+        end,
+        "ghost",
+      },
+    }
+  else
+    actions = {
+      {
+        "Withdraw",
+        function()
+          Ops.withdraw(S)
+        end,
+        "accent",
+      },
+      {
+        "Add",
+        function()
+          Ops.openBoxAddPicker(S, Kit)
+        end,
+        "good",
+      },
+      {
+        Ops.armLabel(S, "box-release", "Release"),
+        function()
+          Ops.release(S)
+        end,
+        "danger",
+      },
+      {
+        "Inspect",
+        function()
+          Motion.change(S, "tab", "party", -1)
+          S.mobileInspector = true
+        end,
+        "ghost",
+      },
+    }
   end
-  if Kit.stepper(gx + ginner - navW, y + gpad, navW, headH, ">",
-      { radius = 8 * s }) then
-    Ops.stepBox(S, 1)
+  local widest = Kit.buttonWidth("Confirm?", { font = "small", icon = "check" }, row)
+  for _, action in ipairs(actions) do
+    widest = math.max(widest, Kit.buttonWidth(action[1], { font = "small" }, row))
   end
-
-  local actH = 34 * s
-  local actY = y + h - gpad - actH
-  local gridTop = y + gpad + headH + 14 * s
-  local gridH = actY - 14 * s - gridTop
-  local cellGap = 10 * s
-  local cellW = (ginner - cellGap * (COLS - 1)) / COLS
-  local cellH = math.min((gridH - cellGap * (ROWS - 1)) / ROWS, 110 * s)
-
-  for i = 1, BoxesMod.CAPACITY do
-    local cc = (i - 1) % COLS
-    local cr = math.floor((i - 1) / COLS)
-    local bx = gx + cc * (cellW + cellGap)
-    local by = gridTop + cr * (cellH + cellGap)
-    local mon = box[i]
-    local selected = (i == S.selectedBoxSlot) and mon ~= nil
-    if mon then
-      if Kit.row(bx, by, cellW, cellH, selected, PAL.green, 11 * s) then
-        Ops.selectBoxSlot(S, i)
+  local cols = inner >= #actions * widest + (#actions - 1) * gap and #actions or 2
+  local bw = (inner - (cols - 1) * gap) / cols
+  local rows = math.ceil(#actions / cols)
+  local footer = y + h - pad - rows * (row + gap)
+  for i, a in ipairs(actions) do
+    if
+      Kit.button(
+        cx + (i - 1) % cols * (bw + gap),
+        footer + math.floor((i - 1) / cols) * (row + gap),
+        bw,
+        row,
+        a[1],
+        { kind = a[3], font = "small" }
+      )
+    then
+      a[2]()
+    end
+  end
+  local bodyH = math.max(0, footer - gap - cy)
+  if S.boxView == "party" then
+    local drawn, shift = Kit.list(S, "dockOffset", cx, cy, inner, bodyH, #S.save.party, row + gap)
+    Kit.pushClip(cx, cy, inner, bodyH)
+    for i = 1, drawn do
+      local slot = S.dockOffset + i
+      local mon = S.save.party[slot]
+      if not mon then
+        break
       end
-      Kit.text("micro", tostring(i), bx + 10 * s, by + 8 * s, PAL.faint)
-      Kit.textRight("micro", ("Lv%d"):format(mon.level), bx + cellW - 10 * s,
-        by + 8 * s, PAL.caption)
-      Kit.textCenter("mono",
-        Kit.ellipsize("mono", mon.species, cellW - 12 * s), bx,
-        by + cellH / 2 - Kit.textHeight("mono") / 2, cellW, PAL.text)
-    else
-      -- empty slots are dashed and clickable: clicking one adds a mon there
-      Theme.col(PAL.cardBorder, Kit.hover(bx, by, cellW, cellH) and 0.6 or 0.32)
-      Theme.dashed(bx, by, cellW, cellH, 11 * s, 6 * s, 5 * s)
-      Kit.text("micro", tostring(i), bx + 10 * s, by + 8 * s, PAL.faint)
-      Kit.textCenter("micro", "+", bx, by + cellH / 2 - Kit.textHeight("micro") / 2,
-        cellW, PAL.faint)
-      if Kit.press(bx, by, cellW, cellH) then
-        S.selectedBoxSlot = math.min(i, #box + 1)
-        Ops.boxAdd(S)
+      if
+        Kit.button(
+          cx,
+          cy + (i - 1) * (row + gap) - shift,
+          inner,
+          row,
+          tostring(slot)
+            .. " / "
+            .. require("Ops").monName(S, mon)
+            .. " / Lv"
+            .. tostring(mon.level),
+          { face = "tab", active = S.editingMon == mon, font = "small" }
+        )
+      then
+        Ops.selectParty(S, slot)
       end
     end
-  end
-
-  local wdW = 170 * s
-  if Kit.button(gx, actY, wdW, actH, "Withdraw to party",
-      { font = "small", radius = 9 * s,
-        enabled = #S.save.party < PartyMod.MAX }) then
-    Ops.withdraw(S)
-  end
-  if Kit.button(gx + wdW + 10 * s, actY, 140 * s, actH, "+ Add mon here",
-      { font = "small", radius = 9 * s,
-        enabled = #box < BoxesMod.CAPACITY }) then
-    Ops.boxAdd(S)
-  end
-  local relW = 110 * s
-  if Kit.button(gx + ginner - relW, actY, relW, actH,
-      Ops.armLabel(S, "box-release", "Release"),
-      { kind = "danger", font = "small", radius = 9 * s }) then
-    Ops.release(S)
-  end
-
-  -- ----------------------------------------------------------- party dock
-  local dx = gridX + gridW + gap
-  Kit.card(dx, y, dockW, h)
-  Kit.caption(dx + pad, y + pad, "PARTY DOCK")
-  Kit.textRight("mono", ("%d/%d"):format(#S.save.party, PartyMod.MAX),
-    dx + dockW - pad, y + pad, PAL.caption)
-  local dTop = y + pad + Kit.textHeight("caption") + 10 * s
-  local dInner = dockW - 2 * pad
-  local dRowH = 34 * s
-  for i, mon in ipairs(S.save.party) do
-    local ry = dTop + (i - 1) * (dRowH + 7 * s)
-    if Kit.row(dx + pad, ry, dInner, dRowH, S.editingMon == mon, PAL.green, 9 * s) then
-      Ops.selectParty(S, i)
+    Kit.popClip()
+  else
+    local cellWMin = math.max(Kit.tapMin(), 82 * s)
+    local gridCols = math.max(2, math.floor((inner + gap) / (cellWMin + gap)))
+    local cw = (inner - (gridCols - 1) * gap) / gridCols
+    local cellH = math.max(row, 76 * s)
+    if bodyH >= 60 * s then
+      cellH = math.min(cellH, bodyH)
     end
-    local lv = ("Lv%d"):format(mon.level)
-    local lvW = Kit.textWidth("tiny", lv)
-    Kit.textRight("tiny", lv, dx + pad + dInner - 10 * s,
-      ry + (dRowH - Kit.textHeight("tiny")) / 2, PAL.caption)
-    Kit.text("mono", Kit.ellipsize("mono", mon.species, dInner - 30 * s - lvW),
-      dx + pad + 10 * s, ry + (dRowH - Kit.textHeight("mono")) / 2, PAL.text)
-  end
-  if #S.save.party == 0 then
-    Kit.emptyBox(dx + pad, dTop, dInner, 70 * s, "Party is empty.")
-  end
-
-  local depY = dTop + math.max(#S.save.party, 2) * (dRowH + 7 * s) + 6 * s
-  if Kit.button(dx + pad, depY, dInner, 36 * s, "Deposit selected slot",
-      { kind = "accent", font = "small", radius = 9 * s,
-        enabled = #S.save.party > 0 }) then
-    Ops.deposit(S)
-  end
-  local noteY = depY + 36 * s + 10 * s
-  local noteH = y + h - pad - noteY
-  if noteH > Kit.textHeight("tiny") * 2 then
-    Kit.textCenter("tiny",
-      "Deposit fills the current box first, then the next box with room, and " ..
-      "the status bar says where the mon landed.",
-      dx + pad, noteY, dInner, PAL.caption)
+    local gridRows = math.ceil(Ops.boxCapacity(S) / gridCols)
+    S.boxGridScroll =
+      Kit.scrollPixels(cx, cy, inner, bodyH, S.boxGridScroll or 0, gridRows * (cellH + gap))
+    Kit.pushClip(cx, cy, inner, bodyH)
+    for i = 1, Ops.boxCapacity(S) do
+      local bx = cx + (i - 1) % gridCols * (cw + gap)
+      local by = cy + math.floor((i - 1) / gridCols) * (cellH + gap) - S.boxGridScroll
+      local mon = box[i]
+      if Kit.row(bx, by, cw, cellH, i == S.selectedBoxSlot, PAL.green) then
+        if mon then
+          Ops.selectBoxSlot(S, i)
+        else
+          S.selectedBoxSlot = Gen.ofState(S) == 3 and i or math.min(i, Ops.boxSize(S, box) + 1)
+          Ops.openBoxAddPicker(S, Kit)
+        end
+      end
+      Kit.text("tiny", tostring(i), bx + 6 * s, by + 6 * s, PAL.caption)
+      if mon then
+        Kit.textCenter(
+          "small",
+          Kit.ellipsize("small", Ops.monName(S, mon), cw - 8 * s),
+          bx,
+          by + 26 * s,
+          cw,
+          PAL.text
+        )
+        Kit.textCenter(
+          "tiny",
+          "Lv" .. tostring(mon.level),
+          bx,
+          by + cellH - Kit.textHeight("tiny") - 6 * s,
+          cw,
+          PAL.caption
+        )
+      else
+        local icon = math.min(row * 0.5, cw * 0.5)
+        Kit.icon("plus", bx + (cw - icon) / 2, by + (cellH - icon) / 2, icon, PAL.muted)
+      end
+    end
+    Kit.popClip()
   end
 end
-
+function M.draw(S, Kit, x, y, w, h)
+  Motion.pages(S, Kit, "boxView", x, y, w, h, drawView)
+end
 return M

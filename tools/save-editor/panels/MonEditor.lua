@@ -1,49 +1,76 @@
--- The mon inspector: species, level, DVs and moves for whatever S.editingMon
--- points at (a party slot or a box slot), all recalculated through MonOps so
--- stats stay in sync with the Gen1 formulas.
---
--- This used to be a modal overlay floating over the party list, which hid the
--- roster you were comparing against.  It is now a permanent right-hand column
--- the Party and Boxes panels dock into (rule 1 of the design spec): the list
--- stays visible while you edit, and Escape clears the selection rather than
--- "closing a window".
 
 local Theme = require("Theme")
-local Ops = require("Ops")
 local PAL = Theme.PAL
+local Gen = require("Gen")
 
 local MonEditor = {}
-
-local DV_KEYS = { "attack", "defense", "speed", "special" }
-local STAT_KEYS = {
-  { key = "HP", field = "hp" },
-  { key = "ATK", field = "attack" },
-  { key = "DEF", field = "defense" },
-  { key = "SPD", field = "speed" },
-  { key = "SPC", field = "special" },
-}
 
 -- Front sprites are read straight off the generated cache.  One image per
 -- species, cached for the process: the old panel called newImage every frame,
 -- which re-decoded a PNG sixty times a second.
 local spriteCache = {}
-function MonEditor.sprite(S, species)
-  if spriteCache[species] ~= nil then return spriteCache[species] or nil end
-  local def = S.data.pokemon[species]
+local SPINDA_CACHE_MAX = 16
+local spindaKeys = {}
+
+local function remember(key, value)
+  spriteCache[key] = value
+  if type(key) == "string" and key:find("^308:") then
+    spindaKeys[#spindaKeys + 1] = key
+    while #spindaKeys > SPINDA_CACHE_MAX do
+      spriteCache[table.remove(spindaKeys, 1)] = nil
+    end
+  end
+end
+
+function MonEditor.spriteKey(S, species, mon)
+  if not species then return nil end
+  local letter = mon and require("Ops").unownForm(S, mon)
+  if letter == nil and mon and Gen.ofState(S) == 3
+      and tonumber(species) == require("src.core.game3.pokemon").SPECIES_SPINDA then
+    return tostring(species) .. ":" .. tostring((tonumber(mon.personality) or 0) % 4294967296)
+  end
+  if letter == nil then return species end
+  return tostring(species) .. ":" .. letter
+end
+
+function MonEditor.sprite(S, species, mon)
+  if not species then return nil end
+  local key = MonEditor.spriteKey(S, species, mon)
+  local letter = key ~= species and require("Ops").unownForm(S, mon) or nil
+  if spriteCache[key] ~= nil then return spriteCache[key] or nil end
+  if Gen.ofState(S) == 3 then
+    local okP, Pokemon = pcall(require, "src.core.game3.pokemon")
+    if okP and Pokemon then
+      local spId = tonumber(species) or (Pokemon.speciesFromName and Pokemon.speciesFromName(tostring(species)))
+      if spId then
+        local picId = letter ~= nil and Pokemon.picSpecies(spId, mon.personality) or spId
+        local pic = (Pokemon.frontPic and Pokemon.frontPic(picId, nil, nil, mon and mon.personality))
+          or (Pokemon.icon and Pokemon.icon(picId))
+        if pic and pic.image then
+          remember(key, pic.image)
+          return pic.image
+        end
+      end
+    end
+  end
+  local def = S.data and S.data.pokemon and (S.data.pokemon[species] or (type(species) == "number" and S.data.pokemon[species]))
   local path = def and def.spriteFront
+  if letter ~= nil and Gen.ofState(S) == 2 then
+    path = require("src.core.gen2.Unown").formSprite(S.data.pokemon, letter) or path
+  end
   if not path or not love.graphics.newImage then
-    spriteCache[species] = false
+    remember(key, false)
     return nil
   end
   local ok, img = pcall(love.graphics.newImage, path)
-  spriteCache[species] = ok and img or false
+  remember(key, ok and img or false)
   return ok and img or nil
 end
 
 -- Draw a species sprite fitted into a box, or a dashed placeholder when the
 -- cache has no art for it (a modded species, or a headless run).
-function MonEditor.drawSprite(S, Kit, species, x, y, size)
-  local img = MonEditor.sprite(S, species)
+function MonEditor.drawSprite(S, Kit, species, x, y, size, mon)
+  local img = MonEditor.sprite(S, species, mon)
   if img and love.graphics.draw and img.getDimensions then
     local iw, ih = img:getDimensions()
     if iw > 0 and ih > 0 then
@@ -58,179 +85,34 @@ function MonEditor.drawSprite(S, Kit, species, x, y, size)
   love.graphics.rectangle("fill", x, y, size, size, 8 * Kit.scale, 8 * Kit.scale)
   Theme.col(PAL.cardBorder, 0.35)
   Theme.dashed(x, y, size, size, 8 * Kit.scale, 5 * Kit.scale, 4 * Kit.scale)
-  Kit.textCenter("micro", (species or "?"):sub(1, 3), x,
+  Kit.textCenter("micro", tostring(species or "?"):sub(1, 3), x,
     y + size / 2 - Kit.textHeight("micro") / 2, size, PAL.muted)
 end
 
--- Bars are scaled against 400 so a Lv100 legend fills roughly three quarters
--- and the differences between mons stay legible.
-local STAT_SCALE = 400
-
-function MonEditor.draw(S, Kit, x, y, w, h)
-  local s = Kit.scale
-  Kit.card(x, y, w, h)
-  local mon = S.editingMon
-  local pad = 18 * s
-  if not mon then
-    -- The inspector column is always drawn, so it explains itself rather
-    -- than collapsing and reflowing the panel underneath it.
-    local tw = math.min(w - 40 * s, 340 * s)
-    Kit.textCenter("button",
-      "Pick a slot on the left to inspect it. Every change here re-runs the " ..
-      "Gen1 stat formulas, so HP and stats stay legal.",
-      x + (w - tw) / 2, y + h / 2 - Kit.textHeight("button"), tw, PAL.muted)
-    return
+function MonEditor.isShiny(S, mon)
+  if not mon then return false end
+  local g = Gen.ofState(S)
+  if g == 3 then
+    if mon.isShiny ~= nil then return mon.isShiny == true end
+    local ok, shiny = pcall(require("src.core.game3.pokemon").isShiny, mon)
+    return ok and shiny == true
+  elseif g == 2 then
+    return require("src.pokemon.Stats").isShiny(mon.dvs)
   end
+  return false
+end
 
-  local def = S.data.pokemon[mon.species]
-  local cx, cy = x + pad, y + pad
-  local inner = w - 2 * pad
+function MonEditor.displayName(S, mon)
+  if mon.nickname and mon.nickname ~= "" then return mon.nickname end
+  local def = S.data and S.data.pokemon and S.data.pokemon[mon.species or mon.speciesId]
+  if def and def.name then return def.name end
+  if type(mon.species) == "string" then return mon.species end
+  if type(mon.name) == "string" and mon.name ~= "" then return mon.name end
+  return tostring(mon.species or "POKEMON")
+end
 
-  -- ---------------------------------------------------------- header row
-  local sprite = 96 * s
-  MonEditor.drawSprite(S, Kit, mon.species, cx, cy, sprite)
-  local hx = cx + sprite + 18 * s
-  local hw = inner - sprite - 18 * s
-
-  Kit.text("title", mon.species, hx, cy, PAL.heading)
-  local nameW = Kit.textWidth("title", mon.species)
-  Kit.text("tiny", ("#%03d"):format(def and def.dex or 0), hx + nameW + 12 * s,
-    cy + Kit.textHeight("title") - Kit.textHeight("tiny") - 2 * s, PAL.caption)
-
-  local stepW, stepH = 28 * s, 26 * s
-  local sx = hx + hw - 2 * stepW - 6 * s
-  local sy = cy + (Kit.textHeight("title") - stepH) / 2
-  if Kit.stepper(sx, sy, stepW, stepH, "<", { radius = 7 * s }) then
-    Ops.stepSpecies(S, mon, -1)
-  end
-  if Kit.stepper(sx + stepW + 6 * s, sy, stepW, stepH, ">", { radius = 7 * s }) then
-    Ops.stepSpecies(S, mon, 1)
-  end
-  Kit.textRight("tiny", "species", sx - 8 * s,
-    sy + (stepH - Kit.textHeight("tiny")) / 2, PAL.caption)
-
-  -- level stepper: -5 -1 [Lv] +1 +5, matching MonOps.setLevel's 1..100 clamp
-  local ly = cy + Kit.textHeight("title") + 14 * s
-  local lh = 28 * s
-  Kit.caption(hx, ly + (lh - Kit.textHeight("caption")) / 2, "LEVEL")
-  local lx = hx + 52 * s
-  local bw = 40 * s
-  for _, d in ipairs({ { "-5", -5 }, { "-1", -1 } }) do
-    if Kit.stepper(lx, ly, bw, lh, d[1], { font = "small", radius = 7 * s }) then
-      Ops.setLevel(S, mon, mon.level + d[2])
-    end
-    lx = lx + bw + 8 * s
-  end
-  Kit.textCenter("monoBig", tostring(mon.level), lx,
-    ly + (lh - Kit.textHeight("monoBig")) / 2, 58 * s, PAL.heading)
-  lx = lx + 58 * s + 8 * s
-  for _, d in ipairs({ { "+1", 1 }, { "+5", 5 } }) do
-    if Kit.stepper(lx, ly, bw, lh, d[1], { font = "small", radius = 7 * s }) then
-      Ops.setLevel(S, mon, mon.level + d[2])
-    end
-    lx = lx + bw + 8 * s
-  end
-  Kit.text("mono", ("EXP %d"):format(mon.exp or 0), lx + 6 * s,
-    ly + (lh - Kit.textHeight("mono")) / 2, PAL.muted)
-
-  -- ------------------------------------------------------- derived stats
-  local statsY = cy + sprite + 18 * s
-  Kit.caption(cx, statsY, "STATS . recalculated from level + DVs")
-  statsY = statsY + Kit.textHeight("caption") + 10 * s
-  local gap = 12 * s
-  local cellW = (inner - gap * 4) / 5
-  local cellH = 68 * s
-  for i, st in ipairs(STAT_KEYS) do
-    local bx = cx + (i - 1) * (cellW + gap)
-    Theme.row(bx, statsY, cellW, cellH, 10 * s, 0.6)
-    local value = (mon.stats and mon.stats[st.field]) or 0
-    Kit.text("micro", st.key, bx + 12 * s, statsY + 10 * s, PAL.caption)
-    Kit.text("stat", tostring(value), bx + 12 * s,
-      statsY + 10 * s + Kit.textHeight("micro") + 4 * s, PAL.heading)
-    Kit.meter(bx + 12 * s, statsY + cellH - 14 * s, cellW - 24 * s, 5 * s,
-      value / STAT_SCALE * 100, PAL.blue)
-  end
-
-  -- --------------------------------------------------- DVs | moves split
-  local colY = statsY + cellH + 18 * s
-  local colGap = 18 * s
-  local colW = (inner - colGap) / 2
-  local rightX = cx + colW + colGap
-
-  Kit.caption(cx, colY, "DVs")
-  Kit.textRight("tiny", ("HP DV auto-derived . %d"):format(mon.dvs.hp or 0),
-    cx + colW, colY, PAL.caption)
-  Kit.caption(rightX, colY, "MOVES")
-  Kit.textRight("tiny", "click a slot to cycle", rightX + colW, colY, PAL.caption)
-
-  local rowY = colY + Kit.textHeight("caption") + 10 * s
-  local rowH = 34 * s
-  local rowGap = 8 * s
-
-  for i, key in ipairs(DV_KEYS) do
-    local ry = rowY + (i - 1) * (rowH + rowGap)
-    Theme.row(cx, ry, colW, rowH, 10 * s, 0.6)
-    local v = mon.dvs[key] or 0
-    Kit.text("tiny", key:upper(), cx + 10 * s,
-      ry + (rowH - Kit.textHeight("tiny")) / 2, PAL.muted)
-    local btn = 26 * s
-    local btnX = cx + colW - 10 * s - 3 * btn - 18 * s
-    local meterX = cx + 66 * s
-    local meterW = math.max(20 * s, btnX - meterX - 34 * s)
-    Kit.meter(meterX, ry + (rowH - 8 * s) / 2, meterW, 8 * s, v / 15 * 100,
-      v >= 15 and PAL.green or (v >= 10 and PAL.blue or PAL.steel))
-    Kit.textRight("monoRow", tostring(v), meterX + meterW + 28 * s,
-      ry + (rowH - Kit.textHeight("monoRow")) / 2, PAL.heading)
-    if Kit.stepper(btnX, ry + (rowH - btn) / 2, btn, btn, "-") then
-      Ops.setDv(S, mon, key, v - 1)
-    end
-    if Kit.stepper(btnX + btn + 6 * s, ry + (rowH - btn) / 2, btn, btn, "+") then
-      Ops.setDv(S, mon, key, v + 1)
-    end
-    if Kit.button(btnX + 2 * btn + 12 * s, ry + (rowH - btn) / 2, btn, btn,
-        "15", { kind = "good", font = "micro", radius = 6 * s }) then
-      Ops.setDv(S, mon, key, 15)
-    end
-  end
-
-  for slot = 1, 4 do
-    local ry = rowY + (slot - 1) * (rowH + rowGap)
-    Theme.row(rightX, ry, colW, rowH, 10 * s, 0.6)
-    local mv = mon.moves and mon.moves[slot]
-    local clear = 24 * s
-    local clearX = rightX + colW - 10 * s - clear
-    local ppText = mv and ("PP %d"):format(mv.pp or 0) or ""
-    local ppW = Kit.textWidth("tiny", ppText)
-    Kit.text("mono", tostring(slot), rightX + 10 * s,
-      ry + (rowH - Kit.textHeight("mono")) / 2, PAL.faint)
-    local nameX = rightX + 28 * s
-    local nameW2 = math.max(20 * s, clearX - 12 * s - ppW - nameX)
-    Kit.text("monoRow", Kit.ellipsize("monoRow", mv and mv.id or "-- --", nameW2),
-      nameX, ry + (rowH - Kit.textHeight("monoRow")) / 2,
-      mv and PAL.text or PAL.faint)
-    Kit.textRight("tiny", ppText, clearX - 10 * s,
-      ry + (rowH - Kit.textHeight("tiny")) / 2, PAL.caption)
-    -- the row body cycles, the x empties: two targets, no modal picker
-    if Kit.press(rightX, ry, clearX - rightX - 4 * s, rowH) then
-      Ops.cycleMove(S, mon, slot)
-    end
-    if Kit.button(clearX, ry + (rowH - clear) / 2, clear, clear, "x",
-        { kind = "danger", font = "tiny", radius = 6 * s }) then
-      Ops.clearMove(S, mon, slot)
-    end
-  end
-
-  local actY = rowY + 4 * (rowH + rowGap) + 4 * s
-  local actH = 34 * s
-  local actW = (colW - 10 * s) / 2
-  if Kit.button(rightX, actY, actW, actH, "Reset to learnset",
-      { font = "small", radius = 9 * s }) then
-    Ops.resetMoves(S, mon)
-  end
-  if Kit.button(rightX + actW + 10 * s, actY, actW, actH, "Full heal",
-      { kind = "good", font = "small", radius = 9 * s }) then
-    Ops.healMon(S, mon)
-  end
+function MonEditor.draw(S, Kit, x, y, w, h, prelude)
+  require("InspectorBody").draw(S, Kit, x, y, w, h, prelude)
 end
 
 return MonEditor

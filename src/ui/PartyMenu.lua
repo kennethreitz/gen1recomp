@@ -11,6 +11,7 @@
 
 local Assets = require("src.render.Assets")
 local Font = require("src.render.Font")
+local LevelDisplay = require("src.ui.LevelDisplay")
 local Logger = require("src.core.Logger")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
@@ -18,8 +19,10 @@ local Theme = require("src.ui.Theme")
 local FieldDefaults = require("src.world.FieldDefaults")
 local Map = require("src.world.Map")
 local Strings = require("src.core.Strings")
+local Status = require("src.battle.Status")
+local Timing = require("src.core.Timing")
 
-local PartyMenu = {}
+local PartyMenu = { isMenu = true }
 PartyMenu.__index = PartyMenu
 PartyMenu.isOpaque = true
 
@@ -33,14 +36,11 @@ PartyMenu.isOpaque = true
 -- MEWMON instead painted every bar with MEWMON's shades, which is why a
 -- full bar came out black and a low one purple (#274, absorbing #272).
 --
--- Two rects differ from the packet's, both because this port draws pixels
+-- One rect differs from the packet's, because this port draws pixels
 -- where the hardware drew OAM over BG:
 --   * the icon block is rows 0-11, not the packet's 0-12 -- row 12 is the
 --     message box's top edge, which on hardware was BG under an OBJ-free
 --     part of the block; here it would take MEWMON instead of the base.
---   * the bar blocks sit one tile right of the packet's 05-11 because this
---     port's bar starts at tile 5 where party_menu.asm:71-76 starts it at
---     4; the span is the same "left cap + six fill tiles".
 function PartyMenu:sgbPalettes(game)
   local P = require("src.render.PaletteFX")
   local base = P.pal(game.data, "GREENBAR")
@@ -63,14 +63,44 @@ function PartyMenu:sgbPalettes(game)
       if self.heal and self.heal.mon == mon then hp = self.heal.from end
       local bar = P.pal(game.data, P.barPalName(hp, mon.stats.hp))
       if bar then
-        zones[#zones + 1] = P.zone(bar, 6, i * 2 - 1, 12, i * 2 - 1)
+        zones[#zones + 1] = P.zone(bar, 5, i * 2 - 1, 11, i * 2 - 1)
       end
     end
   end
   return zones
 end
 
+-- data/moves/field_moves.asm: leftmost tile per field move name
+local FIELD_MOVE_X = {
+  cut = 12, fly = 12, surf = 12, flash = 12, DIG = 12,
+  strength = 10, TELEPORT = 10, softboiled = 8,
+}
+
 local function sameItems(_, items) return items end
+
+local function followerUnavailable(game, mon)
+  local ow = game.overworld
+  local Follower = require("src.world.PikachuFollower")
+  return Follower.isFollowingDisabled(ow)
+    and Follower.isStarterPikachu(game.save, mon)
+end
+
+local function refuseUnavailable(self)
+  self.swapFrom = nil
+  local TextBox = require("src.render.TextBox")
+  local t = self.game.data and self.game.data.text or {}
+  self.game.stack:push(TextBox.new(self.game,
+    t._SleepingPikachuText1 or Strings("There isn't any\nresponse...")))
+end
+
+-- .newBadgeRequired (start_sub_menus.asm): every badge-gated arm of
+-- .outOfBattleMovePointers prints this and jumps back to the open submenu
+local function refuseBadge(self)
+  local TextBox = require("src.render.TextBox")
+  local t = self.game.data and self.game.data.text or {}
+  self.game.stack:push(TextBox.new(self.game,
+    t._NewBadgeRequiredText or Strings("No! A new BADGE\nis required.")))
+end
 
 -- where DIG escapes work: escape_rope_tilesets.asm (Agatha's room is
 -- excluded by map id in ItemUseEscapeRope)
@@ -104,7 +134,25 @@ PartyMenu.iconFrames = {
   FAIRY     = { rest = 3, alt = 0 }, -- FairySprite tile 12 <-> tile 0
   BIRD      = { rest = 3, alt = 0 }, -- BirdSprite tile 12 <-> tile 0
   WATER     = { rest = 0, alt = 3 }, -- SeelSprite tile 0 <-> tile 12
+  PIKACHU   = { rest = 0, alt = 3 }, -- Yellow: PikachuSprite tile 0 <-> 12
 }
+
+local function gridIndex(index, count, direction)
+  if count < 1 then return nil end
+  local row, col = math.floor((index - 1) / 2), (index - 1) % 2
+  if direction == "left" or direction == "right" then
+    local other = row * 2 + (1 - col) + 1
+    return other <= count and other or index
+  end
+  local step = direction == "up" and -1 or direction == "down" and 1
+  if not step then return nil end
+  local rows = math.ceil(count / 2)
+  for offset = 1, rows do
+    local other = ((row + step * offset) % rows) * 2 + col + 1
+    if other <= count then return other end
+  end
+  return index
+end
 
 -- Which 16x16 frame of `name`'s sheet to draw; `ih` (sheet pixel
 -- height) only matters for the fallback, which keeps the old uniform
@@ -125,6 +173,31 @@ function PartyMenu.mirrorsIcon(name)
 end
 
 local iconImages = {}
+-- the OBP0-baked copies: path -> ogGroup (or "") -> image, the "#obp" half
+-- of the cache, nested so a drawn frame builds no key string per icon
+local obpIconImages = {}
+-- image -> { half = { [frame] = quad }, full = { [frame] = quad } }: icon
+-- quads never change once built, so every drawn frame reuses them (they may
+-- also sit in PaletteFX's UI redraw list, which only reads them)
+local iconQuads = setmetatable({}, { __mode = "k" })
+local function iconQuad(img, kind, frame, w, iw, ih)
+  local byImg = iconQuads[img]
+  if not byImg then
+    byImg = { half = {}, full = {} }
+    iconQuads[img] = byImg
+  end
+  local byFrame = byImg[kind]
+  local q = byFrame[frame]
+  if not q then
+    q = love.graphics.newQuad(0, frame * 16, w, 16, iw, ih)
+    byFrame[frame] = q
+  end
+  return q
+end
+-- Sprites.iconPath's opts, reused (it only reads name / trueColor)
+local iconPathOpts = {}
+-- engine/items/town_map.asm:514
+local OAM_XFLIP = { sx = -1 }
 
 -- Party icons are OBJs (engine/gfx/mon_icons.asm WriteMonPartySpriteOAM
 -- writes OAM blocks), so they render through OBP0, and GBPalNormal
@@ -154,7 +227,12 @@ local function obpIcon(path)
   return love.graphics.newImage(id)
 end
 
-local function drawIcon(game, mon, x, y, selected, counter)
+-- `forceAlt` picks the second animation frame outright, for callers with no
+-- selection cursor of their own: Trade_AnimCircledMon
+-- (engine/movie/trade.asm) cycles the party sprite's two frames the whole
+-- time the mon rides the link cable (#750).
+-- `obp` overrides the OBP0 bake: engine/movie/trade.asm:385
+function PartyMenu.drawIcon(game, mon, x, y, selected, counter, forceAlt, obp)
   local icons = game.data.icons
   if not icons then return end
   local def = game.data.pokemon[mon.species]
@@ -167,18 +245,22 @@ local function drawIcon(game, mon, x, y, selected, counter)
   -- change its menu icon.
   local entry = (icons.bySpecies and icons.bySpecies[mon.species])
              or (def and def.icon)
-  local name, path
+  local name, path, trueColor
   if type(entry) == "string" then
     name = entry
     path = icons.icons and icons.icons[entry]
   elseif type(entry) == "table" then
     path = entry.image
+    trueColor = entry.trueColor
   end
   if not path then
     name = def and def.dex and icons.byDex and icons.byDex[def.dex]
     path = name and icons.icons and icons.icons[name]
   end
-  path = require("src.pokemon.Sprites").iconPath(game.data, mon, path, { name = name })
+  iconPathOpts.name, iconPathOpts.trueColor = name, trueColor
+  path, trueColor = require("src.pokemon.Sprites")
+    .iconPath(game.data, mon, path, iconPathOpts)
+  iconPathOpts.name, iconPathOpts.trueColor = nil, nil
   if not path then return end
   -- Built-in icon classes are DMG 2bpp OBJ art and get the OBP0 bake; a
   -- mod's own image (an entry table rather than an icon name) is authored
@@ -186,25 +268,56 @@ local function drawIcon(game, mon, x, y, selected, counter)
   -- split PartyMenu.mirrorsIcon makes for the OAM mirror.  Both live in one
   -- cache under different keys, so a mod pointing a table entry at a
   -- built-in path still gets its unbaked copy. #274
-  local key = name and (path .. "#obp") or path
-  if iconImages[key] == nil then
+  --
+  -- trueColor art is unbaked for the same reason it is unshaded: obpIcon is
+  -- itself a 4-shade remap keyed off the red channel, so running it over
+  -- full-colour art destroys exactly what the flag asks to keep.  The flag
+  -- overrides `name`, because a pokemon.icon hook can substitute full-colour
+  -- art for a path that resolved to a built-in class and still carries one.
+  local baked = name ~= nil and not trueColor
+  local PaletteFX = require("src.render.PaletteFX")
+  local ogColors, ogGroup
+  if baked and PaletteFX.usesSpriteObp() then
+    if obp then
+      ogColors, ogGroup = obp[1], obp[2]
+    else
+      ogColors, ogGroup = PaletteFX.ogObjNormal()
+    end
+  end
+  -- one cache, two halves: the plain image under its path, the baked one
+  -- under (path, ogGroup) -- the old path .. "#obp" .. group key, nested
+  local cache, key = iconImages, path
+  if baked then
+    cache = obpIconImages[path]
+    if not cache then
+      cache = {}
+      obpIconImages[path] = cache
+    end
+    key = ogGroup or ""
+  end
+  if cache[key] == nil then
     -- resolve through Assets so an overrides/ or transform-derived icon
     -- (e.g. a per-species image at assets/generated/icons/<name>.png) is
     -- picked up the same way battle sprites are
     local ok, img
-    if name then
+    if ogColors then
+      ok, img = pcall(require("src.render.SpriteRenderer").obpImage,
+                      path, ogColors, ogGroup)
+    elseif baked then
       ok, img = pcall(obpIcon, path)
     else
       ok, img = pcall(love.graphics.newImage, Assets.resolve(path))
     end
-    iconImages[key] = ok and img or false
+    cache[key] = ok and img or false
   end
-  local img = iconImages[key]
+  local img = cache[key]
   if not img then return end
-  local alt = false
+  local alt = forceAlt or false
   if selected then
     local px = math.floor(mon.hp * 48 / math.max(1, mon.stats.hp))
     local speed = px >= 27 and 5 or px >= 10 and 16 or 32
+    -- engine/gfx/mon_icons.asm:24
+    if PaletteFX.runsNotSGB() then speed = speed + 1 end
     alt = math.floor(counter / speed) % 2 == 1
   end
   if alt and (name == "BALL" or name == "HELIX") then
@@ -224,28 +337,58 @@ local function drawIcon(game, mon, x, y, selected, counter)
     -- reuse overworld sheets whose walk-down frame is NOT symmetric, so
     -- drawing the raw 16x16 showed a tucked-back foot the hardware never
     -- displays (#276, absorbing #238).
-    local half = love.graphics.newQuad(0, frame * 16, 8, 16, iw, ih)
+    local half = iconQuad(img, "half", frame, 8, iw, ih)
     love.graphics.draw(img, half, x, y)
     -- sx = -1 about the block's right edge, so the flipped copy lands on
     -- x+8..x+16: the OAM_XFLIP half
     love.graphics.draw(img, half, x + 16, y, 0, -1, 1)
+    if ogColors then
+      PaletteFX.markUiSpriteRedraw(img, half, x, y)
+      PaletteFX.markUiSpriteRedraw(img, half, x + 16, y, OAM_XFLIP)
+    end
   elseif ih > 16 then
-    love.graphics.draw(img, love.graphics.newQuad(0, frame * 16, 16, 16, iw, ih), x, y)
+    local quad = iconQuad(img, "full", frame, 16, iw, ih)
+    love.graphics.draw(img, quad, x, y)
+    if ogColors then PaletteFX.markUiSpriteRedraw(img, quad, x, y) end
   else
     -- HELIX and any mod art that is a single frame: drawn whole, at
     -- whatever size the file is (unchanged path)
     love.graphics.draw(img, x, y)
+    if ogColors then PaletteFX.markUiSpriteRedraw(img, nil, x, y) end
   end
+  -- Report the covering rect so Renderer:endFrame can re-blit it unshaded
+  -- over the colorized pass.  Every branch above lays a frame into a 16x16
+  -- OAM block except the last, which draws the file at its own size.
+  -- No vanilla icon record sets the flag, so this stays dead code without a
+  -- mod and the zone lists are exactly the ones the states returned.
+  if trueColor then
+    local mw, mh = 16, 16
+    if not (PartyMenu.mirrorsIcon(name) or ih > 16) then mw, mh = iw, ih end
+    require("src.render.PaletteFX").markTrueColor(x, y, mw, mh)
+  end
+  return true
 end
 
 function PartyMenu.new(game, opts)
   opts = opts or {}
   local self = setmetatable({}, PartyMenu)
   self.game = game
-  self.index = 1
+  local party = opts.party or (opts.battle and opts.battle.playerParty)
+  -- PartyMenuInit (home/pokemon.asm) seeds the cursor from
+  -- wPartyAndBillsPCSavedMenuItem rather than from zero, and
+  -- HandlePartyMenuInput writes wCurrentMenuItem back into it on every
+  -- input, so the party cursor survives closing and reopening the menu.
+  -- Only a battle clears it -- InitBattleVariables and end_of_battle.asm
+  -- both zero the byte, which BattleState mirrors.  The clamp covers a
+  -- party that shrank (deposit / release) while the saved index was
+  -- pointing past the end. #768
+  local count = #(party or (game.save and game.save.party) or {})
+  self.index = math.min(math.max(1, game.partyMenuSavedIndex or 1),
+                        math.max(1, count))
   self.onSwitch = opts.onSwitch
   self.onCancel = opts.onCancel
   self.pickOnly = opts.pickOnly
+  self.itemUse = opts.itemUse -- USE_ITEM_PARTY_MENU (item_effects.asm:813)
   -- Medicine keeps the picker on screen: item_effects.asm .doneHealing
   -- animates the party HP bar and then prints the message through
   -- RedrawPartyMenu with the menu STILL up, so BagMenu asks for keepOpen and
@@ -255,22 +398,23 @@ function PartyMenu.new(game, opts)
   -- TM/HM display (ABLE / NOT ABLE per mon instead of the HP bar, and the
   -- "Use TM on which POKeMON?" prompt). Set by BagMenu.pickTargetAndUse. #210
   self.tmhm = opts.tmhm
+  -- Evolution stones: opts.evoStone = item id gives Gen 1's
+  -- EVO_STONE_PARTY_MENU ABLE / NOT ABLE display (party_menu.asm:114). #1411
+  self.evoStone = opts.evoStone
   self.forceSwitch = opts.forceSwitch
   self.battle = opts.battle
-  self.party = opts.party -- link battles pass their clamped copies
+  self.party = party -- link/scoped battles pass their local party view
   self.swapFrom = nil
+  self.swapAnim = nil
+  -- wPartyMenuTypeOrMessageID (engine/menus/party_menu.asm:182)
+  self.message = nil
   self.submenu = nil
   self.subIndex = 1
   self.blink = 0
   return self
 end
 
--- UpdateHPBar2 (engine/gfx/hp_bar.asm, predef'd from item_effects.asm's
--- .doneHealing): UpdateHPBar_AnimateHPBar is documented "for (a) ticks (two
--- waiting frames each)" over a 48-pixel bar, so the shown HP walks
--- maxHP/96 per frame -- the same rate the battle HUD drains at
--- (BattleState:stepHPDrain).  onDone fires on the frame it lands, which is
--- when the caller prints its message. #252
+-- engine/items/item_effects.asm:1208, engine/gfx/hp_bar.asm:81-135
 function PartyMenu:animateTo(mon, fromHP, onDone)
   if not (mon and mon.stats) then
     if onDone then onDone() end
@@ -279,7 +423,44 @@ function PartyMenu:animateTo(mon, fromHP, onDone)
   local from = math.max(0, fromHP or mon.hp)
   -- `from` outlives `shown`: sgbPalettes above needs the pre-heal HP for the
   -- whole fill, because the SGB bar color does not move until the redraw.
-  self.heal = { mon = mon, from = from, shown = from, onDone = onDone }
+  self.heal = { mon = mon, from = from, shown = from, hold = 0,
+                px = Timing.hpBarPixels(from, math.max(1, mon.stats.hp)),
+                onDone = onDone }
+end
+
+function PartyMenu:finishHeal()
+  local heal = self.heal
+  self.heal = nil
+  if heal.onDone then heal.onDone() end
+end
+
+function PartyMenu:stepHeal()
+  local heal = self.heal
+  local maxHP = math.max(1, heal.mon.stats.hp)
+  local goal = heal.mon.hp
+  if heal.hold > 0 then
+    heal.hold = heal.hold - 1
+    if heal.hold == 0 and heal.closing then self:finishHeal() end
+    return
+  end
+  local targetPx = Timing.hpBarPixels(heal.shown, maxHP)
+  if heal.px ~= targetPx then
+    -- engine/gfx/hp_bar.asm:140-148
+    heal.px = heal.px + ((heal.px > targetPx) and -1 or 1)
+    heal.hold = Timing.HP_BAR_PIXEL_STEP - 1
+  elseif heal.shown ~= goal then
+    -- engine/gfx/hp_bar.asm:100-110
+    heal.shown = heal.shown + ((heal.shown > goal) and -1 or 1)
+    heal.started = true
+    heal.hold = Timing.HP_BAR_HP_STEP - 1
+  elseif heal.started then
+    -- engine/gfx/hp_bar.asm:121-135
+    heal.closing = true
+    heal.hold = Timing.hpDrainClosingFrames(true) - 1
+  else
+    -- engine/gfx/hp_bar.asm:69-70
+    self:finishHeal()
+  end
 end
 
 -- Close a picker the caller kept open (see self.keepOpen).  A TextBox pops
@@ -288,37 +469,116 @@ end
 -- that already popped themselves, and stops a double close eating the bag
 -- underneath. #252
 function PartyMenu:close()
+  local top = self.game.stack:top()
+  if top ~= self and top and top.owner == self and top.held then
+    self.game.stack:pop()
+  end
   if self.game.stack:top() == self then self.game.stack:pop() end
+end
+
+-- engine/menus/party_menu.asm:12, engine/menus/start_sub_menus.asm:287
+function PartyMenu:eraseCursors()
+  self.cursorsErased = true
+end
+
+-- engine/menus/text_box.asm:397-440
+local function submenuBox(self)
+  local n = #self.subItems
+  local lx = 12
+  for _, entry in ipairs(self.subItems) do
+    local mx = FIELD_MOVE_X[entry.move or entry.action]
+    if mx and mx < lx then lx = mx end
+  end
+  return lx, n > 3 and math.max(0, 16 - n * 2) or 11
+end
+
+-- engine/battle/core.asm:2329
+function PartyMenu:refuse(text)
+  -- engine/battle/core.asm:2404-2408
+  if self.submenu then
+    local lx, top = submenuBox(self)
+    self.subEdge = { lx = lx, top = top }
+  end
+  self.submenu = nil
+  self.subIndex = 1
+  local TextBox = require("src.render.TextBox")
+  self.game.stack:push(TextBox.new(self.game, text))
+end
+
+function PartyMenu:gridNavigation()
+  if not self.battle
+      or not Runtime.wantsHook("ui.party.grid_navigation") then return false end
+  return Runtime.call("ui.party.grid_navigation", function() return false end,
+                      self) == true
 end
 
 function PartyMenu:update(dt)
   -- icon animation counter; 320 = a whole cycle at every HP speed
-  self.blink = ((self.blink or 0) + 1) % 320
+  -- home/pokemon.asm:243
+  if not (self.submenu or self.chosenHollow or self.heal or self.swapAnim) then
+    self.blink = ((self.blink or 0) + 1) % 320
+  end
   -- The bar fill owns the menu while it runs: UpdateHPBar2 is a blocking
   -- predef in item_effects.asm, so no button is read until it lands (#252).
-  local heal = self.heal
-  if heal then
-    heal.shown = math.min(heal.mon.hp,
-                          heal.shown + math.max(1, heal.mon.stats.hp) / 96)
-    if heal.shown >= heal.mon.hp then
-      self.heal = nil
-      if heal.onDone then heal.onDone() end
+  if self.heal then
+    self:stepHeal()
+    return
+  end
+  -- SwitchPartyMon_ClearGfx (engine/menus/start_sub_menus.asm:690), then
+  -- RedrawPartyMenu_ (engine/menus/party_menu.asm:8)
+  local anim = self.swapAnim
+  if anim then
+    anim.frames = anim.frames + 1
+    -- engine/menus/start_sub_menus.asm:664-666
+    if anim.phase == 1 then
+      anim.blank[anim.to] = true
+      anim.phase = 2
+      return
+    end
+    local playing = false
+    if anim.src then
+      local ok, p = pcall(anim.src.isPlaying, anim.src)
+      playing = ok and p or false
+    end
+    if anim.frames < 10 or (playing and anim.frames < 30) then return end
+    self.swapAnim = nil
+    self.blink = 0 -- home/window.asm:16
+    if self.game.data then
+      require("src.core.Sound").play(self.game.data, "Swap")
     end
     return
   end
+  -- home/window.asm:119
+  self.cursorsErased = nil
+  self.chosenHollow = nil
+  self.subEdge = nil
   local input = self.game.input
   local party = self.party or self.game.save.party
 
+  -- HandlePartyMenuInput (home/pokemon.asm) and the field-move submenu
+  -- (engine/menus/start_sub_menus.asm .chosePokemon) both run through
+  -- HandleMenuInput_, which beeps SFX_PRESS_AB on any A or B press (#570).
+  -- game.data is nil under the stub games the UI harnesses drive.
+  if self.game.data and (input:wasPressed("a") or input:wasPressed("b")) then
+    require("src.core.Sound").play(self.game.data, "Press_AB")
+  end
+
   if self.submenu then
     local n = #self.subItems
+    -- home/window.asm:46
     if input:wasPressed("up") then
-      self.subIndex = self.subIndex > 1 and self.subIndex - 1 or n
+      self.subIndex = math.max(1, self.subIndex - 1)
     elseif input:wasPressed("down") then
-      self.subIndex = self.subIndex < n and self.subIndex + 1 or 1
+      self.subIndex = math.min(n, self.subIndex + 1)
     elseif input:wasPressed("b") then
       self.submenu = nil
+      self.blink = 0 -- home/window.asm:16
     elseif input:wasPressed("a") then
       local mon = party[self.index]
+      if followerUnavailable(self.game, mon) then
+        refuseUnavailable(self)
+        return
+      end
       local entry = self.subItems[self.subIndex]
       local action = entry.action
       if not action and entry.onSelect then
@@ -329,8 +589,14 @@ function PartyMenu:update(dt)
         -- (core.asm .partyMenuWasSelected)
         Screens.push(self.game, "SummaryMenu", mon)
       elseif action == "battle_switch" then
-        self.game.stack:pop()
-        self.onSwitch(mon)
+        -- engine/battle/core.asm:2396
+        if self.keepOpen then
+          self.chosenHollow = true
+          self.onSwitch(mon, self)
+        else
+          self.game.stack:pop()
+          self.onSwitch(mon)
+        end
         return
       elseif action == "cancel" then
         self.game.stack:pop()
@@ -344,29 +610,48 @@ function PartyMenu:update(dt)
         -- flyTo (OverworldController) validates the fly-warp + runs the
         -- departure/warp, so we just hand it the chosen mapId (#195).
         local ow = self.game.overworld
-        self.game.stack:pop() -- close the party menu
+        -- .fly checks THUNDERBADGE first, then CheckIfInOutsideMap
+        -- (OVERWORLD + PLATEAU -- Route 23 / Indigo Plateau outdoor -- not
+        -- OVERWORLD alone, #83); both refusals loop back to the submenu
+        if ow and not ow:partyKnows("FLY") then
+          refuseBadge(self)
+          return
+        end
+        if ow and not Map.isOutside(ow.map.def,
+             FieldDefaults.field(self.game.data, "outsideTilesets")) then
+          local TextBox = require("src.render.TextBox")
+          local def = self.game.data.pokemon[mon.species]
+          local txt = (self.game.data.text._CannotFlyHereText
+                       or Strings("{RAM:wNameBuffer} can't\nFLY here."))
+                      :gsub("{RAM:wNameBuffer}", mon.nickname or def.name)
+          self.game.stack:push(TextBox.new(self.game, txt))
+          return -- .loop: submenu stays open behind the message
+        end
+        -- engine/menus/start_sub_menus.asm:144-151
+        self.submenu = nil
         Screens.push(self.game, "TownMap", { fly = true, onFly = function(mapId)
+          if self.game.stack:top() == self then self.game.stack:pop() end
           if ow then ow:flyTo(mapId) end
         end })
         return
       elseif action == "flash" then -- FLASH lights dark tunnels
-        -- start_sub_menus.asm .flash: PrintText _FlashLightsAreaText, then
-        -- GBPalWhiteOutWithDelay3 + jp .goBackToMap
+        -- start_sub_menus.asm .flash: PrintText _FlashLightsAreaText runs
+        -- with the party menu still on screen, and only then
+        -- GBPalWhiteOutWithDelay3 + jp .goBackToMap.  So the message reads
+        -- over the menu, and the cave is lit when the blink hands the
+        -- screen back, never under the text (#385).
         local ow = self.game.overworld
-        local TextBox = require("src.render.TextBox")
-        local Transition = require("src.render.Transition")
-        self.game.stack:pop()
-        ow.dark = false
-        self.game.save.flashLit = true
-        self.game.stack:push(TextBox.new(self.game,
-          self.game.data.text._FlashLightsAreaText
-          or Strings("A blinding FLASH\nlights the area!"), function()
-            self.game.stack:push(Transition.whiteFlash(self.game))
-          end))
+        if ow and not ow:partyKnows("FLASH") then
+          refuseBadge(self)
+          return
+        end
+        self.submenu = nil -- engine/menus/start_sub_menus.asm:66
+        self.chosenHollow = true
+        ow:useFlashFieldMove(function() self:close() end)
         return
       elseif action == "surf" then
-        -- start_sub_menus.asm .surf: SOULBADGE-gated (checked at list time
-        -- above), then IsSurfingAllowed (the Cycling Road / Seafoam B4F
+        -- start_sub_menus.asm .surf: SOULBADGE-gated (useSurfFieldMove),
+        -- then IsSurfingAllowed (the Cycling Road / Seafoam B4F
         -- current refusals, both of which loop back to the submenu), then
         -- ItemUseSurfboard: while surfing it tries to dismount instead;
         -- otherwise it mounts only if the FACING tile is water, else
@@ -376,9 +661,13 @@ function PartyMenu:update(dt)
         local reason = ow:useSurfFieldMove()
         local Transition = require("src.render.Transition")
         if reason == "ok" then
-          self.game.stack:pop() -- close the party menu (jp .goBackToMap)
+          -- UseItem prints _SurfingGotOnText with the party menu still up;
+          -- GBPalWhiteOutWithDelay3 + jp .goBackToMap only follow it, so
+          -- trySurf closes this menu when its text does (#385)
           local fx, fy = ow.player:facingCell()
-          ow:trySurf(fx, fy)
+          self.submenu = nil -- engine/menus/start_sub_menus.asm:66
+          self.chosenHollow = true
+          ow:trySurf(fx, fy, function() self:close() end)
           return
         end
         if reason == "dismount" then
@@ -388,12 +677,7 @@ function PartyMenu:update(dt)
           -- GBPalWhiteOutWithDelay3 blink, and the simulated pad press
           -- steps the player forward onto land (or across a connection
           -- strip when the shore is the next map's edge)
-          self.game.stack:pop()
-          ow.player.surfing = false
-          require("src.core.Music").setSurfing(self.game.data, false)
-          self.game.stack:push(Transition.whiteFlash(self.game, nil, function()
-            ow:stepForwardOrCrossEdge(ow.player.facing)
-          end))
+          ow:stopSurfing(function() self.game.stack:pop() end)
           return
         end
         local TextBox = require("src.render.TextBox")
@@ -409,9 +693,10 @@ function PartyMenu:update(dt)
           -- .cannotStopSurfing prints _SurfingNoPlaceToGetOffText but
           -- never zeroes wActionResultOrTookBattleTurn, so unlike the
           -- other refusals the menu still closes afterwards
-          -- (GBPalWhiteOutWithDelay3 + .goBackToMap)
-          self.game.stack:pop()
+          -- (GBPalWhiteOutWithDelay3 + .goBackToMap), and the text prints
+          -- over the still-open menu like every other .loop refusal (#385)
           self.game.stack:push(TextBox.new(self.game, txt, function()
+            self:close()
             self.game.stack:push(Transition.whiteFlash(self.game))
           end))
           return
@@ -420,8 +705,8 @@ function PartyMenu:update(dt)
         return -- .loop: submenu stays open behind the message
       elseif action == "cut" then
         -- start_sub_menus.asm .cut -> predef UsedCut (engine/overworld/cut.asm):
-        -- CASCADEBADGE-gated (list time); _NothingToCutText loops back to the
-        -- submenu when the FACING tile isn't a cuttable tree.
+        -- CASCADEBADGE-gated (useCutFieldMove); _NothingToCutText loops back
+        -- to the submenu when the FACING tile isn't a cuttable tree.
         local ow = self.game.overworld
         local reason = ow:useCutFieldMove()
         if reason == "ok" then
@@ -439,7 +724,7 @@ function PartyMenu:update(dt)
         self.game.stack:push(TextBox.new(self.game, txt))
         return -- .loop: submenu stays open behind the message
       elseif action == "strength" then
-        -- start_sub_menus.asm .strength: RAINBOWBADGE-gated (list time);
+        -- start_sub_menus.asm .strength: RAINBOWBADGE-gated;
         -- predef PrintStrengthText (field_move_messages.asm) sets
         -- BIT_STRENGTH_ACTIVE of wStatusFlags1 -- the sole gate
         -- push_boulder.asm reads -- then prints _UsedStrengthText (no
@@ -449,29 +734,31 @@ function PartyMenu:update(dt)
         -- .strength, GBPalWhiteOutWithDelay3 blinks the screen white
         -- before CloseTextDisplay returns to the map.
         local ow = self.game.overworld
-        local TextBox = require("src.render.TextBox")
-        local Transition = require("src.render.Transition")
-        local def = self.game.data.pokemon[mon.species]
-        local name = mon.nickname or def.name
-        self.game.stack:pop() -- close the party menu (jp .goBackToMap)
-        ow.strengthActive = true
-        local t1 = (self.game.data.text._UsedStrengthText
-          or Strings("{RAM:wNameBuffer} used\nSTRENGTH.")):gsub("{RAM:wNameBuffer}", name)
-        local t2 = (self.game.data.text._CanMoveBouldersText
-          or Strings("{RAM:wNameBuffer} can\nmove boulders.")):gsub("{RAM:wNameBuffer}", name)
-        -- like surf (#320): the blink belongs UNDER the texts, not as a
-        -- flashbang on the empty map after them; the stack only updates
-        -- the top state, so the flash holds until the texts close
-        self.game.stack:push(Transition.whiteFlash(self.game))
-        self.game.stack:push(TextBox.new(self.game, t1, function()
-          self.game.stack:push(TextBox.new(self.game, t2))
-        end, { auto = { sound = function()
-          return require("src.core.Sound").playCry(self.game.data, mon.species)
-        end } }))
+        if ow and ow.useStrengthFieldMove then
+          if not ow:partyKnows("STRENGTH") then
+            refuseBadge(self)
+            return
+          end
+          self.submenu = nil -- engine/menus/start_sub_menus.asm:66
+          self.chosenHollow = true
+          ow:useStrengthFieldMove(mon, function() self:close() end)
+          return
+        elseif ow and ow.useFieldMove then
+          ow:useFieldMove("STRENGTH", mon)
+          self:close()
+          return
+        end
         return
       elseif action == "softboiled" then
         -- field SOFTBOILED (StartMenu_Pokemon .softboiled): transfer
         -- 1/5 of the user's max HP to a chosen teammate
+        -- engine/menus/start_sub_menus.asm:236-258
+        if mon.stats and mon.hp <= math.floor(mon.stats.hp / 5) then
+          local TextBox = require("src.render.TextBox")
+          self.game.stack:push(TextBox.new(self.game,
+            self.game.data.text._NotHealthyEnoughText))
+          return
+        end
         self.softboiledFrom = self.index
       elseif action == "escape" then
         -- DIG / TELEPORT warp to the last Pokémon Center TOWN (wLastBlackoutMap,
@@ -481,54 +768,110 @@ function PartyMenu:update(dt)
         -- centralizes the spin -> fade -> warp so BagMenu's ESCAPE ROPE shares
         -- the exact departure; the fade + warp fire when the spin ends.
         local ow = self.game.overworld
+        if entry.move == "TELEPORT" then
+          -- .teleport: TELEPORT works only OUTDOORS (CheckIfInOutsideMap --
+          -- OVERWORLD + PLATEAU, #83); dark maps don't block it
+          if ow and not Map.isOutside(ow.map.def,
+               FieldDefaults.field(self.game.data, "outsideTilesets")) then
+            local TextBox = require("src.render.TextBox")
+            local def = self.game.data.pokemon[mon.species]
+            local txt = (self.game.data.text._CannotUseTeleportNowText
+                         or Strings("{RAM:wNameBuffer} can't\nuse TELEPORT now."))
+                        :gsub("{RAM:wNameBuffer}", mon.nickname or def.name)
+            self.game.stack:push(TextBox.new(self.game, txt))
+            return -- .loop: submenu stays open behind the message
+          end
+        elseif ow and not (DIG_TILESETS[ow.map.def.tileset]
+                           and ow.map.id ~= "AGATHAS_ROOM") then
+          -- .dig runs ItemUseEscapeRope (it sets wCurItem = ESCAPE_ROPE):
+          -- usable in the dungeon tilesets of escape_rope_tilesets.asm minus
+          -- Agatha's room, even in the dark (Rock Tunnel); anywhere else
+          -- .notUsable -> ItemUseNotTime, the same line BagMenu prints for a
+          -- bagged ESCAPE ROPE
+          local TextBox = require("src.render.TextBox")
+          self.game.stack:push(TextBox.new(self.game,
+            self.game.data.text._ItemUseNotTimeText
+            or Strings("OAK: %s!\nThis isn't the\ntime to use that!",
+                       self.game.save.player.name)))
+          return -- .loop: submenu stays open behind the message
+        end
+        if entry.move == "TELEPORT" then
+          -- engine/menus/start_sub_menus.asm:215-226
+          local TextBox = require("src.render.TextBox")
+          self.game.stack:push(TextBox.new(self.game,
+            self.game.data.text._WarpToLastPokemonCenterText, function()
+              self.game.stack:pop()
+              if ow then ow:beginTeleportOut() end
+            end, { auto = { wait = false, delay = 60 } }))
+          return
+        end
         self.game.stack:pop()
         if ow then ow:beginTeleportOut() end
         return
       end
       self.submenu = nil
+      self.blink = 0 -- home/window.asm:16
     end
     return
   end
 
-  if input:wasPressed("up") then
+  local grid
+  if self:gridNavigation() then
+    local direction = input:wasPressed("left") and "left"
+      or input:wasPressed("right") and "right"
+      or input:wasPressed("up") and "up"
+      or input:wasPressed("down") and "down"
+    grid = gridIndex(self.index, #party, direction)
+  end
+  if grid then
+    self.index = grid
+    self.game.partyMenuSavedIndex = self.index
+    self.blink = 0 -- home/window.asm:16
+  elseif input:wasPressed("up") then
     self.index = self.index > 1 and self.index - 1 or math.max(1, #party)
+    self.game.partyMenuSavedIndex = self.index -- HandlePartyMenuInput #768
+    self.blink = 0 -- home/window.asm:16
   elseif input:wasPressed("down") then
     self.index = self.index < #party and self.index + 1 or 1
+    self.game.partyMenuSavedIndex = self.index -- HandlePartyMenuInput #768
+    self.blink = 0 -- home/window.asm:16
   elseif input:wasPressed("b") then
     self.game.stack:pop()
     if self.onCancel then self.onCancel() end
   elseif input:wasPressed("a") and #party > 0 then
     local mon = party[self.index]
+    if followerUnavailable(self.game, mon) then
+      refuseUnavailable(self)
+      return
+    end
     if self.softboiledFrom then
+      -- engine/items/item_effects.asm:854-857
+      if self.softboiledFrom == self.index then return end
       local user = party[self.softboiledFrom]
-      local heal = math.floor(user.stats.hp / 5)
-      if mon == user or mon.hp <= 0 or mon.hp >= mon.stats.hp
-         or user.hp <= heal then
-        self.softboiledFrom = nil
-        local TextBox = require("src.render.TextBox")
-        self.game.stack:push(TextBox.new(self.game, Strings("It won't have\nany effect.")))
-      else
-        user.hp = user.hp - heal
-        mon.hp = math.min(mon.stats.hp, mon.hp + heal)
-        self.softboiledFrom = nil
-        require("src.core.Sound").play(self.game.data, "Heal_HP")
-        local def = self.game.data.pokemon[mon.species]
-        local TextBox = require("src.render.TextBox")
-        self.game.stack:push(TextBox.new(self.game,
-          Strings("%s's HP\nwas restored!", mon.nickname or def.name)))
-      end
+      self.softboiledFrom = nil
+      self.game.overworld:useSoftboiledFieldMove(user, mon)
     elseif self.swapFrom then
-      if self.swapFrom ~= self.index then
-        party[self.swapFrom], party[self.index] = party[self.index], party[self.swapFrom]
-        require("src.core.Sound").play(self.game.data, "Swap")
-      end
+      -- SwitchPartyMon (engine/menus/start_sub_menus.asm:660)
+      local from = self.swapFrom
       self.swapFrom = nil
+      if from ~= self.index then
+        party[from], party[self.index] = party[self.index], party[from]
+      end
+      -- wCurrentMenuItem (engine/menus/start_sub_menus.asm:662-666)
+      self.swapAnim = { blank = { [from] = true }, to = self.index,
+                        phase = 1, frames = 0 }
+      if self.game.data then
+        self.swapAnim.src = require("src.core.Sound").play(self.game.data, "Swap")
+      end
+      return
     elseif self.onSwitch and (self.forceSwitch or self.pickOnly or not self.battle) then
       -- keepOpen callers (HP medicine) need the menu still drawn while the
       -- bar fills and the message prints, and close it themselves; everyone
       -- else keeps the old pop-then-call order.  Popping first is what made
       -- a POTION snap the picker shut before the item had even run (#252).
       if not self.keepOpen then self.game.stack:pop() end
+      -- home/pokemon.asm:246
+      if self.keepOpen then self.chosenHollow = true end
       self.onSwitch(mon, self)
     else
       self.submenu = true
@@ -541,54 +884,56 @@ function PartyMenu:update(dt)
                   { label = Strings("STATS"), action = "stats" },
                   { label = Strings("CANCEL"), action = "cancel" } }
       else
-        -- STATS/SWITCH plus this mon's field moves (start_sub_menus.asm
-        -- builds the same dynamic list)
-        items = { { label = Strings("STATS"), action = "stats" },
-                  { label = Strings("SWITCH"), action = "switch" } }
+        -- This mon's field moves FIRST, then STATS/SWITCH
+        -- (start_sub_menus.asm builds the same dynamic list).  The order is
+        -- load bearing: DisplayFieldMoveMonMenu (engine/menus/text_box.asm)
+        -- grows the box upward one row per field move and prints the field
+        -- move names ABOVE PokemonMenuEntries ("STATS/SWITCH/CANCEL"), and
+        -- StartMenu_Pokemon .choseOutOfBattleMove indexes wFieldMoves with
+        -- menu items 0..n-1 while STATS/SWITCH sit at the bottom of the
+        -- list.  GetMonFieldMoves walks wPartyMon1Moves in slot order, so
+        -- the field moves keep the mon's move-list order -- which the loop
+        -- below already does. #768
+        items = {}
         -- Field moves (HMs/TMs) are usable out of battle even when the mon
         -- is fainted -- Gen 1 does not require HP for Cut/Fly/Surf/etc.
         -- Battle still excludes this list via `not self.battle`. Softboiled
         -- can appear for a fainted user; its heal transfer then no-ops.
         if not self.battle and ow then
-          -- FLY/TELEPORT: CheckIfInOutsideMap (OVERWORLD + PLATEAU --
-          -- Route 23 / Indigo Plateau outdoor), not OVERWORLD alone (#83)
-          local outside = Map.isOutside(ow.map.def,
-            FieldDefaults.field(self.game.data, "outsideTilesets"))
+          -- GetMonFieldMoves (engine/menus/text_box.asm) matches the mon's
+          -- four moves against FieldMoveDisplayData and nothing else -- no
+          -- badge, no map, no tileset test.  Every one of those lives in
+          -- .outOfBattleMovePointers, i.e. on selection, where the refusal
+          -- prints and .loop returns to this still-open submenu (#1022).
           for _, mv in ipairs(mon.moves) do
-            if mv.id == "FLY" and outside
-               and self.game.save.inventory.THUNDERBADGE then
+            if mv.id == "FLY" then
               table.insert(items, { label = Strings("FLY"), action = "fly" })
-            elseif mv.id == "FLASH" and ow.dark
-               and self.game.save.inventory.BOULDERBADGE then
+            elseif mv.id == "FLASH" then
               table.insert(items, { label = Strings("FLASH"), action = "flash" })
-            elseif mv.id == "CUT" and self.game.save.inventory.CASCADEBADGE then
-              -- CUT/SURF/STRENGTH are party-menu field moves too
-              -- (start_sub_menus.asm .outOfBattleMovePointers); listed here
-              -- with the same list-time badge filter this file already uses
-              -- for FLY/FLASH.  The facing-tile/activation check happens on
-              -- selection (useCutFieldMove/useSurfFieldMove).
+            elseif mv.id == "CUT" then
               table.insert(items, { label = Strings("CUT"), action = "cut" })
-            elseif mv.id == "SURF" and self.game.save.inventory.SOULBADGE then
+            elseif mv.id == "SURF" then
               table.insert(items, { label = Strings("SURF"), action = "surf" })
-            elseif mv.id == "STRENGTH" and self.game.save.inventory.RAINBOWBADGE then
+            elseif mv.id == "STRENGTH" then
               table.insert(items, { label = Strings("STRENGTH"), action = "strength" })
             elseif mv.id == "SOFTBOILED" then
               table.insert(items, { label = Strings("SOFTBOILED"), action = "softboiled" })
-            elseif mv.id == "TELEPORT" and outside then
-              -- TELEPORT works only OUTDOORS (start_sub_menus.asm
-              -- .teleport -> CheckIfInOutsideMap); dark maps don't
-              -- block it
-              table.insert(items, { label = Strings("TELEPORT"), action = "escape" })
-            elseif mv.id == "DIG" and DIG_TILESETS[ow.map.def.tileset]
-               and ow.map.id ~= "AGATHAS_ROOM" then
-              -- DIG runs ItemUseEscapeRope (.dig sets wCurItem =
-              -- ESCAPE_ROPE): usable in the dungeon tilesets of
-              -- escape_rope_tilesets.asm minus Agatha's room, even in
-              -- the dark (Rock Tunnel)
-              table.insert(items, { label = Strings("DIG"), action = "escape" })
+            elseif mv.id == "TELEPORT" then
+              table.insert(items, { label = Strings("TELEPORT"),
+                                    action = "escape", move = "TELEPORT" })
+            elseif mv.id == "DIG" then
+              table.insert(items, { label = Strings("DIG"),
+                                    action = "escape", move = "DIG" })
             end
           end
         end
+        -- PokemonMenuEntries always closes the list, under the field moves
+        -- (text_box.asm .donePrintingNames). #768
+        items[#items + 1] = { label = Strings("STATS"), action = "stats" }
+        items[#items + 1] = { label = Strings("SWITCH"), action = "switch" }
+        -- CANCEL closes the whole party menu (start_sub_menus.asm:71-75
+        -- .exitMenu), where B returns to the party list. #1833
+        items[#items + 1] = { label = Strings("CANCEL"), action = "cancel" }
       end
       local ctx = { battle = self.battle, overworld = ow }
       local hooked = Runtime.call("ui.party.submenu", sameItems,
@@ -604,28 +949,36 @@ function PartyMenu:update(dt)
   end
 end
 
--- The bottom-of-screen context message for the current menu state
--- (pokered engine/menus/party_menu.asm PartyMenuMessage / RedrawPartyMenu_):
--- the party menu always prints a message in the bottom text box.  With the
--- normal message id that is PartyMenuBattleText ("Bring out which POKéMON?")
--- when IsInBattle else PartyMenuNormalText ("Choose a POKéMON."); the swap /
--- item / TM-HM ids print their own strings, which draw() handles inline.
--- Pure (no side effects) so drivers can assert it. #147
+-- engine/menus/party_menu.asm:229 (#147 #1610 #1901)
+-- engine/menus/party_menu.asm:226-235
+function PartyMenu:setMessage(text)
+  if type(text) ~= "string" then self.message = nil return end
+  -- constants/charmap.asm:19-20
+  self.message = require("src.render.TextBox").strip(text)
+end
+
 function PartyMenu:bottomMessage()
-  if self.swapFrom then
-    return "Move to where?"
-  elseif self.softboiledFrom or self.pickOnly then
-    return "Use on which one?"
+  local text
+  if self.message then
+    text = self.message
+  elseif self.swapFrom then
+    text = self.game.data.text._PartyMenuSwapMonText
+      or Strings("Move POKéMON\nwhere?")
   elseif self.tmhm then
-    return self.game.data.text._PartyMenuUseTMText
+    text = self.game.data.text._PartyMenuUseTMText
       or Strings("Use TM on which\nPOKéMON?")
-  elseif self.battle then
-    return self.game.data.text._PartyMenuBattleText
+  elseif self.softboiledFrom or self.itemUse then
+    text = self.game.data.text._PartyMenuItemUseText
+      or Strings("Use item on which\nPOKéMON?")
+  elseif self.forceSwitch then
+    text = self.game.data.text._PartyMenuBattleText
       or Strings("Bring out which\nPOKéMON?")
   else
-    return self.game.data.text._PartyMenuNormalText
+    text = self.game.data.text._PartyMenuNormalText
       or Strings("Choose a POKéMON.")
   end
+  -- constants/charmap.asm:19-20
+  return require("src.render.TextBox").strip(text)
 end
 
 -- Name-row pixel Y for party slot i (1-based).
@@ -656,16 +1009,22 @@ function PartyMenu:draw()
   local barZoned = PaletteFX.shader() ~= nil
                    and PaletteFX.pal(self.game.data, "GREENBAR") ~= nil
   for i, mon in ipairs(party) do
+    -- SwitchPartyMon_ClearGfx (engine/menus/start_sub_menus.asm:668)
+    if not (self.swapAnim and self.swapAnim.blank[i]) then
     local def = self.game.data.pokemon[mon.species]
     local y = PartyMenu.entryY(i)
     love.graphics.setColor(1, 1, 1, 1)
-    drawIcon(self.game, mon, 8, y, i == self.index, self.blink or 0)
+    PartyMenu.drawIcon(self.game, mon, 8, y, i == self.index, self.blink or 0)
     love.graphics.setColor(0, 0, 0, 1)
     Font.draw(mon.nickname or def.name, 24, y)
     -- level at column 13 (<LV> tile + digits, PrintLevel) AND the
     -- status/FNT text at column 17 (PrintStatusCondition), like the
     -- original rows -- statused mons keep their level display
-    if mon.level < 100 then
+    if not LevelDisplay.visible(mon, "party", self.game) then -- RFC 0019
+      -- the level column is simply empty; the status/FNT column at 17 is a
+      -- separate field and still prints, exactly as it does for a mon whose
+      -- level is on screen
+    elseif mon.level < 100 then
       HudTiles.tile(0x6E, 104, y) -- <LV>
       Font.draw(tostring(mon.level), 112, y)
     else
@@ -682,17 +1041,32 @@ function PartyMenu:draw()
       for _, m in ipairs(def.tmhm or {}) do
         if m == self.tmhm.move then can = true break end
       end
-      -- right-aligned so the shorter "ABLE" shares "NOT ABLE"'s right edge
+      -- engine/menus/party_menu.asm:93
       if can then
-        Font.draw(Strings("ABLE"), 120, y + 8)
+        Font.draw(Strings("ABLE"), 96, y + 8)
       else
-        Font.draw(Strings("NOT ABLE"), 88, y + 8)
+        Font.draw(Strings("NOT ABLE"), 96, y + 8)
+      end
+    elseif self.evoStone then
+      -- party_menu.asm:114 .evolutionStoneMenu: an EVOLVE_ITEM row matching
+      -- wEvoStoneItemID, printed in the TM/HM strings' row+1 column+9 slot
+      local can = false
+      for _, evo in ipairs(def.evolutions or {}) do
+        if evo.method == "ITEM" and evo.item == self.evoStone then
+          can = true break
+        end
+      end
+      -- engine/menus/party_menu.asm:160
+      if can then
+        Font.draw(Strings("ABLE"), 96, y + 8)
+      else
+        Font.draw(Strings("NOT ABLE"), 96, y + 8)
       end
     else
       if mon.hp <= 0 then
         Font.draw(Strings("FNT"), 136, y)
       elseif mon.status then
-        Font.draw(mon.status, 136, y)
+        Font.draw(Status.hudLabelFor(self.game.data.statuses, mon.status), 136, y)
       end
       -- the tile HP bar (DrawHP2 + SetPartyMenuHPBarColor).  grayFill:
       -- tinting the fill AND running it through the row's zone
@@ -705,12 +1079,15 @@ function PartyMenu:draw()
       -- animation has reached rather than the final value; drawHPBar reads
       -- only .hp and .stats, so a shim table is enough and the real mon is
       -- never mutated for display (#252).
-      local shown = mon
+      local shown, shownPx = mon, nil
       if self.heal and self.heal.mon == mon then
         shown = { hp = math.floor(self.heal.shown), stats = mon.stats }
+        shownPx = self.heal.px
       end
       love.graphics.setColor(1, 1, 1, 1)
-      HudTiles.drawHPBar(self.game.data, 5, (y + 8) / 8, shown, nil, barZoned)
+      -- engine/menus/party_menu.asm:71
+      HudTiles.drawHPBar(self.game.data, 4, (y + 8) / 8, shown, nil, barZoned,
+                         nil, shownPx)
       love.graphics.setColor(0, 0, 0, 1)
       Font.draw(("%3d/%3d"):format(shown.hp, mon.stats.hp), 104, y + 8)
     end
@@ -719,54 +1096,41 @@ function PartyMenu:draw()
     -- level with the middle of the two-row icon -- not on the name row that
     -- entryY returns.  Drawing it at y put it a tile too high (#278).
     local cursorY = y + 8
-    if i == self.index then
-      Font.drawCode(Theme.cursor, 0, cursorY)
+    if i == self.index and not self.cursorsErased then
+      Font.drawCode((self.chosenHollow or self.submenu) and Theme.cursorHollow
+                    or Theme.cursor,
+                    0, cursorY)
     end
-    if i == self.swapFrom or i == self.softboiledFrom then
-      Font.drawCode(Theme.cursorHollow, 0, cursorY) -- the unfilled swap arrow
+    -- the unfilled swap arrow; the filled cursor replaces it in the tilemap
+    -- when they share a row (PlaceMenuCursor, home/window.asm:184-185) (#814)
+    if (i == self.swapFrom or i == self.softboiledFrom) and i ~= self.index
+        and not self.cursorsErased then
+      Font.drawCode(Theme.cursorHollow, 0, cursorY)
+    end
     end
   end
-  if self.swapFrom then
-    Font.draw(Strings("Move to where?"), 8, 136)
-  elseif self.softboiledFrom then
-    Font.draw(Strings("Use on which one?"), 8, 136)
-  elseif self.tmhm then
-    -- "Use TM on which\nPOKeMON?" in the standard bottom text box
-    -- (party_menu.asm keeps the message box for the TM/HM menu); box + line
-    -- geometry match TextBox's default (rows 12-17, text on rows 14/16). #210
-    Font.drawBox(0, 12, 20, 6)
-    love.graphics.setColor(0, 0, 0, 1)
-    local prompt = self.game.data.text._PartyMenuUseTMText
-      or Strings("Use TM on which\nPOKéMON?")
-    local ly = 112
-    for line in (prompt .. "\n"):gmatch("([^\n]*)\n") do
-      Font.draw(line, 8, ly)
-      ly = ly + 16
-    end
-  elseif self.pickOnly then
-    Font.draw(Strings("Use on which one?"), 8, 136)
-  else
-    -- default field party menu (StartMenu) and the battle voluntary-switch
-    -- (BattleState:openParty): Gen1 prints PartyMenuNormalText / PartyMenuBattleText
-    -- in the standard bottom text box (party_menu.asm PartyMenuMessage), not
-    -- plain bottom-row text.  Box + line geometry match the #210 TM/HM case and
-    -- TextBox's default (rows 12-17, text on rows 14/16). #147
-    Font.drawBox(0, 12, 20, 6)
-    love.graphics.setColor(0, 0, 0, 1)
-    local ly = 112
-    for line in (self:bottomMessage() .. "\n"):gmatch("([^\n]*)\n") do
-      Font.draw(line, 8, ly)
-      ly = ly + 16
-    end
+  local edge = self.subEdge
+  if edge then
+    Font.drawBox(edge.lx - 1, edge.top, 21 - edge.lx, 18 - edge.top)
+  end
+  -- every message id prints through PrintText, so it lands in the standard
+  -- bottom text box, rows 12-17 (party_menu.asm:174). #147 #210 #1610
+  Font.drawBox(0, 12, 20, 6)
+  love.graphics.setColor(0, 0, 0, 1)
+  local ly = 112
+  for line in (self:bottomMessage() .. "\n"):gmatch("([^\n]*)\n") do
+    Font.draw(line, 8, ly)
+    ly = ly + 16
   end
   if self.submenu then
     local n = #self.subItems
-    Font.drawBox(9, 17 - n * 2 - 1, 11, n * 2 + 1)
-    local y0 = (17 - n * 2) * 8
+    local lx, top = submenuBox(self)
+    Font.drawBox(lx - 1, top, 21 - lx, 18 - top)
+    local y0 = (18 - n * 2) * 8
     for si, entry in ipairs(self.subItems) do
-      Font.draw(entry.label, 88, y0 + (si - 1) * 16)
+      Font.draw(entry.label, (lx + 1) * 8, y0 + (si - 1) * 16)
     end
-    Font.drawCode(Theme.cursor, 80, y0 + (self.subIndex - 1) * 16)
+    Font.drawCode(Theme.cursor, lx * 8, y0 + (self.subIndex - 1) * 16)
   end
   love.graphics.setColor(1, 1, 1, 1)
 end

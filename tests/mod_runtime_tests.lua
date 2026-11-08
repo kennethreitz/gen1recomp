@@ -56,6 +56,12 @@ check(pcall(function() events:emit("boom") end), "emit survives a throwing liste
 check(reached == 1, "later listeners run after a failure")
 check(logged("[bad_mod]", "boom"), "listener failure logged with mod id")
 
+-- a mod logging nil where the format wants a number gets a line, not a crash
+check(pcall(Logger.info, "[%s] topUp %d/%d", "nil_count", nil, 3),
+  "log call survives arguments that don't fit the format")
+check(logged("[nil_count] topUp nil/3", "bad log format"),
+  "mismatched log arguments still logged")
+
 -- rollback support: removeOwner drops every subscription a mod made
 events:removeOwner("good_mod")
 events:emit("boom")
@@ -144,9 +150,25 @@ check(manifest.id == "test_mod" and manifest.path == "mods/test_mod",
 check(type(Version.engine) == "string"
   and Semver.parse(Version.engine) ~= nil,
   "engine version parses as a semver (triple, optionally with a pre-release)")
-check(Version.modApi == 2, "mod api version is 2")
+check(Version.modApi == 3, "mod api version is 3")
+check(Version.isDev() == true, "the working-tree placeholder is a dev build")
 check(Version.title("X") == "X v" .. Version.engine,
-  "window title carries the engine version")
+  "dev window title carries the engine version")
+do
+  local saved = Version.engine
+  Version.engine = "0.1.73"
+  check(Version.isDev() == false, "a stamped X.Y.Z is not a dev build")
+  check(Version.title() == "gen1recomp",
+    "release window title omits the version number")
+  check(Version.title("Gen 1 Recompilation Project")
+      == "Gen 1 Recompilation Project",
+    "release titles keep the base string alone")
+  Version.engine = "1.2.3-dev"
+  check(Version.isDev() == true, "a -dev pre-release still counts as dev")
+  check(Version.title() == "gen1recomp v1.2.3-dev",
+    "and still shows the version in the title")
+  Version.engine = saved
+end
 
 -- null-object runtime: emit/call are safe with no loader installed
 local nullEvents, nullHooks = Runtime.events, Runtime.hooks
@@ -204,6 +226,7 @@ else
   setVar = function(name, value) ffi.C.setenv(name, value, 1) end
   unsetVar = function(name) ffi.C.unsetenv(name) end
 end
+local originalDataDir = os.getenv("POKEPORT_DATA_DIR")
 setVar("POKEPORT_DATA_DIR", "tests/fixture_data")
 local Data = require("src.core.Data")
 local fixture = setmetatable({}, { __index = Data })
@@ -215,5 +238,11 @@ check(okLoad and fixture.pokemon ~= nil and fixture.pokemon.FIXMON_A ~= nil,
 check(okLoad and fixture.pokemon.PIDGEY == nil, "and not the generated one")
 check(okLoad and fixture.constants.partyMax == 6,
   "fixture constants pass through seedDefaults")
+
+if originalDataDir and originalDataDir ~= "" then
+  setVar("POKEPORT_DATA_DIR", originalDataDir)
+else
+  unsetVar("POKEPORT_DATA_DIR")
+end
 
 S.finish()

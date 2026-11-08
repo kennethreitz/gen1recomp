@@ -71,11 +71,11 @@ return function(game)
   check(samePal(caveDark, { CAVE[3], CAVE[4], CAVE[4], CAVE[4] }),
         "SGB's CAVE becomes light-teal paper over near-black")
 
-  local ogDark = PaletteFX.permute(PaletteFX.GBC_BG, BGP)
+  local ogDark = PaletteFX.permute(PaletteFX.OG_RED_SOFT_BG, BGP)
   U.log("OG RED darkened:", ramp(ogDark))
-  check(ogDark[1][1] == 148 and ogDark[1][2] == 58 and ogDark[1][3] == 58
+  check(ogDark[1][1] == 127 and ogDark[1][2] == 56 and ogDark[1][3] == 72
         and ogDark[2][1] == 0 and ogDark[3][1] == 0 and ogDark[4][1] == 0,
-        "OG RED reduces to exactly (148,58,58) and (0,0,0) -- the issue's image")
+        "OG RED reduces to exactly (127,56,72) and (0,0,0) -- the softened reference")
 
   -- The shade map has to compose AFTER the mono/inverted replacement, or the
   -- modes that throw the incoming palette away throw the darkness out with it.
@@ -145,8 +145,8 @@ return function(game)
         "the map reports itself dark with no FLASH used")
   check(ow ~= nil and ow:paletteNameFor(ow.map) == "CAVE",
         "and resolves the CAVE palette (tileset CAVERN)")
-  check(ow ~= nil and ow:darkNeedsOverlay() == false,
-        "SGB needs NO composited veil -- its palette carries the darkening")
+  check(ow ~= nil and ow.darkNeedsOverlay == nil,
+        "the composited veil path is gone: SGB darkens via its palette")
 
   local function probe(label, wanted, rect)
     local shot = Probe.grab()
@@ -208,7 +208,7 @@ return function(game)
             :format(total, Probe.fmt(top)))
     local extra = {}
     for _, col in ipairs(top) do
-      local isDark = (col[1] == 148 and col[2] == 58 and col[3] == 58)
+      local isDark = (col[1] == 127 and col[2] == 56 and col[3] == 72)
                      or (col[1] == 0 and col[2] == 0 and col[3] == 0)
       if not isDark and col.share > 0.002 then
         extra[#extra + 1] = ("(%d,%d,%d) %.1f%%")
@@ -216,22 +216,20 @@ return function(game)
       end
     end
     check(#extra == 0,
-          "OG RED's dark tunnel is EXACTLY (148,58,58) + (0,0,0), like the "
-          .. "issue's expected screenshot"
+          "OG RED's dark tunnel is EXACTLY (127,56,72) + (0,0,0), like the "
+          .. "softened reference screenshot"
           .. (#extra > 0 and (" -- extra: " .. table.concat(extra, ", ")) or ""))
-    local corner = Probe.count(shot, { red = { 148, 58, 58 } }, 3, FAR_CORNER)
+    local corner = Probe.count(shot, { red = { 127, 56, 72 } }, 3, FAR_CORNER)
     check(corner.red > 0, "and the far corner still carries that red, not a void")
 
-    -- Not a FAIL: OG RED replays its OBP-baked sprites on top of the finished
-    -- zone pass (PaletteFX.markSpriteRedraw) and that replay is unshaded, so
-    -- the player keeps his green where FadePal2's OBP0 would darken him too.
-    local obj = PaletteFX.ogObj()
-    local sprite, spriteTotal = Probe.count(shot,
-      { green = obj[2], darkGreen = obj[3] })
-    local share = (sprite.green + sprite.darkGreen) * 100
-                  / math.max(1, spriteTotal)
-    U.log(("known gap: OG RED's player keeps his green in the dark "
-           .. "(%.2f%% of the frame); hardware darkens OBP0 too"):format(share))
+    -- FadePal2 writes rOBP0 as well as rBGP (`dc 3,3,3,2`), so every OBJ
+    -- colour lands on shade 3 and the player is a black silhouette: none of
+    -- the boot-ROM green may survive (#383).
+    local sprite = Probe.count(shot,
+      { green = PaletteFX.OG_RED_SOFT_OBJ[2],
+        darkGreen = PaletteFX.OG_RED_SOFT_OBJ[3] })
+    check(sprite.green == 0 and sprite.darkGreen == 0,
+          "OG RED's player is black in the dark, not green")
   end
 
   -- ---- the modes that darken in their own ramps --------------------------
@@ -259,13 +257,21 @@ return function(game)
             m[2] .. ": the far corner still has two tones (no light window)")
     end
     if m[1] == "redpp" then
-      -- RED++ has no palette left to shift: TileRenderer bakes true colour
-      -- into the atlas, so the darkness has to be composited by hand.
+      -- RED++ has no palette left for the frame shader to shift, so the shift
+      -- goes into the palette its atlas bakes from instead of a veil (#383).
       local o = game.overworld
       U.log("RED++ gbcAtlas present:",
             tostring(o and o.map and o.map.renderer and o.map.renderer.gbcAtlas ~= nil))
-      check(o ~= nil and o:darkNeedsOverlay() == true,
-            "RED++ is the ONE mode that still composites a flat veil")
+      check(PaletteFX.darkWorld() == true,
+            "RED++ arms the dark-world flag, so its atlas bakes dark")
+      local pack = PaletteFX.gbcPack()
+      local tsId = o and o.map and o.map.tileset and o.map.tileset.id
+      local lit = pack and tsId and pack.world.groupColors[tsId]
+      local shifted = tsId and PaletteFX.worldGroupColors(game.data, tsId,
+                                                          o.map.id, nil)
+      check(lit ~= nil and shifted ~= nil and samePal(shifted[1],
+              { lit[1][3], lit[1][4], lit[1][4], lit[1][4] }),
+            "and every baked group is FadePal2-shifted, not veiled")
     end
   end
 

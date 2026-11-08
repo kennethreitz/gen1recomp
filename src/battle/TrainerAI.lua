@@ -20,11 +20,39 @@
 
 local TypeChart = require("src.battle.TypeChart")
 local Strings = require("src.core.Strings")
+local Status = require("src.battle.Status")
+local romText = require("src.core.RomText")
 
 local TrainerAI = {}
 
+-- pokered's <USER>/<TARGET> text macros print "Enemy " before the
+-- enemy mon's nickname (home/text.asm PlaceMoveUsersName)
+local function displayName(b)
+  return b.isPlayer and b.name or Strings("Enemy %s", b.name)  -- #779
+end
+
 local HEAL_AMOUNT = { POTION = 20, SUPER_POTION = 50, HYPER_POTION = 200 }
-local X_STAT = { X_ATTACK = "attack", X_DEFEND = "defense", X_SPEED = "speed" }
+local X_STAT = {
+  X_ATTACK = "attack", X_DEFEND = "defense", X_SPEED = "speed",
+  X_SPECIAL = "special",
+}
+local RESTORING_SFX = {
+  FULL_HEAL = true, GUARD_SPEC = true, X_ACCURACY = true, DIRE_HIT = true,
+}
+
+-- engine/battle/trainer_ai.asm:459
+function TrainerAI.playsRestoringSfx(item)
+  return RESTORING_SFX[item] == true
+end
+
+-- Strings.source, not Strings: harvested at require time so the catalog
+-- generator can see the literal, same pattern as MoveEffects.lua's
+-- STAT_LABEL (#811) -- Strings(stat:upper()) alone is a dynamic argument
+-- the harvester can't discover.
+local STAT_LABEL = {
+  attack = Strings.source("ATTACK"), defense = Strings.source("DEFENSE"),
+  speed = Strings.source("SPEED"), special = Strings.source("SPECIAL"),
+}
 
 -- The trainer's ai_classes record from the merged registry; the direct
 -- require covers battles built without a loader.  A trainer record's
@@ -38,9 +66,7 @@ function TrainerAI.classFor(battle)
   return require("data.scripts.ai_classes")[id]
 end
 
--- Item use / switching per trainer class (engine/battle/trainer_ai.asm
--- via the ai_classes registry).  Runs before move choice each enemy
--- turn; returns an action { special = "aiItem"/"aiSwitch", ... } or nil.
+-- engine/battle/trainer_ai.asm:290-320, engine/battle/core.asm:416,454
 -- battle.aiUses is initialized per enemy Pokémon (wAICount).
 function TrainerAI.classAction(battle)
   if battle.kind ~= "trainer" or not battle.trainer then return nil end
@@ -95,28 +121,44 @@ function TrainerAI.switchAction(battle)
   return { special = "aiSwitch", index = alive[1] }
 end
 
--- Apply an aiItem action to the enemy battler; returns messages.
+-- Apply an aiItem action to the enemy battler; returns messages, already
+-- final: the item line prints the raw nickname (AIPrintItemUseText has no
+-- "Enemy " prefix in pokered), the stat lines carry it via displayName, so
+-- the caller must not run these through prefixEnemy.
 function TrainerAI.useItem(battle, item)
   local enemy = battle.enemy
   local trainerName = battle.trainer.name
   local itemName = battle.data.items[item] and battle.data.items[item].name or item
-  local msgs = { Strings("%s\nused %s!", trainerName, itemName) }
+  local msgs = { romText(battle.data, "_AIBattleUseItemText",
+    "%s\nused %s!", trainerName, itemName, enemy.name) }
   if item == "FULL_HEAL" then
+    Status.keepPenaltyOnCure(battle, enemy)
     enemy.mon.status = nil
     enemy.toxicCounter = nil
   elseif item == "FULL_RESTORE" then
     enemy.mon.hp = enemy.mon.stats.hp
+    Status.keepPenaltyOnCure(battle, enemy)
     enemy.mon.status = nil
     enemy.toxicCounter = nil
   elseif HEAL_AMOUNT[item] then
     enemy.mon.hp = math.min(enemy.mon.stats.hp, enemy.mon.hp + HEAL_AMOUNT[item])
   elseif X_STAT[item] then
     local stat = X_STAT[item]
-    enemy.stages[stat] = math.min(6, (enemy.stages[stat] or 0) + 1)
-    table.insert(msgs, Strings("%s's\n%s rose!", enemy.name, stat:upper()))
+    if (enemy.stages[stat] or 0) >= 6 or require("src.battle.Damage").statAtCap(battle, enemy, stat) then
+      -- engine/battle/effects.asm:372-373
+      table.insert(msgs, romText(battle.data, "_NothingHappenedText", "Nothing happened!"))
+      return msgs
+    end
+    enemy.stages[stat] = (enemy.stages[stat] or 0) + 1
+    -- trainer_ai.asm:719 -> effects.asm:414-415
+    Status.afterStatChange(battle, enemy, stat, battle.player)
+    enemy.hazeStatReset = nil
+    -- trainer_ai.asm:716 -> effects.asm:484 (PlayCurrentMoveAnimation)
+    table.insert(msgs, { anim = "XSTATITEM_DUPLICATE_ANIM" })
+    table.insert(msgs, Strings("%s's\n%s rose!", displayName(enemy), Strings(STAT_LABEL[stat])))
   elseif item == "GUARD_SPEC" then
+    -- engine/battle/trainer_ai.asm:645
     enemy.mist = true
-    table.insert(msgs, Strings("%s's\nprotected against\nstat changes!", enemy.name))
   end
   return msgs
 end
