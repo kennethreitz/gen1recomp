@@ -829,6 +829,18 @@ local function startLaunchRequest(request)
 
   if not RomImporter.isReady(version) then
     showLauncher(version)
+    if request.rom then
+      local imported = {}
+      for key, value in pairs(request) do imported[key] = value end
+      imported.rom = nil
+      Importer:startLaunchRom(request.rom, version, function()
+        require("src.import.LauncherWindow").observe(0)
+        require("src.import.LauncherWindow").flush()
+        Importer = nil
+        startLaunchRequest(imported)
+      end)
+      return true
+    end
     autoUpdateMods(request)
     return true
   end
@@ -902,6 +914,7 @@ function love.load(args)
   -- dev / source checkout no-ops (see src/update/Boot.lua).
   local Boot = require("src.update.Boot")
   if Boot.run(args) then return end
+  if require("src.core.G1RFolder").ensure() then return end
 
   local savePath
   for i, a in ipairs(args or {}) do

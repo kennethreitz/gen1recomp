@@ -80,13 +80,26 @@ function BattleItems.isBattleUsable(id)
   return pocket == "POKE_BALLS" or pocket == "BERRY_POUCH"
 end
 
+-- pokeemerald/src/data/items.h:1018
+local ITEM_POKE_DOLL = 80
+
+-- pokeemerald/src/item_use.c:1035
+function BattleItems.isEscapeItem(id)
+  local num = ItemsData.toNumericId(id) or tonumber(id)
+  if num == ITEM_POKE_DOLL then return true end
+  local info = ItemsData.info(id)
+  local doll = ItemsData.info(ITEM_POKE_DOLL)
+  local fn = info and tonumber(info.battleUseFunc) or 0
+  return fn ~= 0 and doll ~= nil and fn == tonumber(doll.battleUseFunc)
+end
+
 function BattleItems.needsPartySelect(id)
   if not id then return false end
   if Catching.isBall(id) then return false end
   local modRecord = ItemUse.modEffect(id)
   if modRecord then return modRecord.needsTarget == true end
   local num = ItemsData.toNumericId(id) or tonumber(id)
-  if num == 80 then return false end -- POKE_DOLL
+  if BattleItems.isEscapeItem(id) then return false end
   if BattleItems.isStatBooster(id) then return false end
   local use = ItemUse.fieldUseKind(id, nil, true)
   local info = ItemsData.info(id)
@@ -221,7 +234,7 @@ end
 function BattleItems.canUseOn(st, itemId, partySlot, mon, moveSlot)
   local session = st and st.session
   if not mon or not itemId then return false, wont_have_effect() end
-  if mon.isEgg then return false, Strings("An EGG can't be used on.") end
+  if mon.isEgg then return false end
   if ItemUse.modEffect(itemId) then return true end
   if (ItemsData.toNumericId(itemId) or tonumber(itemId)) == 175 and require("src.core.game3.rs.enigma").matches(session) then
     if ItemUse.fieldUseKind(itemId, session, true) == "none" then return false, wont_have_effect() end
@@ -430,10 +443,11 @@ function BattleItems.use(st, adapter, bag, session, itemId, partySlot, battlerId
     return "heal", msgs, true, false, text
   end
 
-  -- Poké Doll → flee wild
-  if num == 80 then
+  if BattleItems.isEscapeItem(itemId) then
     if not st.wild then
-      say(Strings("This can't be used right now."))
+      -- pokefirered/src/item_use.c:830
+      -- pokeemerald/src/item_use.c:1048
+      say(ItemUse.notTheTimeText(session))
       return "error", msgs, false, false
     end
     Bag.remove(bag, itemId, 1)
@@ -614,7 +628,8 @@ function BattleItems.use(st, adapter, bag, session, itemId, partySlot, battlerId
     return "heal", msgs, true, false, ItemUse.medicineText(mon, hpBefore, cured)
   end
 
-  say(Strings("This can't be used right now."))
+  -- pokeemerald/src/item_use.c:1123
+  say(ItemUse.notTheTimeText(session))
   return "error", msgs, false, false
 end
 
